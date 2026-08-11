@@ -42,6 +42,13 @@
     - `func delete(id: Int64)`
     - `func deleteWhere(sourceCaseInsensitive source: String)`
 
+- [ ] **Step 0: Confirm the target Mac's system SQLite supports `RETURNING` and column-level `COLLATE`**
+
+`upsertLocked` (Step 2 below) uses an `INSERT ... ON CONFLICT ... RETURNING` statement, which requires SQLite ≥ 3.35 (2021). Confirm the actual version on the real build/target Mac before writing code against it:
+
+Run: `sqlite3 --version`
+Expected: a version ≥ 3.35.0. macOS 14 (Sonoma)'s system `libsqlite3` ships well above this (typically 3.43+), so this should pass; if it does not, stop and report back — the schema in Step 2 needs a fallback (`sqlite3_last_insert_rowid()` + a follow-up `SELECT` instead of `RETURNING`) that is not written into this plan.
+
 - [ ] **Step 1: Add the SQLite link flag**
 
 In `swift/Package.swift`, inside the `.executableTarget(name: "Parakey", ...)` block, add a `linkerSettings` array (there isn't one there today — only `dependencies:`):
@@ -112,10 +119,15 @@ final class VocabularyStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.local.superdictate.vocabulary-store")
 
     init(fileURL: URL) throws {
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        // ":memory:" (used only by inMemoryFallback() below) has no parent
+        // directory to create — skip the directory step for it so this
+        // doesn't try to create "/" on disk.
+        if fileURL.path != ":memory:" {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        }
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(fileURL.path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -132,17 +144,25 @@ final class VocabularyStore: @unchecked Sendable {
     }
 
     private func createSchema() throws {
+        // `source` declares COLLATE NOCASE at the column level (not via a
+        // separate collated index expression) so a plain `ON CONFLICT(source)`
+        // in upsertLocked's INSERT below resolves against this same unique
+        // index without needing to repeat the collation in the conflict
+        // target — SQLite's upsert conflict-target matching requires the
+        // ON CONFLICT column list to resolve to the exact same index
+        // definition, and the simplest way to guarantee that match is to
+        // let the column's own declared collation do the work everywhere.
         let sql = """
         CREATE TABLE IF NOT EXISTS corrections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
+            source TEXT NOT NULL COLLATE NOCASE,
             replacement TEXT NOT NULL,
             origin TEXT NOT NULL DEFAULT 'manual',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_source_nocase
-            ON corrections (source COLLATE NOCASE);
+            ON corrections (source);
         """
         try execute(sql)
     }
@@ -195,7 +215,7 @@ final class VocabularyStore: @unchecked Sendable {
             let sql = """
             INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(source COLLATE NOCASE) DO UPDATE SET
+            ON CONFLICT(source) DO UPDATE SET
                 replacement = excluded.replacement,
                 updated_at = excluded.updated_at
             RETURNING id, source, replacement, origin, created_at, updated_at;
@@ -234,7 +254,7 @@ final class VocabularyStore: @unchecked Sendable {
     func deleteWhere(sourceCaseInsensitive source: String) {
         queue.sync {
             guard let db else { return }
-            let sql = "DELETE FROM corrections WHERE source = ? COLLATE NOCASE;"
+            let sql = "DELETE FROM corrections WHERE source = ?;"
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
             defer { sqlite3_finalize(statement) }
@@ -315,7 +335,7 @@ Append to `VocabularyStore`:
     }
 
     private func rowExists(db: OpaquePointer, sourceCaseInsensitive source: String) -> Bool {
-        let sql = "SELECT 1 FROM corrections WHERE source = ? COLLATE NOCASE LIMIT 1;"
+        let sql = "SELECT 1 FROM corrections WHERE source = ? LIMIT 1;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(statement) }
@@ -349,7 +369,7 @@ Append to `VocabularyStore`:
         let sql = """
         INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(source COLLATE NOCASE) DO UPDATE SET
+        ON CONFLICT(source) DO UPDATE SET
             replacement = excluded.replacement,
             updated_at = excluded.updated_at
         RETURNING id, source, replacement, origin, created_at, updated_at;
@@ -491,23 +511,26 @@ Change `init` (line 92-94) to build the store and run the one-time migration:
 ```swift
     init(defaults: UserDefaults = .standard, vocabularyStore: VocabularyStore? = nil) {
         self.defaults = defaults
-        if let vocabularyStore {
-            self.vocabularyStore = vocabularyStore
-        } else {
-            do {
-                let dbURL = try superDictateApplicationSupportDirectory()
-                    .appendingPathComponent("corrections.sqlite", isDirectory: false)
-                self.vocabularyStore = try VocabularyStore(fileURL: dbURL)
-            } catch {
-                log("settings: failed to open vocabulary store, falling back to in-memory: \(error)")
-                // A file URL under a non-existent temp path still lets
-                // SQLite open an in-memory-equivalent throwaway DB file
-                // for this process lifetime rather than crashing launch.
-                self.vocabularyStore = (try? VocabularyStore(fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("superdictate-corrections-fallback.sqlite")))
-                    ?? VocabularyStore.inMemoryFallback()
-            }
-        }
+        self.vocabularyStore = vocabularyStore ?? Self.openDefaultVocabularyStore()
         migrateLegacyTranscriptCorrectionsIfNeeded()
+    }
+
+    /// A writable Application Support directory is a basic launch
+    /// precondition this app already relies on elsewhere (model files,
+    /// logs) — not a scenario worth chained fallbacks for. The one
+    /// fallback kept here is an in-memory store so a single bad launch
+    /// degrades to "corrections don't persist this run" instead of a
+    /// crash, since corrections are a convenience feature, not core
+    /// dictation functionality.
+    private static func openDefaultVocabularyStore() -> VocabularyStore {
+        do {
+            let dbURL = try superDictateApplicationSupportDirectory()
+                .appendingPathComponent("corrections.sqlite", isDirectory: false)
+            return try VocabularyStore(fileURL: dbURL)
+        } catch {
+            log("settings: failed to open vocabulary store at the app support path, falling back to an in-memory store for this run: \(error)")
+            return VocabularyStore.inMemoryFallback()
+        }
     }
 
     private func migrateLegacyTranscriptCorrectionsIfNeeded() {
