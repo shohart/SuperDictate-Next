@@ -173,7 +173,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "Parakey",
-            dependencies: ["parakeet_cpp"]
+            dependencies: ["parakeet_cpp"],
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+            ]
             // No `resources:` here on purpose. SwiftPM bundles them as
             // a `<Package>_<Target>.bundle` directory next to the
             // executable, which `codesign --deep` won't accept as a
