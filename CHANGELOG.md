@@ -6,6 +6,24 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+- **Automatic vocabulary learning**: SuperDictate now notices when you
+  hand-correct a short word or phrase right after it inserts a dictation
+  (classic case: an English loanword written out phonetically in Cyrillic)
+  and remembers the fix on its own — a HUD toast confirms what was learned
+  with an "Отменить"/Undo button, no manual entry required. Off switch in
+  Settings ("Автоматически учить словарь по вашим правкам").
+- New **Vocabulary** manager window (opened from Settings): a full table of
+  every text correction — manual and auto-learned — with add/edit/delete,
+  plus the existing JSON import/export.
+- Text corrections now live in a local SQLite database
+  (`~/Library/Application Support/SuperDictate/corrections.sqlite`) instead
+  of `UserDefaults`. Existing corrections migrate automatically, once, on
+  first launch after upgrading — nothing to do on your end. Cross-Mac
+  folder sync (Dropbox/iCloud/etc.) still uses the same JSON file format as
+  before.
+
 ## v0.5.1 — 2026-08-07
 
 Internal refactor: the monolithic `main.swift` was split into
