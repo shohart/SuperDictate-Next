@@ -149,6 +149,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // PendingTextInsertionTargetStore and captureTextInsertionTargetForNextDictation().
     private var pendingTextInsertionTarget = PendingTextInsertionTargetStore()
     private var textInsertionTargetCaptureToken = 0
+    // Watches the field text was just inserted into for a short window and
+    // reports a learn candidate if the user immediately hand-corrects it.
+    // See PostInsertionEditWatcher (VocabularyLearning.swift) and the
+    // `if let textInsertionTarget, ...` wiring at the insertion call site.
+    private lazy var postInsertionWatcher = PostInsertionEditWatcher(
+        store: settings.vocabularyStore,
+        onLearned: { [weak self] record in self?.showVocabularyLearnedToast(record) }
+    )
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -2350,6 +2358,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 for: result,
                                 targetElementStillValid: isAXElementStillValid(textInsertionTarget.element)
                             )
+                        }
+                        if let textInsertionTarget,
+                           /* TODO(Task 7): replace with settings.autoLearnVocabularyEnabled */ true,
+                           focusedTargetResult == .insertedUsingSelectedText || focusedTargetResult == .insertedUsingValueAndRange {
+                            postInsertionWatcher.beginWatching(insertedText: textToInsert, target: textInsertionTarget)
                         }
                         switch route {
                         case .usedFocusedTarget:
@@ -6585,6 +6598,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.terminate(nil)
         }
     }
+
+    // TODO(Task 6): remove this stub once ParakeyApp gets a real toast for
+    // learned vocabulary corrections; postInsertionWatcher's onLearned
+    // closure calls this today only so it compiles standalone.
+    private func showVocabularyLearnedToast(_ record: VocabularyRecord) {}
 
 }
 
