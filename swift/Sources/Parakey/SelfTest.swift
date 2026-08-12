@@ -70,6 +70,10 @@ enum ParakeySelfTest {
             return runSuite("statistics", testDictationUsageStatistics)
         case "corrections":
             return runSuite("corrections", testTranscriptCorrections)
+        case "vocabulary-store":
+            return runSuite("vocabulary-store", testVocabularyStore)
+        case "vocabulary-learning":
+            return runSuite("vocabulary-learning", testLearnCandidateDetector)
         case "fillers":
             return runSuite("fillers", testFillerWordRemoval)
         case "filler-word-presets-custom-words":
@@ -2814,6 +2818,62 @@ enum ParakeySelfTest {
             equals: true,
             "merge cap warning should state how many corrections a merge would drop"
         )
+    }
+
+    private static func testVocabularyStore() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vocabulary-store-selftest-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let store = try VocabularyStore(fileURL: tempURL)
+
+        // Manual upsert + dedup by source (case-insensitive).
+        let first = try store.upsert(source: "инглиш", replacement: "English", origin: .manual)
+        guard first.origin == .manual else { throw VocabularyLearningTestFailure("expected manual origin") }
+        let updated = try store.upsert(source: "Инглиш", replacement: "english", origin: .manual)
+        guard store.count() == 1, updated.replacement == "english" else {
+            throw VocabularyLearningTestFailure("case-insensitive upsert should update the existing row, not add a second one")
+        }
+
+        // recordLearned: no-op when source already known.
+        guard store.recordLearned(source: "инглиш", replacement: "English") == nil else {
+            throw VocabularyLearningTestFailure("recordLearned should no-op for an already-known source")
+        }
+
+        // recordLearned: succeeds for a new source, tagged 'learned'.
+        guard let learned = store.recordLearned(source: "кложа", replacement: "closure"), learned.origin == .learned else {
+            throw VocabularyLearningTestFailure("recordLearned should insert a new source tagged learned")
+        }
+        guard store.count() == 2 else { throw VocabularyLearningTestFailure("expected 2 rows after recordLearned") }
+
+        // delete(id:)
+        store.delete(id: learned.id)
+        guard store.count() == 1 else { throw VocabularyLearningTestFailure("delete(id:) should remove exactly one row") }
+
+        // replaceAllPreservingOrigin: preserves origin/created_at for kept rows, drops missing ones, adds new ones as manual.
+        _ = try store.upsert(source: "старое", replacement: "old", origin: .learned)
+        store.replaceAllPreservingOrigin([
+            TranscriptCorrection(source: "инглиш", replacement: "English (edited)"),
+            TranscriptCorrection(source: "новое", replacement: "new"),
+        ])
+        let all = store.all()
+        guard all.count == 2 else { throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should leave exactly the given sources") }
+        guard let englishRow = all.first(where: { $0.source.lowercased() == "инглиш" }), englishRow.replacement == "English (edited)" else {
+            throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should update the replacement text for a kept source")
+        }
+        guard let newRow = all.first(where: { $0.source == "новое" }), newRow.origin == .manual else {
+            throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should tag brand-new sources as manual")
+        }
+
+        // Cap enforcement in recordLearned.
+        let capStore = try VocabularyStore(fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("vocabulary-store-cap-\(UUID().uuidString).sqlite"))
+        defer { }
+        for index in 0..<MAX_TRANSCRIPT_CORRECTIONS {
+            _ = try capStore.upsert(source: "src\(index)", replacement: "rep\(index)", origin: .manual)
+        }
+        guard capStore.recordLearned(source: "one-too-many", replacement: "nope") == nil else {
+            throw VocabularyLearningTestFailure("recordLearned must not exceed MAX_TRANSCRIPT_CORRECTIONS")
+        }
     }
 
     private static func testFillerWordRemoval() throws {
