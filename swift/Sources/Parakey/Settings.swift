@@ -117,16 +117,25 @@ final class Settings: @unchecked Sendable {
 
     private func migrateLegacyTranscriptCorrectionsIfNeeded() {
         guard !defaults.bool(forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite) else { return }
-        defer { defaults.set(true, forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite) }
 
-        guard let data = defaults.data(forKey: Self.keyTranscriptCorrections) else { return }
+        guard let data = defaults.data(forKey: Self.keyTranscriptCorrections) else {
+            defaults.set(true, forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite)
+            return
+        }
         do {
             let legacy = try TranscriptCorrectionsTransfer.decode(data)
+            var migratedCount = 0
             for correction in normalizedTranscriptCorrections(legacy) {
-                _ = try? vocabularyStore.upsert(source: correction.source, replacement: correction.replacement, origin: .manual)
+                do {
+                    _ = try vocabularyStore.upsert(source: correction.source, replacement: correction.replacement, origin: .manual)
+                    migratedCount += 1
+                } catch {
+                    log("settings: failed to migrate one legacy correction (source: \(correction.source)): \(error)")
+                }
             }
             defaults.removeObject(forKey: Self.keyTranscriptCorrections)
-            log("settings: migrated \(legacy.count) legacy transcript corrections into SQLite")
+            defaults.set(true, forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite)
+            log("settings: migrated \(migratedCount) of \(legacy.count) legacy transcript corrections into SQLite")
         } catch {
             log("settings: legacy transcript correction migration failed, leaving UserDefaults copy in place: \(error)")
         }
