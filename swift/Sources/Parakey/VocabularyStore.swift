@@ -41,19 +41,44 @@ final class VocabularyStore: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "com.local.superdictate.vocabulary-store")
 
-    init(fileURL: URL) throws {
-        // ":memory:" (used only by inMemoryFallback() below) has no parent
+    convenience init(fileURL: URL) throws {
+        try self.init(sqlitePath: fileURL.path)
+    }
+
+    /// Last-resort constructor for the (expected-never) case where even
+    /// FileManager.default.temporaryDirectory isn't writable. SQLite's
+    /// special ":memory:" filename opens a private in-memory database
+    /// instead of touching disk at all, so this cannot fail the way
+    /// init(fileURL:) can.
+    static func inMemoryFallback() -> VocabularyStore {
+        // Force-unwrap is safe: ":memory:" always succeeds in SQLite,
+        // and createSchema() against a fresh in-memory DB cannot fail.
+        try! VocabularyStore(sqlitePath: ":memory:")
+    }
+
+    /// Designated initializer, keyed off a raw SQLite path/filename
+    /// string rather than a URL. SQLite's special ":memory:" sentinel
+    /// must reach sqlite3_open_v2 verbatim — round-tripping it through
+    /// URL(fileURLWithPath:) resolves it against the current working
+    /// directory (e.g. "/Users/me/:memory:"), which would silently turn
+    /// "in-memory" into "write a file literally named :memory: to disk".
+    /// Going through a plain String sidesteps that entirely.
+    private init(sqlitePath: String) throws {
+        // ":memory:" (used only by inMemoryFallback() above) has no parent
         // directory to create — skip the directory step for it so this
         // doesn't try to create "/" on disk.
-        if fileURL.path != ":memory:" {
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
+        if sqlitePath != ":memory:" {
+            let directory = (sqlitePath as NSString).deletingLastPathComponent
+            if !directory.isEmpty {
+                try FileManager.default.createDirectory(
+                    atPath: directory,
+                    withIntermediateDirectories: true
+                )
+            }
         }
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
-        guard sqlite3_open_v2(fileURL.path, &handle, flags, nil) == SQLITE_OK, let handle else {
+        guard sqlite3_open_v2(sqlitePath, &handle, flags, nil) == SQLITE_OK, let handle else {
             let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
             if let handle { sqlite3_close(handle) }
             throw VocabularyStoreError.openFailed(message)
