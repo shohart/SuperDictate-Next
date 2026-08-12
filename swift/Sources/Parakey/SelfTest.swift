@@ -211,6 +211,8 @@ enum ParakeySelfTest {
         try testRecordingHUDOutlineFillPath()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
+        try testVocabularyStore()
+        try testLearnCandidateDetector()
         try testFillerWordRemoval()
         try testFillerWordRemoverPresetsAndCustomWords()
         try testFillerWordPresetDefaults()
