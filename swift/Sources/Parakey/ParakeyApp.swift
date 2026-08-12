@@ -2424,6 +2424,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 // are not using this resolution to insert anything.
                                 Task { [weak self] in
                                     guard let self else { return }
+                                    // TextInserter.insert(_:) returns as soon as the
+                                    // synthetic keyboard events are posted, not once
+                                    // the target app has processed them and updated
+                                    // its AX tree -- reading kAXValueAttribute
+                                    // immediately after can observe a stale/empty
+                                    // element (seen in practice: fieldLength=0,
+                                    // cursorRange=(0,0) in TextEdit). Give the
+                                    // target app's run loop a moment to catch up
+                                    // before resolving focus for observation.
+                                    try? await Task.sleep(nanoseconds: 200_000_000)
                                     do {
                                         let target = try await Task.detached(priority: .userInitiated) {
                                             try FocusedTextTargetResolver().captureTarget()
