@@ -92,14 +92,14 @@ final class VocabularyStore: @unchecked Sendable {
     }
 
     private func createSchema() throws {
-        // `source` declares COLLATE NOCASE at the column level (not via a
-        // separate collated index expression) so a plain `ON CONFLICT(source)`
-        // in upsertLocked's INSERT below resolves against this same unique
-        // index without needing to repeat the collation in the conflict
-        // target — SQLite's upsert conflict-target matching requires the
-        // ON CONFLICT column list to resolve to the exact same index
-        // definition, and the simplest way to guarantee that match is to
-        // let the column's own declared collation do the work everywhere.
+        // `source` declares COLLATE NOCASE at the column level, and there's
+        // a unique index below to match — but note this index only catches
+        // ASCII-case duplicates (SQLite's built-in NOCASE collation doesn't
+        // fold non-ASCII scripts like Cyrillic). It's kept as a defense-in-
+        // depth constraint against exact/ASCII-case dupes; the actual
+        // Unicode-aware case-insensitive dedup logic lives in Swift, in
+        // findRowLocked(db:sourceCaseInsensitive:), which upsertLocked,
+        // recordLearned, and deleteWhere all route through.
         let sql = """
         CREATE TABLE IF NOT EXISTS corrections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,14 +171,41 @@ final class VocabularyStore: @unchecked Sendable {
         }
     }
 
+    /// Dedup lookup is done here in Swift (via `.lowercased()`) rather than
+    /// leaning on SQLite's `COLLATE NOCASE`/unique index: SQLite's built-in
+    /// NOCASE collation only folds ASCII A-Z — it leaves non-ASCII text
+    /// (Cyrillic, Greek, accented Latin, etc.) untouched, so "Инглиш" and
+    /// "инглиш" would compare unequal and the ON CONFLICT dedup would
+    /// silently insert a second row instead of updating the first one.
+    /// `String.lowercased()` is Unicode-aware and does the right thing for
+    /// all scripts this app's users actually dictate in.
     private func upsertLocked(db: OpaquePointer, source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
         let now = ISO8601DateFormatter().string(from: Date())
+        if let existing = findRowLocked(db: db, sourceCaseInsensitive: source) {
+            let sql = """
+            UPDATE corrections SET replacement = ?, updated_at = ?
+            WHERE id = ?
+            RETURNING id, source, replacement, origin, created_at, updated_at;
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+
+            bindText(statement, 1, replacement)
+            bindText(statement, 2, now)
+            sqlite3_bind_int64(statement, 3, existing.id)
+
+            guard sqlite3_step(statement) == SQLITE_ROW, let record = record(from: statement) else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            return record
+        }
+
         let sql = """
         INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(source) DO UPDATE SET
-            replacement = excluded.replacement,
-            updated_at = excluded.updated_at
         RETURNING id, source, replacement, origin, created_at, updated_at;
         """
         var statement: OpaquePointer?
@@ -211,19 +238,19 @@ final class VocabularyStore: @unchecked Sendable {
     func recordLearned(source: String, replacement: String) -> VocabularyRecord? {
         queue.sync {
             guard let db else { return nil }
-            if rowExists(db: db, sourceCaseInsensitive: source) { return nil }
+            if findRowLocked(db: db, sourceCaseInsensitive: source) != nil { return nil }
             guard countLocked(db: db) < MAX_TRANSCRIPT_CORRECTIONS else { return nil }
             return try? insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
         }
     }
 
-    private func rowExists(db: OpaquePointer, sourceCaseInsensitive source: String) -> Bool {
-        let sql = "SELECT 1 FROM corrections WHERE source = ? LIMIT 1;"
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(statement) }
-        bindText(statement, 1, source)
-        return sqlite3_step(statement) == SQLITE_ROW
+    /// Unicode-aware case-insensitive lookup — see the note on
+    /// `upsertLocked` for why this can't just be a SQL `WHERE source = ?`
+    /// against the NOCASE-collated column. Row counts here are capped at
+    /// MAX_TRANSCRIPT_CORRECTIONS (512), so a linear scan is cheap.
+    private func findRowLocked(db: OpaquePointer, sourceCaseInsensitive source: String) -> VocabularyRecord? {
+        let target = source.lowercased()
+        return allLocked(db: db).first { $0.source.lowercased() == target }
     }
 
     /// Full-array replace matching the semantics the old UserDefaults-array
@@ -273,12 +300,8 @@ final class VocabularyStore: @unchecked Sendable {
     func deleteWhere(sourceCaseInsensitive source: String) {
         queue.sync {
             guard let db else { return }
-            let sql = "DELETE FROM corrections WHERE source = ?;"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-            defer { sqlite3_finalize(statement) }
-            bindText(statement, 1, source)
-            _ = sqlite3_step(statement)
+            guard let existing = findRowLocked(db: db, sourceCaseInsensitive: source) else { return }
+            deleteLocked(db: db, id: existing.id)
         }
     }
 
