@@ -41,8 +41,14 @@ final class VocabularyStore: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "com.local.superdictate.vocabulary-store")
 
+    /// True only for the in-memory fallback created by inMemoryFallback().
+    /// Callers (see Settings.migrateLegacyTranscriptCorrectionsIfNeeded)
+    /// use this to avoid ever treating data written into an ephemeral
+    /// store as durably migrated — see C2 in the final-review fix report.
+    let isEphemeral: Bool
+
     convenience init(fileURL: URL) throws {
-        try self.init(sqlitePath: fileURL.path)
+        try self.init(sqlitePath: fileURL.path, isEphemeral: false)
     }
 
     /// Last-resort constructor for the (expected-never) case where even
@@ -53,7 +59,7 @@ final class VocabularyStore: @unchecked Sendable {
     static func inMemoryFallback() -> VocabularyStore {
         // Force-unwrap is safe: ":memory:" always succeeds in SQLite,
         // and createSchema() against a fresh in-memory DB cannot fail.
-        try! VocabularyStore(sqlitePath: ":memory:")
+        try! VocabularyStore(sqlitePath: ":memory:", isEphemeral: true)
     }
 
     /// Designated initializer, keyed off a raw SQLite path/filename
@@ -63,7 +69,8 @@ final class VocabularyStore: @unchecked Sendable {
     /// directory (e.g. "/Users/me/:memory:"), which would silently turn
     /// "in-memory" into "write a file literally named :memory: to disk".
     /// Going through a plain String sidesteps that entirely.
-    private init(sqlitePath: String) throws {
+    private init(sqlitePath: String, isEphemeral: Bool) throws {
+        self.isEphemeral = isEphemeral
         // ":memory:" (used only by inMemoryFallback() above) has no parent
         // directory to create — skip the directory step for it so this
         // doesn't try to create "/" on disk.
@@ -84,6 +91,12 @@ final class VocabularyStore: @unchecked Sendable {
             throw VocabularyStoreError.openFailed(message)
         }
         self.db = handle
+        // The main app and the separate Control Panel process both open
+        // their own connection to the same on-disk corrections.sqlite, so
+        // SQLITE_BUSY from a concurrent writer is a real, expected event —
+        // give SQLite's own retry-on-lock behavior a real window instead
+        // of failing (and being silently swallowed by try?) instantly.
+        sqlite3_busy_timeout(handle, 3000)
         try queue.sync { try createSchema() }
     }
 
@@ -171,14 +184,19 @@ final class VocabularyStore: @unchecked Sendable {
         }
     }
 
-    /// Dedup lookup is done here in Swift (via `.lowercased()`) rather than
-    /// leaning on SQLite's `COLLATE NOCASE`/unique index: SQLite's built-in
-    /// NOCASE collation only folds ASCII A-Z — it leaves non-ASCII text
-    /// (Cyrillic, Greek, accented Latin, etc.) untouched, so "Инглиш" and
-    /// "инглиш" would compare unequal and the ON CONFLICT dedup would
+    /// Dedup lookup is done here in Swift (via
+    /// `normalizedTranscriptCorrectionSource`, ModelDownload.swift) rather
+    /// than leaning on SQLite's `COLLATE NOCASE`/unique index: SQLite's
+    /// built-in NOCASE collation only folds ASCII A-Z — it leaves non-ASCII
+    /// text (Cyrillic, Greek, accented Latin, etc.) untouched, so "Инглиш"
+    /// and "инглиш" would compare unequal and the ON CONFLICT dedup would
     /// silently insert a second row instead of updating the first one.
-    /// `String.lowercased()` is Unicode-aware and does the right thing for
-    /// all scripts this app's users actually dictate in.
+    /// `normalizedTranscriptCorrectionSource` is Unicode-aware (via
+    /// `.lowercased()`) *and* collapses internal whitespace, matching the
+    /// canonical correction-identity key the rest of the app (import
+    /// summaries, merge logic) already assumes — using a weaker key here
+    /// let whitespace-variant duplicates slip into the store that those
+    /// call sites then choke on. See C1 in the final-review fix report.
     private func upsertLocked(db: OpaquePointer, source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
         let now = ISO8601DateFormatter().string(from: Date())
         if let existing = findRowLocked(db: db, sourceCaseInsensitive: source) {
@@ -249,8 +267,8 @@ final class VocabularyStore: @unchecked Sendable {
     /// against the NOCASE-collated column. Row counts here are capped at
     /// MAX_TRANSCRIPT_CORRECTIONS (512), so a linear scan is cheap.
     private func findRowLocked(db: OpaquePointer, sourceCaseInsensitive source: String) -> VocabularyRecord? {
-        let target = source.lowercased()
-        return allLocked(db: db).first { $0.source.lowercased() == target }
+        let target = normalizedTranscriptCorrectionSource(source)
+        return allLocked(db: db).first { normalizedTranscriptCorrectionSource($0.source) == target }
     }
 
     /// Full-array replace matching the semantics the old UserDefaults-array
@@ -260,29 +278,57 @@ final class VocabularyStore: @unchecked Sendable {
     /// the menu doesn't downgrade a learned entry's origin badge back to
     /// nothing, and vice versa a manual edit of a learned row's
     /// replacement text keeps it tagged `learned`).
+    /// Wrapped in a single transaction: this method issues a sequence of
+    /// deletes and upserts, and every one of them is used on the exact
+    /// path a menu-bar corrections save, import, or folder-sync apply
+    /// goes through. Without a transaction, a mid-sequence failure (e.g.
+    /// SQLITE_BUSY once the busy-timeout window expires) would leave the
+    /// store partially updated — some rows deleted, not yet replaced. See
+    /// I4 in the final-review fix report.
     func replaceAllPreservingOrigin(_ corrections: [TranscriptCorrection]) {
         queue.sync {
             guard let db else { return }
-            let wantedSources = Set(corrections.map { $0.source.lowercased() })
-            let existing = allLocked(db: db)
-            for row in existing where !wantedSources.contains(row.source.lowercased()) {
-                deleteLocked(db: db, id: row.id)
+
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                log("vocabulary: replaceAllPreservingOrigin could not start a transaction (store likely busy); leaving the store untouched")
+                return
             }
-            let existingBySource = Dictionary(uniqueKeysWithValues: existing.map { ($0.source.lowercased(), $0) })
-            for correction in corrections {
-                let origin = existingBySource[correction.source.lowercased()]?.origin ?? .manual
-                _ = try? upsertLocked(db: db, source: correction.source, replacement: correction.replacement, origin: origin)
+
+            do {
+                // Keyed with the same canonical normalizer findRowLocked
+                // uses, so this stays consistent with upsertLocked's own
+                // dedup key — see C1 in the final-review fix report.
+                let wantedSources = Set(corrections.map { normalizedTranscriptCorrectionSource($0.source) })
+                let existing = allLocked(db: db)
+                for row in existing where !wantedSources.contains(normalizedTranscriptCorrectionSource(row.source)) {
+                    guard deleteLocked(db: db, id: row.id) else {
+                        throw VocabularyStoreError.sqlError("failed to delete row \(row.id) during replaceAllPreservingOrigin")
+                    }
+                }
+                let existingBySource = Dictionary(
+                    existing.map { (normalizedTranscriptCorrectionSource($0.source), $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                for correction in corrections {
+                    let origin = existingBySource[normalizedTranscriptCorrectionSource(correction.source)]?.origin ?? .manual
+                    _ = try upsertLocked(db: db, source: correction.source, replacement: correction.replacement, origin: origin)
+                }
+                try execute("COMMIT;")
+            } catch {
+                try? execute("ROLLBACK;")
+                log("vocabulary: replaceAllPreservingOrigin failed, rolled back to the pre-call state: \(error)")
             }
         }
     }
 
-    private func deleteLocked(db: OpaquePointer, id: Int64) {
+    @discardableResult
+    private func deleteLocked(db: OpaquePointer, id: Int64) -> Bool {
         let sql = "DELETE FROM corrections WHERE id = ?;"
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int64(statement, 1, id)
-        _ = sqlite3_step(statement)
+        return sqlite3_step(statement) == SQLITE_DONE
     }
 
     func delete(id: Int64) {

@@ -5340,9 +5340,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func correctionImportSummary(for imported: [TranscriptCorrection]) -> CorrectionImportSummary {
-        let existingBySource = Dictionary(uniqueKeysWithValues: settings.transcriptCorrections.map {
-            (normalizedTranscriptCorrectionSource($0.source), $0)
-        })
+        // uniquingKeysWith rather than uniqueKeysWithValues: the store now
+        // keys dedup on this same normalizer (see VocabularyStore.swift,
+        // C1 in the final-review fix report), but data written before
+        // that fix could still contain a whitespace-variant duplicate
+        // pair on disk — this must never crash on such rows. "First wins"
+        // matches allLocked()'s `ORDER BY source COLLATE NOCASE ASC`,
+        // i.e. the row findRowLocked would itself return.
+        let existingBySource = Dictionary(
+            settings.transcriptCorrections.map { (normalizedTranscriptCorrectionSource($0.source), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         var newCount = 0
         var updatedCount = 0
@@ -5377,9 +5385,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return imported
         case .merge:
             var merged = settings.transcriptCorrections
-            var indexBySource = Dictionary(uniqueKeysWithValues: merged.enumerated().map {
-                (normalizedTranscriptCorrectionSource($0.element.source), $0.offset)
-            })
+            // uniquingKeysWith, not uniqueKeysWithValues — same rationale
+            // as correctionImportSummary above. "Last wins" here matches
+            // the loop below, which also does last-write-wins on
+            // `indexBySource[key] = ...`.
+            var indexBySource = Dictionary(
+                merged.enumerated().map { (normalizedTranscriptCorrectionSource($0.element.source), $0.offset) },
+                uniquingKeysWith: { _, second in second }
+            )
 
             for correction in imported {
                 let key = normalizedTranscriptCorrectionSource(correction.source)

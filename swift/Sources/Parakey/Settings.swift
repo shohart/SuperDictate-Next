@@ -117,6 +117,18 @@ final class Settings: @unchecked Sendable {
     }
 
     private func migrateLegacyTranscriptCorrectionsIfNeeded() {
+        // If openDefaultVocabularyStore() had to fall back to an
+        // in-memory store (e.g. the on-disk DB is corrupted or locked),
+        // never let migration "complete" against it: upserts would only
+        // ever live in memory, and marking migration done + deleting the
+        // UserDefaults copy here would destroy the user's entire
+        // correction history the moment the process exits, with no
+        // retry. Skip so a future launch where the real store opens can
+        // retry migration correctly. See C2 in the final-review fix report.
+        guard !vocabularyStore.isEphemeral else {
+            log("settings: vocabulary store is ephemeral (in-memory fallback); skipping legacy migration so the UserDefaults copy survives for a future real attempt")
+            return
+        }
         guard !defaults.bool(forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite) else { return }
 
         guard let data = defaults.data(forKey: Self.keyTranscriptCorrections) else {

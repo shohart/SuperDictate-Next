@@ -138,7 +138,24 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
 
     @objc private func addTapped() {
         guard let pair = promptForCorrection(existingSource: "", existingReplacement: "") else { return }
-        _ = try? store.upsert(source: pair.source, replacement: pair.replacement, origin: .manual)
+        guard let validated = normalizedTranscriptCorrections(
+            [TranscriptCorrection(source: pair.source, replacement: pair.replacement)]
+        ).first else {
+            presentError("That correction was rejected: it's empty, too long, or contains characters Parakey can't store.")
+            return
+        }
+        // Only refuse for genuinely new sources — an add that overwrites
+        // an existing row (case/whitespace-insensitive) is an update, not
+        // a new row, and must not be blocked by the cap. See I5 in the
+        // final-review fix report.
+        let isNewSource = !records.contains {
+            normalizedTranscriptCorrectionSource($0.source) == normalizedTranscriptCorrectionSource(validated.source)
+        }
+        if isNewSource, store.count() >= MAX_TRANSCRIPT_CORRECTIONS {
+            presentError("Parakey keeps at most \(MAX_TRANSCRIPT_CORRECTIONS) corrections, and that limit has been reached. Delete an existing entry before adding a new one.")
+            return
+        }
+        _ = try? store.upsert(source: validated.source, replacement: validated.replacement, origin: .manual)
         reload()
     }
 
@@ -146,17 +163,24 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         guard let tableView, tableView.selectedRow >= 0, records.indices.contains(tableView.selectedRow) else { return }
         let record = records[tableView.selectedRow]
         guard let pair = promptForCorrection(existingSource: record.source, existingReplacement: record.replacement) else { return }
-        let collidesWithOtherRow = records.contains { other in
-            other.id != record.id && other.source.lowercased() == pair.source.lowercased()
-        }
-        if collidesWithOtherRow {
-            presentError("A correction for \"\(pair.source)\" already exists.")
+        guard let validated = normalizedTranscriptCorrections(
+            [TranscriptCorrection(source: pair.source, replacement: pair.replacement)]
+        ).first else {
+            presentError("That correction was rejected: it's empty, too long, or contains characters Parakey can't store.")
             return
         }
-        if pair.source.lowercased() != record.source.lowercased() {
+        let collidesWithOtherRow = records.contains { other in
+            other.id != record.id
+                && normalizedTranscriptCorrectionSource(other.source) == normalizedTranscriptCorrectionSource(validated.source)
+        }
+        if collidesWithOtherRow {
+            presentError("A correction for \"\(validated.source)\" already exists.")
+            return
+        }
+        if normalizedTranscriptCorrectionSource(validated.source) != normalizedTranscriptCorrectionSource(record.source) {
             store.delete(id: record.id)
         }
-        _ = try? store.upsert(source: pair.source, replacement: pair.replacement, origin: record.origin)
+        _ = try? store.upsert(source: validated.source, replacement: validated.replacement, origin: record.origin)
         reload()
     }
 

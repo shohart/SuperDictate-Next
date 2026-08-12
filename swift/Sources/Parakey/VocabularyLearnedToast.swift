@@ -80,7 +80,11 @@ final class VocabularyLearnedToastController {
 
         let undoButton = NSButton(title: "Отменить", target: nil, action: nil)
         undoButton.bezelStyle = .rounded
-        undoButton.keyEquivalent = "\u{1b}"
+        // Deliberately no keyEquivalent here. Escape conventionally means
+        // "dismiss, do nothing" everywhere else in macOS UI; binding it to
+        // Undo would make pressing Escape near this toast actively delete
+        // the just-learned correction instead of a harmless no-op. See I6
+        // in the final-review fix report.
         let action = UndoButtonAction(handler: onUndo)
         undoButton.target = action
         undoButton.action = #selector(UndoButtonAction.undoTapped)
