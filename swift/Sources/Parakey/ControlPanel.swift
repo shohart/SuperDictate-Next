@@ -127,6 +127,7 @@ enum ControlPanelUpdateState: Equatable, Sendable {
 final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
+    private lazy var vocabularyManagerWindowController = VocabularyManagerWindowController(store: Settings.shared.vocabularyStore)
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
     private var updateTask: Task<Void, Never>?
@@ -1569,7 +1570,24 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
             size: 12,
             color: .secondaryLabelColor
         ))
-        return text
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(panelButton(
+            t("Открыть словарь…", "Open Vocabulary…"),
+            action: #selector(openVocabularyManager),
+            toolTip: t("Открыть окно управления словарём исправлений (добавить, изменить, удалить, импорт/экспорт).",
+                       "Open the vocabulary manager window (add, edit, delete, import/export).")
+        ))
+        return row
+    }
+
+    @objc private func openVocabularyManager() {
+        vocabularyManagerWindowController.show()
     }
 
     private static let enterDelayOptions: [(title: String, value: String)] = [
