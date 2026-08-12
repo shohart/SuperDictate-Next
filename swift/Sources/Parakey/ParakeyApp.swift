@@ -157,6 +157,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store: settings.vocabularyStore,
         onLearned: { [weak self] record in self?.showVocabularyLearnedToast(record) }
     )
+    private let vocabularyLearnedToastController = VocabularyLearnedToastController()
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -6599,10 +6600,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // TODO(Task 6): remove this stub once ParakeyApp gets a real toast for
-    // learned vocabulary corrections; postInsertionWatcher's onLearned
-    // closure calls this today only so it compiles standalone.
-    private func showVocabularyLearnedToast(_ record: VocabularyRecord) {}
+    private func showVocabularyLearnedToast(_ record: VocabularyRecord) {
+        vocabularyLearnedToastController.show(record, store: settings.vocabularyStore)
+    }
 
 }
 
