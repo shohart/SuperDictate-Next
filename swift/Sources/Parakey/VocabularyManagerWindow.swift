@@ -146,6 +146,13 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         guard let tableView, tableView.selectedRow >= 0, records.indices.contains(tableView.selectedRow) else { return }
         let record = records[tableView.selectedRow]
         guard let pair = promptForCorrection(existingSource: record.source, existingReplacement: record.replacement) else { return }
+        let collidesWithOtherRow = records.contains { other in
+            other.id != record.id && other.source.lowercased() == pair.source.lowercased()
+        }
+        if collidesWithOtherRow {
+            presentError("A correction for \"\(pair.source)\" already exists.")
+            return
+        }
         if pair.source.lowercased() != record.source.lowercased() {
             store.delete(id: record.id)
         }
@@ -160,29 +167,38 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     }
 
     private func promptForCorrection(existingSource: String, existingReplacement: String) -> (source: String, replacement: String)? {
-        let alert = NSAlert()
-        alert.messageText = "Text Correction"
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
+        var currentSource = existingSource
+        var currentReplacement = existingReplacement
 
-        let container = NSStackView()
-        container.orientation = .vertical
-        container.spacing = 8
-        container.frame = NSRect(x: 0, y: 0, width: 280, height: 60)
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Text Correction"
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
 
-        let sourceField = NSTextField(string: existingSource)
-        sourceField.placeholderString = "Model said…"
-        let replacementField = NSTextField(string: existingReplacement)
-        replacementField.placeholderString = "Should say…"
-        container.addArrangedSubview(sourceField)
-        container.addArrangedSubview(replacementField)
-        alert.accessoryView = container
+            let container = NSStackView()
+            container.orientation = .vertical
+            container.spacing = 8
+            container.frame = NSRect(x: 0, y: 0, width: 280, height: 60)
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let source = sourceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let replacement = replacementField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !source.isEmpty, !replacement.isEmpty else { return nil }
-        return (source, replacement)
+            let sourceField = NSTextField(string: currentSource)
+            sourceField.placeholderString = "Model said…"
+            let replacementField = NSTextField(string: currentReplacement)
+            replacementField.placeholderString = "Should say…"
+            container.addArrangedSubview(sourceField)
+            container.addArrangedSubview(replacementField)
+            alert.accessoryView = container
+
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            let source = sourceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let replacement = replacementField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            currentSource = source
+            currentReplacement = replacement
+            if !source.isEmpty, !replacement.isEmpty {
+                return (source, replacement)
+            }
+            presentError("Both fields are required.")
+        }
     }
 
     @objc private func importTapped() {
