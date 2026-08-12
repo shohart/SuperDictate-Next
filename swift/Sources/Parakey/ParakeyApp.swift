@@ -2360,11 +2360,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 targetElementStillValid: isAXElementStillValid(textInsertionTarget.element)
                             )
                         }
-                        if let textInsertionTarget,
-                           settings.autoLearnVocabularyEnabled,
-                           focusedTargetResult == .insertedUsingSelectedText || focusedTargetResult == .insertedUsingValueAndRange {
-                            postInsertionWatcher.beginWatching(insertedText: textToInsert, target: textInsertionTarget)
-                        }
                         switch route {
                         case .usedFocusedTarget:
                             inserted = true
@@ -2411,6 +2406,34 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         } else {
                             log("text insertion failed")
                             dictationFailed = true
+                        }
+
+                        if inserted, settings.autoLearnVocabularyEnabled {
+                            if let textInsertionTarget, route == .usedFocusedTarget {
+                                // We already have a live FocusedTextTarget from the
+                                // AX-targeted insertion path — reuse it, no extra AX round-trip.
+                                postInsertionWatcher.beginWatching(insertedText: textToInsert, target: textInsertionTarget)
+                            } else {
+                                // The actual production path today (global-post fallback,
+                                // TextInserter.insert) never resolves a FocusedTextTarget at
+                                // all -- captureTextInsertionTargetForNextDictation() is
+                                // disabled via axFocusedInsertionEnabled (see its own doc
+                                // comment). Resolve one fresh, read-only, purely to observe
+                                // for a post-insertion edit -- this carries none of the risk
+                                // that disabled the AX-targeted *insertion* path, since we
+                                // are not using this resolution to insert anything.
+                                Task { [weak self] in
+                                    guard let self else { return }
+                                    do {
+                                        let target = try await Task.detached(priority: .userInitiated) {
+                                            try FocusedTextTargetResolver().captureTarget()
+                                        }.value
+                                        self.postInsertionWatcher.beginWatching(insertedText: textToInsert, target: target)
+                                    } catch {
+                                        log("PostInsertionEditWatcher: post-insertion focus capture failed: \(error)")
+                                    }
+                                }
+                            }
                         }
 
                         log(DictationLatencyMetrics(
