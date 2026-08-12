@@ -2361,7 +2361,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             )
                         }
                         if let textInsertionTarget,
-                           /* TODO(Task 7): replace with settings.autoLearnVocabularyEnabled */ true,
+                           settings.autoLearnVocabularyEnabled,
                            focusedTargetResult == .insertedUsingSelectedText || focusedTargetResult == .insertedUsingValueAndRange {
                             postInsertionWatcher.beginWatching(insertedText: textToInsert, target: textInsertionTarget)
                         }

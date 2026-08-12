@@ -72,6 +72,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var autoStopOnSilenceEnabled: Bool
     var autoStopSilenceSeconds: Int
     var muteWhileRecording: Bool
+    var autoLearnVocabularyEnabled: Bool
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -95,6 +96,7 @@ struct ControlPanelSettingsDraft: Equatable {
         autoStopOnSilenceEnabled = settings.autoStopOnSilenceEnabled
         autoStopSilenceSeconds = settings.autoStopSilenceSeconds
         muteWhileRecording = settings.muteWhileRecording
+        autoLearnVocabularyEnabled = settings.autoLearnVocabularyEnabled
     }
 }
 
@@ -403,6 +405,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         root.addArrangedSubview(muteWhileRecordingRow(draft))
         root.addArrangedSubview(launchAtLoginRow())
         root.addArrangedSubview(correctionsInfoRow())
+        root.addArrangedSubview(autoLearnVocabularyRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -1520,6 +1523,36 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         return row
     }
 
+    private func autoLearnVocabularyRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Автоматически учить словарь по вашим правкам", "Automatically learn vocabulary from your edits"),
+            size: 13,
+            weight: .semibold
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleAutoLearnVocabularySetting(_:))
+        toggle.state = draft.autoLearnVocabularyEnabled ? .on : .off
+        toggle.toolTip = t("Автоматически учить словарь по вашим правкам.",
+                           "Automatically learn vocabulary from your edits.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func correctionsInfoRow() -> NSView {
         let text = NSStackView()
         text.orientation = .vertical
@@ -2323,6 +2356,13 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         refreshSettingsWindow()
     }
 
+    @objc private func toggleAutoLearnVocabularySetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.autoLearnVocabularyEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func toggleLaunchAtLoginSetting(_ sender: NSSwitch) {
         do {
             switch SMAppService.mainApp.status {
@@ -2430,6 +2470,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         settings.autoStopOnSilenceEnabled = draft.autoStopOnSilenceEnabled
         settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
         settings.muteWhileRecording = draft.muteWhileRecording
+        settings.autoLearnVocabularyEnabled = draft.autoLearnVocabularyEnabled
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)

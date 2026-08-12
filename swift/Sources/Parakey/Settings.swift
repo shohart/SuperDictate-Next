@@ -66,6 +66,7 @@ final class Settings: @unchecked Sendable {
     private static let keyTranscriptCorrections = "transcript_corrections"
     private static let keyTranscriptCorrectionsSyncFile = "transcript_corrections_sync_file"
     private static let keyDidMigrateTranscriptCorrectionsToSQLite = "did_migrate_transcript_corrections_to_sqlite_v1"
+    private static let keyAutoLearnVocabularyEnabled = "auto_learn_vocabulary_enabled_v1"
     private static let keyDictationLanguage = "dictation_language"
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
@@ -699,6 +700,13 @@ final class Settings: @unchecked Sendable {
                 defaults.set(versions, forKey: Self.keySkippedVersions)
             }
         }
+    }
+
+    var autoLearnVocabularyEnabled: Bool {
+        get {
+            defaults.object(forKey: Self.keyAutoLearnVocabularyEnabled) as? Bool ?? true
+        }
+        set { defaults.set(newValue, forKey: Self.keyAutoLearnVocabularyEnabled) }
     }
 
     var transcriptCorrections: [TranscriptCorrection] {
