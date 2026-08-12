@@ -103,63 +103,134 @@ final class VocabularyStore: @unchecked Sendable {
     func all() -> [VocabularyRecord] {
         queue.sync {
             guard let db else { return [] }
-            let sql = "SELECT id, source, replacement, origin, created_at, updated_at FROM corrections ORDER BY source COLLATE NOCASE ASC;"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-            defer { sqlite3_finalize(statement) }
-
-            var results: [VocabularyRecord] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                if let record = record(from: statement) {
-                    results.append(record)
-                }
-            }
-            return results
+            return allLocked(db: db)
         }
+    }
+
+    private func allLocked(db: OpaquePointer) -> [VocabularyRecord] {
+        let sql = "SELECT id, source, replacement, origin, created_at, updated_at FROM corrections ORDER BY source COLLATE NOCASE ASC;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+
+        var results: [VocabularyRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let record = record(from: statement) {
+                results.append(record)
+            }
+        }
+        return results
     }
 
     func count() -> Int {
         queue.sync {
             guard let db else { return 0 }
-            let sql = "SELECT COUNT(*) FROM corrections;"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
-            defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
-            return Int(sqlite3_column_int64(statement, 0))
+            return countLocked(db: db)
         }
+    }
+
+    private func countLocked(db: OpaquePointer) -> Int {
+        let sql = "SELECT COUNT(*) FROM corrections;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
     @discardableResult
     func upsert(source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
         try queue.sync {
             guard let db else { throw VocabularyStoreError.sqlError("database closed") }
-            let now = ISO8601DateFormatter().string(from: Date())
-            let sql = """
-            INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(source) DO UPDATE SET
-                replacement = excluded.replacement,
-                updated_at = excluded.updated_at
-            RETURNING id, source, replacement, origin, created_at, updated_at;
-            """
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
-            }
-            defer { sqlite3_finalize(statement) }
-
-            bindText(statement, 1, source)
-            bindText(statement, 2, replacement)
-            bindText(statement, 3, origin.rawValue)
-            bindText(statement, 4, now)
-            bindText(statement, 5, now)
-
-            guard sqlite3_step(statement) == SQLITE_ROW, let record = record(from: statement) else {
-                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
-            }
-            return record
+            return try upsertLocked(db: db, source: source, replacement: replacement, origin: origin)
         }
+    }
+
+    private func upsertLocked(db: OpaquePointer, source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
+        let now = ISO8601DateFormatter().string(from: Date())
+        let sql = """
+        INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET
+            replacement = excluded.replacement,
+            updated_at = excluded.updated_at
+        RETURNING id, source, replacement, origin, created_at, updated_at;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bindText(statement, 1, source)
+        bindText(statement, 2, replacement)
+        bindText(statement, 3, origin.rawValue)
+        bindText(statement, 4, now)
+        bindText(statement, 5, now)
+
+        guard sqlite3_step(statement) == SQLITE_ROW, let record = record(from: statement) else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        return record
+    }
+
+    private func insertLocked(db: OpaquePointer, source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
+        try upsertLocked(db: db, source: source, replacement: replacement, origin: origin)
+    }
+
+    /// Used by PostInsertionEditWatcher. Never evicts existing rows and
+    /// never overwrites an existing correction for the same source
+    /// (manual or previously-learned) — if the source is already known,
+    /// this is a no-op so a manual correction can never be silently
+    /// clobbered by auto-learning.
+    func recordLearned(source: String, replacement: String) -> VocabularyRecord? {
+        queue.sync {
+            guard let db else { return nil }
+            if rowExists(db: db, sourceCaseInsensitive: source) { return nil }
+            guard countLocked(db: db) < MAX_TRANSCRIPT_CORRECTIONS else { return nil }
+            return try? insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+        }
+    }
+
+    private func rowExists(db: OpaquePointer, sourceCaseInsensitive source: String) -> Bool {
+        let sql = "SELECT 1 FROM corrections WHERE source = ? LIMIT 1;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, source)
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    /// Full-array replace matching the semantics the old UserDefaults-array
+    /// setter had: any source not in `corrections` is removed, every
+    /// source in `corrections` is present afterward. Existing rows keep
+    /// their `origin`/`created_at` (so re-saving the same manual list from
+    /// the menu doesn't downgrade a learned entry's origin badge back to
+    /// nothing, and vice versa a manual edit of a learned row's
+    /// replacement text keeps it tagged `learned`).
+    func replaceAllPreservingOrigin(_ corrections: [TranscriptCorrection]) {
+        queue.sync {
+            guard let db else { return }
+            let wantedSources = Set(corrections.map { $0.source.lowercased() })
+            let existing = allLocked(db: db)
+            for row in existing where !wantedSources.contains(row.source.lowercased()) {
+                deleteLocked(db: db, id: row.id)
+            }
+            let existingBySource = Dictionary(uniqueKeysWithValues: existing.map { ($0.source.lowercased(), $0) })
+            for correction in corrections {
+                let origin = existingBySource[correction.source.lowercased()]?.origin ?? .manual
+                _ = try? upsertLocked(db: db, source: correction.source, replacement: correction.replacement, origin: origin)
+            }
+        }
+    }
+
+    private func deleteLocked(db: OpaquePointer, id: Int64) {
+        let sql = "DELETE FROM corrections WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, id)
+        _ = sqlite3_step(statement)
     }
 
     func delete(id: Int64) {
