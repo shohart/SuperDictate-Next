@@ -83,7 +83,7 @@ final class VocabularyLearnedToastController {
         undoButton.keyEquivalent = "\u{1b}"
         let action = UndoButtonAction(handler: onUndo)
         undoButton.target = action
-        undoButton.action = #selector(UndoButtonAction.perform)
+        undoButton.action = #selector(UndoButtonAction.undoTapped)
         objc_setAssociatedObject(undoButton, &UndoButtonAction.associationKey, action, .OBJC_ASSOCIATION_RETAIN)
 
         stack.addArrangedSubview(label)
@@ -113,8 +113,8 @@ final class VocabularyLearnedToastController {
 /// NSButton's target must be an NSObject; this wraps a Swift closure so
 /// the toast controller doesn't need to become one itself.
 private final class UndoButtonAction: NSObject {
-    static var associationKey: UInt8 = 0
+    nonisolated(unsafe) static var associationKey: UInt8 = 0
     let handler: () -> Void
     init(handler: @escaping () -> Void) { self.handler = handler }
-    @objc func perform() { handler() }
+    @objc func undoTapped() { handler() }
 }
