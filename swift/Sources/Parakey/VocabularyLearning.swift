@@ -128,11 +128,19 @@ struct VocabularyLearningTestFailure: Error, CustomStringConvertible {
 @MainActor
 final class PostInsertionEditWatcher {
     static let watchWindowSeconds: TimeInterval = 45
-    static let debounceSeconds: TimeInterval = 0.8
+    static let debounceSeconds: TimeInterval = 1.2
+    /// Second-stage "confirm" delay: once a debounce cycle finds a valid
+    /// learn candidate, we don't commit it immediately — we wait this much
+    /// longer, uninterrupted, before actually saving. Any further edit
+    /// during this window cancels the confirm and restarts the normal
+    /// debounce → evaluate cycle, so a user who is still mid-correction
+    /// (edit, pause, edit again) keeps resetting the clock instead of
+    /// having a half-finished correction learned.
+    static let confirmSeconds: TimeInterval = 2.5
     private static let secureSubroles: Set<String> = ["AXSecureTextField"]
 
     private let store: VocabularyStore
-    private let onLearned: (VocabularyRecord) -> Void
+    private let onLearned: (VocabularyRecord, NSRect?) -> Void
 
     private var observer: AXObserver?
     private var observedElement: AXUIElement?
@@ -141,10 +149,12 @@ final class PostInsertionEditWatcher {
     private var anchorPrefix: String = ""
     private var anchorSuffix: String = ""
     private var debounceTask: Task<Void, Never>?
+    private var confirmTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
+    private var pendingCandidate: LearnCandidate?
     private var watchGeneration: Int = 0
 
-    init(store: VocabularyStore, onLearned: @escaping (VocabularyRecord) -> Void) {
+    init(store: VocabularyStore, onLearned: @escaping (VocabularyRecord, NSRect?) -> Void) {
         self.store = store
         self.onLearned = onLearned
     }
@@ -216,6 +226,9 @@ final class PostInsertionEditWatcher {
         expiryTask = nil
         debounceTask?.cancel()
         debounceTask = nil
+        confirmTask?.cancel()
+        confirmTask = nil
+        pendingCandidate = nil
         if let observer {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
         }
@@ -278,6 +291,15 @@ final class PostInsertionEditWatcher {
         }
         guard notification == (kAXValueChangedNotification as String) else { return }
 
+        // A new edit arrived — even if a candidate from a previous debounce
+        // cycle was sitting in the confirm stage waiting to be committed,
+        // the user is clearly still correcting, so that pending candidate
+        // is stale. Cancel it and restart the debounce → evaluate cycle
+        // fresh, exactly as if this were the first edit.
+        confirmTask?.cancel()
+        confirmTask = nil
+        pendingCandidate = nil
+
         let generation = watchGeneration
         debounceTask?.cancel()
         debounceTask = Task { [weak self] in
@@ -326,7 +348,31 @@ final class PostInsertionEditWatcher {
             log("PostInsertionEditWatcher: evaluateEdit — inserted region is now \"\(currentInsertedRegion)\" (was \"\(insertedText)\"), no ≤3-word learn candidate; continuing to watch")
             return
         }
-        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"")
+        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"; starting \(Int(Self.confirmSeconds))s confirm stage before saving")
+        // A candidate was found, but don't commit it yet — the user may
+        // still be mid-correction. Start (or restart) a second, longer
+        // timer; only if it fires uninterrupted (no further edits, which
+        // would cancel it via handleNotification) do we actually save.
+        pendingCandidate = candidate
+        let generation = watchGeneration
+        confirmTask?.cancel()
+        confirmTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.confirmSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            guard let self, self.watchGeneration == generation else { return }
+            self.commitPendingCandidate()
+        }
+    }
+
+    /// Called only after the confirm-stage timer fires uninterrupted.
+    /// Actually persists the candidate found by evaluateEdit() and reports
+    /// it, using the observed element's on-screen frame (if resolvable) so
+    /// the toast can be positioned near the field the correction happened in.
+    private func commitPendingCandidate() {
+        guard let candidate = pendingCandidate else {
+            log("PostInsertionEditWatcher: commitPendingCandidate — no pending candidate, nothing to do")
+            return
+        }
         // A learn candidate was found: recordLearned returning nil means the
         // store declined to store it (already known, or the cap was hit) —
         // not a failure to detect the correction — so either way this
@@ -334,7 +380,8 @@ final class PostInsertionEditWatcher {
         // keep watching it.
         if let record = store.recordLearned(source: candidate.source, replacement: candidate.replacement) {
             log("PostInsertionEditWatcher: recorded new correction id=\(record.id)")
-            onLearned(record)
+            let frame = observedElement.flatMap(resolveElementFrame)
+            onLearned(record, frame)
         } else {
             log("PostInsertionEditWatcher: recordLearned declined (already known or cap reached)")
         }
@@ -360,4 +407,53 @@ final class PostInsertionEditWatcher {
         guard AXValueGetValue(value, .cfRange, &range) else { return nil }
         return range
     }
+}
+
+/// Best-effort conversion of an AXUIElement's on-screen frame
+/// (`kAXPositionAttribute`/`kAXSizeAttribute`, which AX reports in a
+/// top-left-origin/flipped-Y space) into an AppKit `NSRect`
+/// (bottom-left-origin). Returns nil if the attributes aren't readable —
+/// never guess. This intentionally doesn't attempt the full
+/// multi-screen-aware rigor of `FocusedInsertionTargetLocator`'s
+/// `elementFrame`/`appKitRect(fromAXRect:context:)` in TextInsertion.swift
+/// (tuned for the demanding text-insertion-anchor use case); it uses the
+/// primary screen's height as the flip reference, which is correct for the
+/// common single/primary-screen case and a reasonable approximation
+/// otherwise — good enough for "place a toast near this field."
+@MainActor
+func resolveElementFrame(_ element: AXUIElement) -> NSRect? {
+    var positionRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
+          let positionRef,
+          CFGetTypeID(positionRef) == AXValueGetTypeID() else {
+        return nil
+    }
+    var sizeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+          let sizeRef,
+          CFGetTypeID(sizeRef) == AXValueGetTypeID() else {
+        return nil
+    }
+
+    let positionValue = unsafeDowncast(positionRef, to: AXValue.self)
+    let sizeValue = unsafeDowncast(sizeRef, to: AXValue.self)
+    guard AXValueGetType(positionValue) == .cgPoint, AXValueGetType(sizeValue) == .cgSize else {
+        return nil
+    }
+
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue, .cgPoint, &point),
+          AXValueGetValue(sizeValue, .cgSize, &size),
+          size.width.isFinite, size.height.isFinite,
+          size.width > 0, size.height > 0,
+          point.x.isFinite, point.y.isFinite else {
+        return nil
+    }
+
+    let referenceMaxY = NSScreen.screens.first?.frame.maxY ?? NSScreen.main?.frame.maxY ?? 0
+    return NSRect(x: point.x,
+                  y: referenceMaxY - point.y - size.height,
+                  width: size.width,
+                  height: size.height)
 }

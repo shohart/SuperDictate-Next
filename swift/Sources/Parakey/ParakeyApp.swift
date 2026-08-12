@@ -155,7 +155,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // `if let textInsertionTarget, ...` wiring at the insertion call site.
     private lazy var postInsertionWatcher = PostInsertionEditWatcher(
         store: settings.vocabularyStore,
-        onLearned: { [weak self] record in self?.showVocabularyLearnedToast(record) }
+        onLearned: { [weak self] record, targetFrame in self?.showVocabularyLearnedToast(record, targetFrame: targetFrame) }
     )
     private let vocabularyLearnedToastController = VocabularyLearnedToastController()
     private var globalMouseDownMonitor: Any?
@@ -6646,8 +6646,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func showVocabularyLearnedToast(_ record: VocabularyRecord) {
-        vocabularyLearnedToastController.show(record, store: settings.vocabularyStore)
+    private func showVocabularyLearnedToast(_ record: VocabularyRecord, targetFrame: NSRect?) {
+        vocabularyLearnedToastController.show(record, store: settings.vocabularyStore, targetFrame: targetFrame)
     }
 
 }
