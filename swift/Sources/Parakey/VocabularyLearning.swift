@@ -153,9 +153,19 @@ final class PostInsertionEditWatcher {
         stopWatching()
         watchGeneration += 1
         let generation = watchGeneration
-        guard !insertedText.isEmpty else { return }
-        guard !Self.secureSubroles.contains(target.subrole ?? "") else { return }
-        guard let anchor = computeAnchor(insertedText: insertedText, element: target.element) else { return }
+        log("PostInsertionEditWatcher: beginWatching app=\(target.applicationName ?? "?") role=\(target.role ?? "?") subrole=\(target.subrole ?? "nil") insertedLength=\(insertedText.count)")
+        guard !insertedText.isEmpty else {
+            log("PostInsertionEditWatcher: aborted — inserted text was empty")
+            return
+        }
+        guard !Self.secureSubroles.contains(target.subrole ?? "") else {
+            log("PostInsertionEditWatcher: aborted — secure text field")
+            return
+        }
+        guard let anchor = computeAnchor(insertedText: insertedText, element: target.element) else {
+            log("PostInsertionEditWatcher: aborted — could not compute a trustworthy anchor (see computeAnchor log line above)")
+            return
+        }
 
         var createdObserver: AXObserver?
         let callback: AXObserverCallback = { _, element, notification, refcon in
@@ -166,14 +176,18 @@ final class PostInsertionEditWatcher {
                 watcher.handleNotification(notificationName, element: element)
             }
         }
-        guard AXObserverCreate(target.elementPID, callback, &createdObserver) == .success,
-              let observer = createdObserver else {
+        let createStatus = AXObserverCreate(target.elementPID, callback, &createdObserver)
+        guard createStatus == .success, let observer = createdObserver else {
+            log("PostInsertionEditWatcher: aborted — AXObserverCreate failed (\(createStatus.rawValue))")
             return
         }
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         let valueResult = AXObserverAddNotification(observer, target.element, kAXValueChangedNotification as CFString, refcon)
-        guard valueResult == .success else { return }
+        guard valueResult == .success else {
+            log("PostInsertionEditWatcher: aborted — AXObserverAddNotification for kAXValueChangedNotification failed (\(valueResult.rawValue)); this app/element may not support AX value-change notifications at all")
+            return
+        }
         let focusResult = AXObserverAddNotification(observer, target.application, kAXFocusedUIElementChangedNotification as CFString, refcon)
         if focusResult != .success {
             log("PostInsertionEditWatcher: failed to register focus-change notification (\(focusResult.rawValue)); relying on \(Int(Self.watchWindowSeconds))s timeout only")
@@ -187,6 +201,7 @@ final class PostInsertionEditWatcher {
         self.insertedText = insertedText
         self.anchorPrefix = anchor.prefix
         self.anchorSuffix = anchor.suffix
+        log("PostInsertionEditWatcher: armed (generation=\(generation)), watching up to \(Int(Self.watchWindowSeconds))s")
 
         expiryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.watchWindowSeconds * 1_000_000_000))
@@ -218,20 +233,30 @@ final class PostInsertionEditWatcher {
     /// later diff to be trusted. Returns nil if the field's attributes
     /// aren't readable or the math doesn't add up (never guess).
     private func computeAnchor(insertedText: String, element: AXUIElement) -> (prefix: String, suffix: String)? {
-        guard let fieldValue = stringAttribute(element, kAXValueAttribute as CFString) else { return nil }
-        guard let cursorRange = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString) else { return nil }
+        guard let fieldValue = stringAttribute(element, kAXValueAttribute as CFString) else {
+            log("PostInsertionEditWatcher: computeAnchor — kAXValueAttribute not readable on this element")
+            return nil
+        }
+        guard let cursorRange = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString) else {
+            log("PostInsertionEditWatcher: computeAnchor — kAXSelectedTextRangeAttribute not readable on this element")
+            return nil
+        }
 
         let fieldNSString = fieldValue as NSString
         let insertedLength = (insertedText as NSString).length
         let insertionEnd = cursorRange.location
         let insertionStart = insertionEnd - insertedLength
-        guard insertionStart >= 0, insertionEnd <= fieldNSString.length else { return nil }
+        guard insertionStart >= 0, insertionEnd <= fieldNSString.length else {
+            log("PostInsertionEditWatcher: computeAnchor — cursor range (\(cursorRange.location),\(cursorRange.length)) doesn't fit insertedLength=\(insertedLength) within fieldLength=\(fieldNSString.length)")
+            return nil
+        }
 
         let insertedRange = NSRange(location: insertionStart, length: insertedLength)
         guard fieldNSString.substring(with: insertedRange) == insertedText else {
             // The selection/cursor position doesn't actually bracket the
             // text we just inserted (e.g. a stale kAXSelectedTextRangeAttribute
             // left over from before insertion) — don't guess at the anchor.
+            log("PostInsertionEditWatcher: computeAnchor — text at the cursor-derived range doesn't match what was inserted; refusing to guess")
             return nil
         }
 
@@ -241,8 +266,13 @@ final class PostInsertionEditWatcher {
     }
 
     private func handleNotification(_ notification: String, element: AXUIElement) {
-        guard observer != nil else { return }
+        guard observer != nil else {
+            log("PostInsertionEditWatcher: notification '\(notification)' received but no watch is active — ignoring")
+            return
+        }
+        log("PostInsertionEditWatcher: notification received: \(notification)")
         if notification == (kAXFocusedUIElementChangedNotification as String) {
+            log("PostInsertionEditWatcher: focus changed — stopping watch")
             stopWatching()
             return
         }
@@ -259,14 +289,21 @@ final class PostInsertionEditWatcher {
     }
 
     private func evaluateEdit() {
-        guard let observedElement else { return }
+        guard let observedElement else {
+            log("PostInsertionEditWatcher: evaluateEdit — no observedElement, nothing to do")
+            return
+        }
 
-        guard let currentValue = stringAttribute(observedElement, kAXValueAttribute as CFString) else { return }
+        guard let currentValue = stringAttribute(observedElement, kAXValueAttribute as CFString) else {
+            log("PostInsertionEditWatcher: evaluateEdit — kAXValueAttribute not readable after the edit")
+            return
+        }
         guard currentValue.hasPrefix(anchorPrefix), currentValue.hasSuffix(anchorSuffix) else {
             // The user edited outside the region SuperDictate inserted,
             // or the field's surrounding structure changed — can't
             // safely isolate what changed, so don't guess. The region is
             // no longer trustworthy, so stop watching entirely.
+            log("PostInsertionEditWatcher: evaluateEdit — current field value no longer has the expected prefix/suffix; stopping (anchor no longer trustworthy)")
             stopWatching()
             return
         }
@@ -275,6 +312,7 @@ final class PostInsertionEditWatcher {
         let prefixLength = (anchorPrefix as NSString).length
         let suffixLength = (anchorSuffix as NSString).length
         guard currentNSString.length >= prefixLength + suffixLength else {
+            log("PostInsertionEditWatcher: evaluateEdit — field shrank below prefix+suffix length; stopping")
             stopWatching()
             return
         }
@@ -285,15 +323,20 @@ final class PostInsertionEditWatcher {
             // No learnable candidate yet (or a spurious no-op notification) —
             // the anchor region is still valid, so keep watching for a
             // subsequent edit within the remaining window.
+            log("PostInsertionEditWatcher: evaluateEdit — inserted region is now \"\(currentInsertedRegion)\" (was \"\(insertedText)\"), no ≤3-word learn candidate; continuing to watch")
             return
         }
+        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"")
         // A learn candidate was found: recordLearned returning nil means the
         // store declined to store it (already known, or the cap was hit) —
         // not a failure to detect the correction — so either way this
         // insertion's correction has been captured and there's no need to
         // keep watching it.
         if let record = store.recordLearned(source: candidate.source, replacement: candidate.replacement) {
+            log("PostInsertionEditWatcher: recorded new correction id=\(record.id)")
             onLearned(record)
+        } else {
+            log("PostInsertionEditWatcher: recordLearned declined (already known or cap reached)")
         }
         stopWatching()
     }
