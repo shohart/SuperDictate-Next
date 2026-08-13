@@ -40,8 +40,45 @@ final class VocabularyLearnedToastController {
         } else {
             Self.positionBottomRight(panel)
         }
+
+        // Anchor the content view's scale at its own center (rather than
+        // the default bottom-left corner) so the grow-in/shrink-out below
+        // scales symmetrically outward from/inward to the pill's center,
+        // not from a corner. Changing anchorPoint shifts `position` (it's
+        // expressed in the same coordinate space as the layer's bounds
+        // scaled by the anchor), so `position` is recomputed to compensate
+        // and keep the layer's on-screen frame exactly where
+        // positionAboveTarget/positionBottomRight already placed it.
+        if let layer = content.layer {
+            let bounds = layer.bounds
+            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            layer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
+
+        // Animate in: start scaled-down + transparent, grow/fade to full
+        // size/opacity. Mirrors the visual effect of RecordingHUDView's
+        // reveal animation, implemented here with plain Core
+        // Animation/NSAnimationContext since this toast is a one-shot
+        // show/hide rather than a continuously-live, per-frame-driven view.
+        panel.alphaValue = 0
+        content.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
         panel.orderFrontRegardless()
         self.panel = panel
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = RECORDING_HUD_ANIMATE_IN_SECONDS
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+        let scaleIn = CABasicAnimation(keyPath: "transform")
+        scaleIn.fromValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
+        scaleIn.toValue = CATransform3DIdentity
+        scaleIn.duration = RECORDING_HUD_ANIMATE_IN_SECONDS
+        scaleIn.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        scaleIn.fillMode = .forwards
+        scaleIn.isRemovedOnCompletion = false
+        content.layer?.add(scaleIn, forKey: "toastScaleIn")
+        content.layer?.setAffineTransform(.identity)
 
         dismissTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.autoDismissSeconds * 1_000_000_000))
@@ -50,11 +87,38 @@ final class VocabularyLearnedToastController {
         }
     }
 
+    /// Scale the toast animates from (on appear) / to (on dismiss). Applied
+    /// to the content view's layer, which has its anchorPoint recentered in
+    /// `show(_:store:targetFrame:)` so scaling grows from/shrinks toward
+    /// the pill's own center rather than a corner.
+    private static let entryExitScale: CGFloat = 0.85
+
     private func dismiss() {
+        // Guard against double-invocation (e.g. the 7s auto-timer firing
+        // just as the user clicks/Escapes the toast): once the completion
+        // handler below runs, `panel` is nil'd out, so a second call here
+        // is a no-op instead of animating/ordering-out an already-gone panel.
+        guard let panel else { return }
         dismissTask?.cancel()
         dismissTask = nil
-        panel?.orderOut(nil)
-        panel = nil
+        self.panel = nil
+
+        let content = panel.contentView
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+        }, completionHandler: {
+            panel.orderOut(nil)
+        })
+        let scaleOut = CABasicAnimation(keyPath: "transform")
+        scaleOut.fromValue = CATransform3DIdentity
+        scaleOut.toValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
+        scaleOut.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
+        scaleOut.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        scaleOut.fillMode = .forwards
+        scaleOut.isRemovedOnCompletion = false
+        content?.layer?.add(scaleOut, forKey: "toastScaleOut")
     }
 
     // Pill geometry, chosen to read as an obviously-rounded capsule (like
