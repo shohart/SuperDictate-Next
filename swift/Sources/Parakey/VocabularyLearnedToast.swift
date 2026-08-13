@@ -62,6 +62,7 @@ final class VocabularyLearnedToastController {
         // show/hide rather than a continuously-live, per-frame-driven view.
         panel.alphaValue = 0
         content.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
+        panel.invalidateShadow()
         panel.orderFrontRegardless()
         self.panel = panel
 
@@ -70,6 +71,14 @@ final class VocabularyLearnedToastController {
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
         }
+        // Remove any exit animation left over from a dismiss() that was
+        // still in flight when this new show() started reusing the same
+        // key — without this, scaleOut (added under a different key by a
+        // near-simultaneous dismiss) can stay attached to this content
+        // view's layer and race with scaleIn on the same "transform"
+        // keyPath, leaving Core Animation's multi-animation resolution to
+        // decide the presented value instead of this code.
+        content.layer?.removeAnimation(forKey: "toastScaleOut")
         let scaleIn = CABasicAnimation(keyPath: "transform")
         scaleIn.fromValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
         scaleIn.toValue = CATransform3DIdentity
@@ -104,6 +113,7 @@ final class VocabularyLearnedToastController {
         self.panel = nil
 
         let content = panel.contentView
+        panel.invalidateShadow()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
@@ -111,6 +121,10 @@ final class VocabularyLearnedToastController {
         }, completionHandler: {
             panel.orderOut(nil)
         })
+        // See the matching removeAnimation(forKey:) in show(): the same
+        // race can happen in reverse if dismiss() is somehow reached again
+        // while an entry animation is still attached.
+        content?.layer?.removeAnimation(forKey: "toastScaleIn")
         let scaleOut = CABasicAnimation(keyPath: "transform")
         scaleOut.fromValue = CATransform3DIdentity
         scaleOut.toValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
@@ -119,6 +133,12 @@ final class VocabularyLearnedToastController {
         scaleOut.fillMode = .forwards
         scaleOut.isRemovedOnCompletion = false
         content?.layer?.add(scaleOut, forKey: "toastScaleOut")
+        // Match show()'s pattern: the model layer holds the true final
+        // value directly, with the CABasicAnimation above only animating
+        // the *presentation* toward it — consistent even if this layer
+        // were ever kept alive past this call instead of being discarded
+        // with the panel right after orderOut(nil) fires.
+        content?.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
     }
 
     // Pill geometry, chosen to read as an obviously-rounded capsule (like
