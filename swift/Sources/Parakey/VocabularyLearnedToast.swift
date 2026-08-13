@@ -26,6 +26,14 @@ final class VocabularyLearnedToastController {
                 self?.dismiss()
             }
         )
+        // Resize the panel to the content's already-computed size *before*
+        // assigning it as contentView — setting `panel.contentView` resets
+        // the view's frame to fill the panel's *existing* content rect, so
+        // resizing after assignment would silently discard the measured
+        // width (every toast would render at minPillWidth instead of fitting
+        // its text). Positioning below reads panel.frame.size, so this must
+        // happen first.
+        panel.setContentSize(content.frame.size)
         panel.contentView = content
         if let targetFrame, let screen = Self.screenFor(point: NSPoint(x: targetFrame.midX, y: targetFrame.midY)) {
             Self.positionAboveTarget(panel, targetFrame: targetFrame, screen: screen)
@@ -49,9 +57,16 @@ final class VocabularyLearnedToastController {
         panel = nil
     }
 
+    // Pill geometry, chosen to read as an obviously-rounded capsule (like
+    // RecordingHUDView's pill) rather than a barely-rounded rectangle.
+    private static let pillHeight: CGFloat = 60
+    private static let horizontalPadding: CGFloat = 26
+    private static let minPillWidth: CGFloat = 180
+    private static let maxPillWidth: CGFloat = 540
+
     private static func makePanel() -> NSPanel {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 64),
+            contentRect: NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight),
             styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -67,80 +82,104 @@ final class VocabularyLearnedToastController {
         return panel
     }
 
+    /// Mirrors RecordingHUDView.backgroundPalette(alpha:) (HUDViews.swift)
+    /// so the toast's fill/stroke match the recording HUD's solid,
+    /// mostly-opaque capsule background rather than a translucent blur
+    /// material (NSVisualEffectView's ".hudWindow" material read as flat
+    /// gray, which is what this redesign moves away from).
+    private static func backgroundPalette(lightBackground: Bool) -> (fill: NSColor, stroke: NSColor) {
+        if lightBackground {
+            return (
+                NSColor(calibratedWhite: 1.0, alpha: 0.84),
+                NSColor(calibratedWhite: 0.0, alpha: 0.14)
+            )
+        }
+        return (
+            NSColor(calibratedWhite: 0.0, alpha: 0.96),
+            NSColor(calibratedWhite: 0.22, alpha: 0.26)
+        )
+    }
+
     private static func makeContentView(record: VocabularyRecord,
                                         lightBackground: Bool,
                                         accentColor: NSColor,
                                         onUndo: @escaping () -> Void) -> NSView {
-        let container = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 340, height: 64))
-        container.material = .hudWindow
-        // Mirrors RecordingHUDView.shouldUseLightBackground()'s light/dark
-        // decision (HUDViews.swift) so the toast reads as part of the same
-        // visual family as the recording indicator HUD, rather than always
-        // rendering with a fixed appearance regardless of user settings.
-        container.appearance = NSAppearance(named: lightBackground ? .aqua : .darkAqua)
-        container.state = .active
-        container.wantsLayer = true
-        container.layer?.cornerRadius = 12
-        container.layer?.borderWidth = 1
-        container.layer?.borderColor = accentColor.withAlphaComponent(0.6).cgColor
-
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Small accent dot ties the toast's color to the recording HUD's
-        // configured accent color, without reimplementing the HUD's
-        // custom Core Graphics capsule drawing.
-        let accentDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
-        accentDot.wantsLayer = true
-        accentDot.layer?.backgroundColor = accentColor.cgColor
-        accentDot.layer?.cornerRadius = 4
-        accentDot.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            accentDot.widthAnchor.constraint(equalToConstant: 8),
-            accentDot.heightAnchor.constraint(equalToConstant: 8),
-        ])
-
-        let label = NSTextField(labelWithString: "Запомнил: «\(record.source)» → «\(record.replacement)»")
-        label.font = .systemFont(ofSize: 12)
-        label.lineBreakMode = .byTruncatingTail
-        label.maximumNumberOfLines = 2
-        // NSColor.labelColor resolves against the *system* appearance,
-        // which can mismatch this container's forced light/dark appearance
-        // (e.g. a forced-light toast on a Dark-mode Mac would render
-        // unreadable white-on-white text) — same reasoning as
-        // RecordingHUDView's textColor. Use an explicit color instead.
-        label.textColor = lightBackground
+        // Mirrors RecordingHUDView.drawTimerOutlineFill's textColor formula
+        // (HUDViews.swift) — NSColor.labelColor resolves against the
+        // *system* appearance, which can mismatch this container's forced
+        // light/dark background (e.g. a forced-light toast on a Dark-mode
+        // Mac would render unreadable white-on-white text).
+        let textColor: NSColor = lightBackground
             ? NSColor(calibratedWhite: 0.0, alpha: 0.85)
             : NSColor(calibratedWhite: 1.0, alpha: 0.92)
+        let font = NSFont.systemFont(ofSize: 17, weight: .bold)
 
-        let undoButton = NSButton(title: "Отменить", target: nil, action: nil)
-        undoButton.bezelStyle = .rounded
-        undoButton.contentTintColor = accentColor
-        // Escape triggers the same action as clicking "Отменить" — the
-        // user explicitly wants pressing Escape while the toast is showing
-        // to cancel the just-learned save, overriding an earlier review
-        // pass that removed this binding on "Escape means harmless
-        // dismiss" grounds.
+        let text = NSMutableAttributedString(string: record.source, attributes: [
+            .font: font,
+            .foregroundColor: textColor,
+        ])
+        text.append(NSAttributedString(string: "  →  ", attributes: [
+            .font: font,
+            .foregroundColor: accentColor,
+        ]))
+        text.append(NSAttributedString(string: record.replacement, attributes: [
+            .font: font,
+            .foregroundColor: textColor,
+        ]))
+
+        let label = NSTextField(labelWithAttributedString: text)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        // Content-sized pill: measure the text and clamp it into
+        // [minPillWidth, maxPillWidth], with generous horizontal padding.
+        let measuredWidth = text.size().width + (horizontalPadding * 2)
+        let pillWidth = min(max(measuredWidth, minPillWidth), maxPillWidth)
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: pillWidth, height: pillHeight))
+        container.wantsLayer = true
+        let palette = backgroundPalette(lightBackground: lightBackground)
+        container.layer?.backgroundColor = palette.fill.cgColor
+        container.layer?.cornerRadius = pillHeight / 2
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = palette.stroke.cgColor
+
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: horizontalPadding),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -horizontalPadding),
+            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        // Undo/cancel affordance: clicking anywhere on the toast, or
+        // pressing Escape, cancels the just-learned save — same mechanism
+        // as before (UndoButtonAction + keyEquivalent), but with all
+        // visible button chrome stripped so nothing reads as a button. The
+        // user explicitly doesn't want any "press Escape to cancel" text
+        // shown; they already know the shortcut.
+        let undoButton = NSButton(title: "", target: nil, action: nil)
+        undoButton.isBordered = false
+        // isTransparent guarantees the cell draws nothing at all (an empty
+        // bordered/borderless title can still leave faint cell artifacts on
+        // some bezel styles) while still tracking mouse-down and honoring
+        // keyEquivalent, so clicking anywhere on the toast — or pressing
+        // Escape — still fires onUndo with zero visible button chrome.
+        undoButton.isTransparent = true
         undoButton.keyEquivalent = "\u{1b}"
+        undoButton.translatesAutoresizingMaskIntoConstraints = false
         let action = UndoButtonAction(handler: onUndo)
         undoButton.target = action
         undoButton.action = #selector(UndoButtonAction.undoTapped)
         objc_setAssociatedObject(undoButton, &UndoButtonAction.associationKey, action, .OBJC_ASSOCIATION_RETAIN)
 
-        stack.addArrangedSubview(accentDot)
-        stack.addArrangedSubview(label)
-        stack.addArrangedSubview(undoButton)
-        container.addSubview(stack)
-
+        container.addSubview(undoButton)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            undoButton.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            undoButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            undoButton.topAnchor.constraint(equalTo: container.topAnchor),
+            undoButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         return container
