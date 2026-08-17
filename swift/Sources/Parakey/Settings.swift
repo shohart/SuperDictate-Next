@@ -65,6 +65,8 @@ final class Settings: @unchecked Sendable {
     private static let keySkippedVersions = "skipped_versions"
     private static let keyTranscriptCorrections = "transcript_corrections"
     private static let keyTranscriptCorrectionsSyncFile = "transcript_corrections_sync_file"
+    private static let keyDidMigrateTranscriptCorrectionsToSQLite = "did_migrate_transcript_corrections_to_sqlite_v1"
+    private static let keyAutoLearnVocabularyEnabled = "auto_learn_vocabulary_enabled_v1"
     private static let keyDictationLanguage = "dictation_language"
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
@@ -86,11 +88,70 @@ final class Settings: @unchecked Sendable {
     private static let keyAgentEnabled = "agent_enabled"
 
     private let defaults: UserDefaults
+    let vocabularyStore: VocabularyStore
 
     static let shared = Settings()
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, vocabularyStore: VocabularyStore? = nil) {
         self.defaults = defaults
+        self.vocabularyStore = vocabularyStore ?? Self.openDefaultVocabularyStore()
+        migrateLegacyTranscriptCorrectionsIfNeeded()
+    }
+
+    /// A writable Application Support directory is a basic launch
+    /// precondition this app already relies on elsewhere (model files,
+    /// logs) — not a scenario worth chained fallbacks for. The one
+    /// fallback kept here is an in-memory store so a single bad launch
+    /// degrades to "corrections don't persist this run" instead of a
+    /// crash, since corrections are a convenience feature, not core
+    /// dictation functionality.
+    private static func openDefaultVocabularyStore() -> VocabularyStore {
+        do {
+            let dbURL = try superDictateApplicationSupportDirectory()
+                .appendingPathComponent("corrections.sqlite", isDirectory: false)
+            return try VocabularyStore(fileURL: dbURL)
+        } catch {
+            log("settings: failed to open vocabulary store at the app support path, falling back to an in-memory store for this run: \(error)")
+            return VocabularyStore.inMemoryFallback()
+        }
+    }
+
+    private func migrateLegacyTranscriptCorrectionsIfNeeded() {
+        // If openDefaultVocabularyStore() had to fall back to an
+        // in-memory store (e.g. the on-disk DB is corrupted or locked),
+        // never let migration "complete" against it: upserts would only
+        // ever live in memory, and marking migration done + deleting the
+        // UserDefaults copy here would destroy the user's entire
+        // correction history the moment the process exits, with no
+        // retry. Skip so a future launch where the real store opens can
+        // retry migration correctly. See C2 in the final-review fix report.
+        guard !vocabularyStore.isEphemeral else {
+            log("settings: vocabulary store is ephemeral (in-memory fallback); skipping legacy migration so the UserDefaults copy survives for a future real attempt")
+            return
+        }
+        guard !defaults.bool(forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite) else { return }
+
+        guard let data = defaults.data(forKey: Self.keyTranscriptCorrections) else {
+            defaults.set(true, forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite)
+            return
+        }
+        do {
+            let legacy = try TranscriptCorrectionsTransfer.decode(data)
+            var migratedCount = 0
+            for correction in normalizedTranscriptCorrections(legacy) {
+                do {
+                    _ = try vocabularyStore.upsert(source: correction.source, replacement: correction.replacement, origin: .manual)
+                    migratedCount += 1
+                } catch {
+                    log("settings: failed to migrate one legacy correction (source: \(correction.source)): \(error)")
+                }
+            }
+            defaults.removeObject(forKey: Self.keyTranscriptCorrections)
+            defaults.set(true, forKey: Self.keyDidMigrateTranscriptCorrectionsToSQLite)
+            log("settings: migrated \(migratedCount) of \(legacy.count) legacy transcript corrections into SQLite")
+        } catch {
+            log("settings: legacy transcript correction migration failed, leaving UserDefaults copy in place: \(error)")
+        }
     }
 
     @discardableResult
@@ -653,42 +714,32 @@ final class Settings: @unchecked Sendable {
         }
     }
 
+    var autoLearnVocabularyEnabled: Bool {
+        get {
+            defaults.object(forKey: Self.keyAutoLearnVocabularyEnabled) as? Bool ?? true
+        }
+        set { defaults.set(newValue, forKey: Self.keyAutoLearnVocabularyEnabled) }
+    }
+
     var transcriptCorrections: [TranscriptCorrection] {
         get {
-            guard let data = defaults.data(forKey: Self.keyTranscriptCorrections) else { return [] }
-            do {
-                return try TranscriptCorrectionsTransfer.decode(data)
-            } catch {
-                log("settings: transcript correction decode failed: \(error)")
-                return []
-            }
+            vocabularyStore.all().map { TranscriptCorrection(source: $0.source, replacement: $0.replacement) }
         }
         set { storeTranscriptCorrections(newValue) }
     }
 
     /// Persists corrections and reports failure to the caller instead
-    /// of swallowing it. With the per-field/per-count caps the encoded
-    /// set always fits maxFileBytes in practice (see its derivation
-    /// comment), but if encoding or the size guard ever fails the
-    /// user's edit must not silently vanish — UI entry points alert on
-    /// a non-nil return. The property setter above keeps the
-    /// fire-and-forget shape (and the log below) for internal callers.
+    /// of swallowing it, matching the pre-SQLite contract this replaces.
+    /// With SQLite there is no encode/size-limit failure mode left (each
+    /// row is capped and validated by `normalizedTranscriptCorrections`
+    /// before it reaches here), so this always returns nil today; the
+    /// `Error?` return type is kept because call sites throughout
+    /// ParakeyApp.swift already branch on it.
     @discardableResult
     func storeTranscriptCorrections(_ newValue: [TranscriptCorrection]) -> Error? {
         let corrections = normalizedTranscriptCorrections(newValue)
-        guard !corrections.isEmpty else {
-            defaults.removeObject(forKey: Self.keyTranscriptCorrections)
-            return nil
-        }
-        do {
-            let data = try JSONEncoder().encode(corrections)
-            try TranscriptCorrectionsTransfer.validateTransferSize(data.count)
-            defaults.set(data, forKey: Self.keyTranscriptCorrections)
-            return nil
-        } catch {
-            log("settings: transcript correction encode failed: \(error)")
-            return error
-        }
+        vocabularyStore.replaceAllPreservingOrigin(corrections)
+        return nil
     }
 
     var transcriptCorrectionsSyncFile: String {

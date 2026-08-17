@@ -70,6 +70,10 @@ enum ParakeySelfTest {
             return runSuite("statistics", testDictationUsageStatistics)
         case "corrections":
             return runSuite("corrections", testTranscriptCorrections)
+        case "vocabulary-store":
+            return runSuite("vocabulary-store", testVocabularyStore)
+        case "vocabulary-learning":
+            return runSuite("vocabulary-learning", testLearnCandidateDetector)
         case "fillers":
             return runSuite("fillers", testFillerWordRemoval)
         case "filler-word-presets-custom-words":
@@ -207,6 +211,8 @@ enum ParakeySelfTest {
         try testRecordingHUDOutlineFillPath()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
+        try testVocabularyStore()
+        try testLearnCandidateDetector()
         try testFillerWordRemoval()
         try testFillerWordRemoverPresetsAndCustomWords()
         try testFillerWordPresetDefaults()
@@ -814,6 +820,8 @@ enum ParakeySelfTest {
         try testCustomShortcutMatching()
         try testModifierOnlyChordMatching()
         try testConfigurableEnterShortcut()
+        try testEnterChordBuiltOnHeldPrimaryModifier()
+        try testCommandModifierEnterShortcutWithPrimaryCommand()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testHistoryChordShowsOverlay()
@@ -905,11 +913,16 @@ enum ParakeySelfTest {
             hotkeyRecordingDecision(for: event(.flagsChanged,
                                                keycode: 61,
                                                flags: CGEventFlags.maskAlternate.rawValue)),
+            equals: .ignore,
+            "hotkey recorder should not accept a modifier on press (chords capture on release)"
+        )
+        try expect(
+            hotkeyRecordingDecision(for: event(.flagsChanged, keycode: 61)),
             equals: .accept(HotkeyChoice(name: "Right Option",
                                          keycode: 61,
                                          isModifier: true,
                                          modifierFlag: .maskAlternate)),
-            "hotkey recorder should accept right-side modifier presses"
+            "hotkey recorder should accept a bare right-side modifier on release"
         )
         try expect(
             hotkeyRecordingDecision(for: event(
@@ -917,9 +930,18 @@ enum ParakeySelfTest {
                 keycode: RIGHT_COMMAND_KEYCODE,
                 flags: CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskCommand.rawValue
             )),
+            equals: .ignore,
+            "hotkey recorder should keep waiting while a modifier chord is still being pressed"
+        )
+        try expect(
+            hotkeyRecordingDecision(for: event(
+                .flagsChanged,
+                keycode: RIGHT_COMMAND_KEYCODE,
+                flags: CGEventFlags.maskAlternate.rawValue
+            )),
             equals: .accept(hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
-                                         modifiers: [.maskAlternate, .maskCommand])),
-            "hotkey recorder should accept modifier-only chords"
+                                         modifiers: [.maskAlternate])),
+            "hotkey recorder should accept modifier-only chords on release (other chord keys still held)"
         )
     }
 
@@ -974,13 +996,13 @@ enum ParakeySelfTest {
         let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
         try expect(
             singleCommand.consume(commandDown),
-            equals: .candidate(rightCommand),
-            "pressing Right Command should select it immediately as a one-key shortcut"
+            equals: .ignore,
+            "pressing Right Command alone should keep the recorder waiting"
         )
         try expect(
             singleCommand.consume(event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE)),
-            equals: .ignore,
-            "releasing Right Command should not be required to preserve its selection"
+            equals: .candidate(rightCommand),
+            "releasing Right Command with nothing else held should select it as a one-key shortcut"
         )
 
         var singleModifier = HotkeyRecorderCaptureState()
@@ -990,13 +1012,13 @@ enum ParakeySelfTest {
         let leftOption = hotkeyChoice(forKeycode: 58)
         try expect(
             singleModifier.consume(optionDown),
-            equals: .candidate(leftOption),
-            "pressing Option should select it immediately as a one-key shortcut"
+            equals: .ignore,
+            "pressing Option alone should keep the recorder waiting"
         )
         try expect(
             singleModifier.consume(event(.flagsChanged, keycode: 58)),
-            equals: .ignore,
-            "releasing Option should not change the selected shortcut"
+            equals: .candidate(leftOption),
+            "releasing Option with nothing else held should select it as a one-key shortcut"
         )
 
         for (keycode, flags, label) in [
@@ -1009,8 +1031,13 @@ enum ParakeySelfTest {
                 modifier.consume(event(.flagsChanged,
                                        keycode: keycode,
                                        flags: flags.rawValue)),
+                equals: .ignore,
+                "pressing \(label) should keep the recorder waiting"
+            )
+            try expect(
+                modifier.consume(event(.flagsChanged, keycode: keycode)),
                 equals: .candidate(hotkeyChoice(forKeycode: keycode)),
-                "pressing \(label) should select it immediately"
+                "releasing \(label) with nothing else held should select it"
             )
         }
 
@@ -1027,15 +1054,46 @@ enum ParakeySelfTest {
 
         var modifierChord = HotkeyRecorderCaptureState()
         _ = modifierChord.consume(optionDown)
+        _ = modifierChord.consume(event(
+            .flagsChanged,
+            keycode: RIGHT_COMMAND_KEYCODE,
+            flags: CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskCommand.rawValue
+        ))
         try expect(
             modifierChord.consume(event(
                 .flagsChanged,
                 keycode: RIGHT_COMMAND_KEYCODE,
-                flags: CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskCommand.rawValue
+                flags: CGEventFlags.maskAlternate.rawValue
             )),
             equals: .candidate(hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                             modifiers: [.maskAlternate, .maskCommand])),
-            "pressing a second modifier should select a modifier-only chord"
+            "releasing one chord key while the other stays held should select the full modifier chord"
+        )
+        try expect(
+            modifierChord.consume(event(.flagsChanged, keycode: 58)),
+            equals: .ignore,
+            "the trailing release of the remaining chord key must not overwrite the captured chord with a bare key"
+        )
+
+        var controlCommandChord = HotkeyRecorderCaptureState()
+        _ = controlCommandChord.consume(event(.flagsChanged,
+                                              keycode: LEFT_CONTROL_KEYCODE,
+                                              flags: CGEventFlags.maskControl.rawValue))
+        _ = controlCommandChord.consume(event(.flagsChanged,
+                                              keycode: RIGHT_COMMAND_KEYCODE,
+                                              flags: CGEventFlags.maskControl.rawValue | CGEventFlags.maskCommand.rawValue))
+        try expect(
+            controlCommandChord.consume(event(.flagsChanged,
+                                              keycode: LEFT_CONTROL_KEYCODE,
+                                              flags: CGEventFlags.maskCommand.rawValue)),
+            equals: .candidate(hotkeyChoice(forKeycode: LEFT_CONTROL_KEYCODE,
+                                            modifiers: [.maskControl, .maskCommand])),
+            "Ctrl+Cmd pressed, Ctrl released first: the full chord should be captured"
+        )
+        try expect(
+            controlCommandChord.consume(event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE)),
+            equals: .ignore,
+            "the trailing Right Command release must not overwrite the captured Ctrl+Cmd chord"
         )
 
         var singleKey = HotkeyRecorderCaptureState()
@@ -2814,6 +2872,62 @@ enum ParakeySelfTest {
             equals: true,
             "merge cap warning should state how many corrections a merge would drop"
         )
+    }
+
+    private static func testVocabularyStore() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vocabulary-store-selftest-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let store = try VocabularyStore(fileURL: tempURL)
+
+        // Manual upsert + dedup by source (case-insensitive).
+        let first = try store.upsert(source: "инглиш", replacement: "English", origin: .manual)
+        guard first.origin == .manual else { throw VocabularyLearningTestFailure("expected manual origin") }
+        let updated = try store.upsert(source: "Инглиш", replacement: "english", origin: .manual)
+        guard store.count() == 1, updated.replacement == "english" else {
+            throw VocabularyLearningTestFailure("case-insensitive upsert should update the existing row, not add a second one")
+        }
+
+        // recordLearned: no-op when source already known.
+        guard store.recordLearned(source: "инглиш", replacement: "English") == nil else {
+            throw VocabularyLearningTestFailure("recordLearned should no-op for an already-known source")
+        }
+
+        // recordLearned: succeeds for a new source, tagged 'learned'.
+        guard let learned = store.recordLearned(source: "кложа", replacement: "closure"), learned.origin == .learned else {
+            throw VocabularyLearningTestFailure("recordLearned should insert a new source tagged learned")
+        }
+        guard store.count() == 2 else { throw VocabularyLearningTestFailure("expected 2 rows after recordLearned") }
+
+        // delete(id:)
+        store.delete(id: learned.id)
+        guard store.count() == 1 else { throw VocabularyLearningTestFailure("delete(id:) should remove exactly one row") }
+
+        // replaceAllPreservingOrigin: preserves origin/created_at for kept rows, drops missing ones, adds new ones as manual.
+        _ = try store.upsert(source: "старое", replacement: "old", origin: .learned)
+        store.replaceAllPreservingOrigin([
+            TranscriptCorrection(source: "инглиш", replacement: "English (edited)"),
+            TranscriptCorrection(source: "новое", replacement: "new"),
+        ])
+        let all = store.all()
+        guard all.count == 2 else { throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should leave exactly the given sources") }
+        guard let englishRow = all.first(where: { $0.source.lowercased() == "инглиш" }), englishRow.replacement == "English (edited)" else {
+            throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should update the replacement text for a kept source")
+        }
+        guard let newRow = all.first(where: { $0.source == "новое" }), newRow.origin == .manual else {
+            throw VocabularyLearningTestFailure("replaceAllPreservingOrigin should tag brand-new sources as manual")
+        }
+
+        // Cap enforcement in recordLearned.
+        let capStore = try VocabularyStore(fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("vocabulary-store-cap-\(UUID().uuidString).sqlite"))
+        defer { }
+        for index in 0..<MAX_TRANSCRIPT_CORRECTIONS {
+            _ = try capStore.upsert(source: "src\(index)", replacement: "rep\(index)", origin: .manual)
+        }
+        guard capStore.recordLearned(source: "one-too-many", replacement: "nope") == nil else {
+            throw VocabularyLearningTestFailure("recordLearned must not exceed MAX_TRANSCRIPT_CORRECTIONS")
+        }
     }
 
     private static func testFillerWordRemoval() throws {
@@ -6152,6 +6266,36 @@ enum ParakeySelfTest {
         print("PARAKEET VULKAN: load \(String(format: "%.2f", loadSeconds))s, device \(actualDevice), threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
 
         try runParakeetEngineSynchronously { await engine.shutdown() }
+
+        // Stale-singleton regression (production signature: "Vulkan was
+        // requested but the actual selected backend is 'cpu'" right after
+        // re-enabling GPU in settings). The process-global pk::Backend
+        // singleton outlives context destruction and reads PARAKEET_DEVICE
+        // only at construction, so a CPU context created after a Vulkan one
+        // (exactly what the mid-session Vulkan-error fallback does) leaves a
+        // CPU singleton behind. A subsequent Vulkan context — with the fix,
+        // the bridge resets the stale singleton when the device request
+        // changes and no contexts are alive — must come up on a real
+        // "Vulkan…" device, not throw .vulkanFellBackToCPU.
+        let cpuEngine = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
+        try runParakeetEngineSynchronously { try await cpuEngine.warmUp() }
+        let cpuDevice = try runParakeetEngineSynchronously { await cpuEngine.backendDescription() }
+        try expect(
+            cpuDevice.lowercased().hasPrefix("cpu") || cpuDevice.lowercased().hasPrefix("vulkan"),
+            equals: true,
+            "CPU-requested engine should report a sane backend (got \"\(cpuDevice)\")"
+        )
+        try runParakeetEngineSynchronously { await cpuEngine.shutdown() }
+
+        let vulkanReload = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
+        try runParakeetEngineSynchronously { try await vulkanReload.warmUp() }
+        let reloadedDevice = try runParakeetEngineSynchronously { await vulkanReload.backendDescription() }
+        try expect(
+            reloadedDevice.lowercased().hasPrefix("vulkan"),
+            equals: true,
+            "re-enabling Vulkan after a CPU context in the same process must select a Vulkan device, not reuse the stale CPU singleton (got \"\(reloadedDevice)\")"
+        )
+        try runParakeetEngineSynchronously { await vulkanReload.shutdown() }
     }
 
     private static func testAudioRouteChangeDecision() throws {
@@ -6846,6 +6990,123 @@ enum ParakeySelfTest {
                              isRecording: true),
             equals: HotkeyTransitionResult(suppress: true, actions: [.releaseAlternate]),
             "a user-configured Enter shortcut should use the Enter completion path"
+        )
+    }
+
+    /// A release-first recorder capture of Ctrl+Command is represented as
+    /// "Command + Left Control": Command is the required modifier and
+    /// Control is the primary key. With bare Right Command as the primary
+    /// dictation shortcut, this must still finish the active recording —
+    /// the shared Command is intentional, not an ambiguous prefix.
+    private static func testCommandModifierEnterShortcutWithPrimaryCommand() throws {
+        var state = HotkeyTransitionState()
+        let primary = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let commandControl = hotkeyChoice(forKeycode: LEFT_CONTROL_KEYCODE,
+                                          modifiers: .maskCommand)
+        let commandControlFlags = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskControl.rawValue
+
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_COMMAND_KEYCODE,
+                                        flags: CGEventFlags.maskCommand.rawValue),
+                             hotkey: primary,
+                             enterHotkey: commandControl,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "Right Command should start the primary dictation shortcut"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: LEFT_CONTROL_KEYCODE,
+                                        flags: commandControlFlags),
+                             hotkey: primary,
+                             enterHotkey: commandControl,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: false, actions: [.releaseAlternate]),
+            "Command + Control should finish an active Right Command recording"
+        )
+    }
+
+    /// Hold-mode fix: when the alternate-completion chord is built on the
+    /// same modifier keycode as the primary dictation hotkey (e.g.
+    /// primary "Right Command", chord "Control + Right Command"), the
+    /// shared modifier is necessarily pressed BEFORE the recording
+    /// starts — pressing it is what starts the recording — so the enter
+    /// state machine never sees its flagsChanged. The recording edge
+    /// must adopt the held modifier, or the chord could never fire.
+    private static func testEnterChordBuiltOnHeldPrimaryModifier() throws {
+        let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let enterChord = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                      modifiers: [.maskControl])
+        let controlCommand = CGEventFlags.maskControl.rawValue | CGEventFlags.maskCommand.rawValue
+
+        var state = HotkeyTransitionState()
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_COMMAND_KEYCODE,
+                                        flags: CGEventFlags.maskCommand.rawValue),
+                             hotkey: rightCommand,
+                             enterHotkey: enterChord,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "Right Command press should start dictation"
+        )
+        // The app flips isRecording=true only after .press above, so the
+        // enter state machine missed the Right Command flagsChanged —
+        // exactly the real-world hold-mode sequence.
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: LEFT_CONTROL_KEYCODE,
+                                        flags: controlCommand),
+                             hotkey: rightCommand,
+                             enterHotkey: enterChord,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: false, actions: [.releaseAlternate]),
+            "pressing the extra chord modifier mid-recording should fire alternate completion (held primary adopted)"
+        )
+
+        // The default ⌥⌘ chord must behave the same way.
+        var defaultChordState = HotkeyTransitionState()
+        let defaultEnterChord = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                             modifiers: [.maskAlternate])
+        _ = defaultChordState.transition(for: event(.flagsChanged,
+                                                     keycode: RIGHT_COMMAND_KEYCODE,
+                                                     flags: CGEventFlags.maskCommand.rawValue),
+                                         hotkey: rightCommand,
+                                         enterHotkey: defaultEnterChord,
+                                         triggerMode: .hold,
+                                         isRecording: false)
+        try expect(
+            defaultChordState.transition(for: event(.flagsChanged,
+                                                     keycode: RIGHT_OPTION_KEYCODE,
+                                                     flags: CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskCommand.rawValue),
+                                         hotkey: rightCommand,
+                                         enterHotkey: defaultEnterChord,
+                                         triggerMode: .hold,
+                                         isRecording: true),
+            equals: HotkeyTransitionResult(suppress: false, actions: [.releaseAlternate]),
+            "the default Option+Right Command chord should fire alternate completion mid-recording"
+        )
+
+        // Negative: a primary hotkey that is NOT the chord's base key
+        // must not adopt anything — the chord still requires its own
+        // modifier press to be seen.
+        var unrelatedState = HotkeyTransitionState()
+        let f5Primary = hotkeyChoice(forKeycode: 96)
+        try expect(
+            unrelatedState.transition(for: event(.flagsChanged,
+                                                  keycode: LEFT_CONTROL_KEYCODE,
+                                                  flags: CGEventFlags.maskControl.rawValue),
+                                       hotkey: f5Primary,
+                                       enterHotkey: enterChord,
+                                       triggerMode: .hold,
+                                       isRecording: true),
+            equals: .pass,
+            "without the chord's base modifier held, the extra modifier alone must not fire alternate completion"
         )
     }
 

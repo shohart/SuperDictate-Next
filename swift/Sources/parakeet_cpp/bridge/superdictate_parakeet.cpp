@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -88,6 +89,13 @@ char *dupUTF8(const std::string &s) {
     return buf;
 }
 
+// Lifecycle tracking for stale-backend prevention (see sd_parakeet_create):
+// how many SDParakeetContext instances are currently alive, and the device
+// name the process-global pk::Backend singleton was last requested to use.
+std::mutex g_lifecycle_mutex;
+int g_live_contexts = 0;
+std::string g_last_requested_device;
+
 } // namespace
 
 extern "C" SDParakeetStatus sd_parakeet_create(
@@ -135,6 +143,33 @@ extern "C" SDParakeetStatus sd_parakeet_create(
                 : "cpu";
         setenv("PARAKEET_DEVICE", device_name_to_request, 1);
 
+        // Stale-singleton prevention. pk::global_backend() is a lazily
+        // constructed PROCESS-GLOBAL singleton that reads PARAKEET_DEVICE
+        // at construction time — not per context. It outlives context
+        // destruction (sd_parakeet_destroy does not reset it), so a
+        // backend left behind by a previous request (classically: the
+        // CPU backend constructed after a mid-session Vulkan-error
+        // fallback) would silently keep serving computes for a NEW
+        // context created with a different device request. warm_up's
+        // post-init check then reports "Vulkan was requested but the
+        // actual selected backend is 'cpu'" and the whole session falls
+        // back to CPU until the process is restarted — the exact
+        // production log signature this guards against. When no live
+        // context exists (the app always unloads before reloading with
+        // a different device, so their weight buffers are already
+        // freed), reset the stale singleton so this context's first
+        // compute rebuilds it against the new PARAKEET_DEVICE.
+        {
+            std::lock_guard<std::mutex> lock(g_lifecycle_mutex);
+            const bool device_changed =
+                !g_last_requested_device.empty() &&
+                g_last_requested_device != device_name_to_request;
+            if (device_changed && g_live_contexts == 0) {
+                pk::shutdown_backend();
+            }
+            g_last_requested_device = device_name_to_request;
+        }
+
         parakeet_ctx *native = parakeet_capi_load(model_path);
         if (!native) {
             return SD_PARAKEET_ERR_MODEL_LOAD_FAILED;
@@ -147,6 +182,10 @@ extern "C" SDParakeetStatus sd_parakeet_create(
         }
         ctx->native = native;
         ctx->device = device;
+        {
+            std::lock_guard<std::mutex> lock(g_lifecycle_mutex);
+            ++g_live_contexts;
+        }
         *out_context = ctx;
         return SD_PARAKEET_OK;
     } catch (...) {
@@ -390,6 +429,10 @@ extern "C" void sd_parakeet_destroy(SDParakeetContext *context) {
     if (context->native) {
         parakeet_capi_free(context->native);
     }
+    {
+        std::lock_guard<std::mutex> lock(g_lifecycle_mutex);
+        if (g_live_contexts > 0) --g_live_contexts;
+    }
     delete context;
 }
 
@@ -451,6 +494,10 @@ extern "C" const char *sd_parakeet_vulkan_device_description(void) {
 
 extern "C" void sd_parakeet_test_reset_backend(void) {
     pk::shutdown_backend();
+    // Keep the stale-device tracker in sync: the singleton is gone, so
+    // there is no "last requested device" to protect against anymore.
+    std::lock_guard<std::mutex> lock(g_lifecycle_mutex);
+    g_last_requested_device.clear();
 }
 
 extern "C" const char *sd_parakeet_last_error_message(const SDParakeetContext *context) {

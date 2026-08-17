@@ -84,9 +84,21 @@ func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRecordingD
     if event.isAutoRepeat { return .ignore }
 
     if event.typeRawValue == CGEventType.flagsChanged.rawValue {
+        // Accept modifier chords on KEY RELEASE, not key press. On press
+        // the flags only show modifiers held SO FAR, so the very first
+        // modifier press would immediately capture a bare single-key
+        // choice ("Left Control") and close the recorder — two-modifier
+        // chords (Control + Right Command) could never be recorded. On
+        // release, event.flags still carries every OTHER modifier the
+        // user is holding as part of the chord, so
+        // recordableHotkeyChoice(forKeycode:modifiers:) assembles the
+        // full combination: releasing Ctrl while Right Command is still
+        // held records "Command + Left Control". A bare single-modifier
+        // choice still records naturally: press Ctrl, release it with
+        // nothing else held → "Left Control".
         guard let baseChoice = MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == event.keycode }),
               let mask = baseChoice.modifierFlag,
-              event.flags.contains(mask) else {
+              !event.flags.contains(mask) else {
             return .ignore
         }
         guard let choice = recordableHotkeyChoice(forKeycode: event.keycode,
@@ -115,14 +127,28 @@ enum HotkeyRecorderCaptureResult: Equatable {
 }
 
 struct HotkeyRecorderCaptureState {
+    /// Set once the first candidate has been captured. With
+    /// release-accept recording (see hotkeyRecordingDecision), a
+    /// two-modifier chord is captured at the FIRST key release, while
+    /// the user physically cannot lift both keys simultaneously — the
+    /// trailing release of the other chord key would otherwise produce
+    /// a second, bare-key candidate and silently overwrite the chord
+    /// the user intended. Freezing after the first candidate keeps the
+    /// captured chord; the user confirms with Save or discards with
+    /// Escape and reopens the recorder for another attempt.
+    private var captured = false
+
     mutating func consume(_ event: HotkeyEventSnapshot) -> HotkeyRecorderCaptureResult {
         if event.typeRawValue == CGEventType.keyDown.rawValue,
            event.keycode == ESCAPE_KEYCODE {
             return .cancel
         }
 
+        guard !captured else { return .ignore }
+
         switch hotkeyRecordingDecision(for: event) {
         case .accept(let choice):
+            captured = true
             return .candidate(choice)
         case .reject(let message):
             return .reject(message)
@@ -465,13 +491,43 @@ struct HotkeyShortcutResult: Equatable {
 
 struct HotkeyShortcutState {
     private var primaryModifierDown = false
+    /// Whether we actually OBSERVED the primary modifier's own
+    /// flagsChanged press (as opposed to adopting it as already-held
+    /// via `adoptPrimaryModifierDown`). Disambiguates the next
+    /// keycode==shortcut.keycode event: after an observed press it is
+    /// the key's RELEASE (toggle semantics — the shared mask may stay
+    /// set by the same modifier on the other side of the keyboard);
+    /// after an adoption it is a genuine PRESS arriving.
+    private var primaryPressObserved = false
     private var shortcutDown = false
 
     var isEngaged: Bool { primaryModifierDown || shortcutDown }
 
     mutating func reset() {
         primaryModifierDown = false
+        primaryPressObserved = false
         shortcutDown = false
+    }
+
+    /// Adopts the shortcut's primary modifier key as already held down
+    /// (without having observed its press).
+    ///
+    /// Recovery for a hold-mode interaction that could never work
+    /// otherwise: the alternate-completion shortcut is often built on
+    /// the SAME modifier key as the primary dictation hotkey (e.g.
+    /// primary "Right Command", alternate "Control + Right Command").
+    /// That modifier is necessarily pressed BEFORE the recording starts
+    /// — pressing it IS what starts the recording — and
+    /// `transitionEnterShortcut` ignores events while not recording, so
+    /// the enter state machine never sees the flagsChanged that would
+    /// set `primaryModifierDown`. Without adopting it here, the chord
+    /// can never report a press mid-recording no matter which extra
+    /// modifier the user adds. Called by `HotkeyTransitionState` on the
+    /// not-recording → recording edge, only when the primary hotkey and
+    /// the enter shortcut share the same (modifier) keycode.
+    mutating func adoptPrimaryModifierDown() {
+        primaryModifierDown = true
+        primaryPressObserved = false
     }
 
     mutating func consume(_ event: HotkeyEventSnapshot,
@@ -506,9 +562,29 @@ struct HotkeyShortcutState {
 
         if event.keycode == shortcut.keycode {
             if primaryModifierDown {
-                primaryModifierDown = false
+                if primaryPressObserved {
+                    // We watched this physical key go down, so the next
+                    // event for THIS keycode is its release — even when
+                    // the shared mask stays set by the same modifier on
+                    // the other side of the keyboard (right Option
+                    // released while left Option is held).
+                    primaryModifierDown = false
+                    primaryPressObserved = false
+                } else if event.flags.contains(primaryMask) {
+                    // Adopted-as-held, and now a real press event for
+                    // this keycode arrives with the mask set — e.g. the
+                    // user released and re-pressed the key mid-recording
+                    // (the release itself would land in the branch
+                    // below and clear the adoption).
+                    primaryPressObserved = true
+                } else {
+                    // Adopted-as-held, and the mask is gone: the key we
+                    // adopted has actually been released.
+                    primaryModifierDown = false
+                }
             } else if event.flags.contains(primaryMask) {
                 primaryModifierDown = true
+                primaryPressObserved = true
             }
         }
 
@@ -540,6 +616,10 @@ struct HotkeyTransitionState {
     private var historyShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
+    /// Previous `isRecording` value seen by `transition(for:...)`, used
+    /// to detect the not-recording → recording edge for
+    /// `enterShortcutState.adoptPrimaryModifierDown()`.
+    private var wasRecording = false
 
     mutating func resetAll() {
         standardShortcutState.reset()
@@ -547,6 +627,7 @@ struct HotkeyTransitionState {
         historyShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
+        wasRecording = false
     }
 
     mutating func resetToggleState() {
@@ -570,6 +651,19 @@ struct HotkeyTransitionState {
         isRecording: Bool,
         canStartRecording: Bool = true
     ) -> HotkeyTransitionResult {
+        // Recording-start edge: if the enter (alternate completion)
+        // shortcut is built on the same modifier keycode as the primary
+        // dictation hotkey, that modifier is already held down (it is
+        // what started the recording) — see
+        // HotkeyShortcutState.adoptPrimaryModifierDown. Adopt it BEFORE
+        // this event is dispatched to the sub-state-machines so the
+        // very first mid-recording event can complete the chord.
+        if isRecording, !wasRecording,
+           hotkey.isModifier, hotkey.keycode == enterHotkey.keycode {
+            enterShortcutState.adoptPrimaryModifierDown()
+        }
+        wasRecording = isRecording
+
         if event.keycode == ESCAPE_KEYCODE {
             return transitionEscape(for: event, isRecording: isRecording)
         }
@@ -580,8 +674,7 @@ struct HotkeyTransitionState {
             return history
         }
 
-        if alternateCompletionEnabled,
-           !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
+        if alternateCompletionEnabled {
             if let completion = transitionEnterShortcut(for: event,
                                                          isRecording: isRecording,
                                                          enterHotkey: enterHotkey) {
@@ -877,4 +970,3 @@ final class HotkeyListener {
         transitionState.resetToggleState()
     }
 }
-

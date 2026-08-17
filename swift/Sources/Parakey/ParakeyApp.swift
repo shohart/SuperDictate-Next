@@ -149,6 +149,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // PendingTextInsertionTargetStore and captureTextInsertionTargetForNextDictation().
     private var pendingTextInsertionTarget = PendingTextInsertionTargetStore()
     private var textInsertionTargetCaptureToken = 0
+    // Watches the field text was just inserted into for a short window and
+    // reports a learn candidate if the user immediately hand-corrects it.
+    // See PostInsertionEditWatcher (VocabularyLearning.swift) and the
+    // `if let textInsertionTarget, ...` wiring at the insertion call site.
+    private lazy var postInsertionWatcher = PostInsertionEditWatcher(
+        store: settings.vocabularyStore,
+        onLearned: { [weak self] record, targetFrame in self?.showVocabularyLearnedToast(record, targetFrame: targetFrame) }
+    )
+    private let vocabularyLearnedToastController = VocabularyLearnedToastController()
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -258,6 +267,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Sounds.playError()
         }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
+        // So the toast's own Escape tap (VocabularyLearnedToast.swift) can
+        // defer to an active recording rather than shadowing
+        // HotkeyListener's existing Escape-cancels-recording handling —
+        // see VocabularyLearnedToastController.isRecordingActive.
+        vocabularyLearnedToastController.isRecordingActive = { [weak self] in self?.isRecording == true }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
         // must not flip state for it. The missing-permissions case is
@@ -2397,6 +2411,44 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         } else {
                             log("text insertion failed")
                             dictationFailed = true
+                        }
+
+                        if inserted, settings.autoLearnVocabularyEnabled {
+                            if let textInsertionTarget, route == .usedFocusedTarget {
+                                // We already have a live FocusedTextTarget from the
+                                // AX-targeted insertion path — reuse it, no extra AX round-trip.
+                                postInsertionWatcher.beginWatching(insertedText: textToInsert, target: textInsertionTarget)
+                            } else {
+                                // The actual production path today (global-post fallback,
+                                // TextInserter.insert) never resolves a FocusedTextTarget at
+                                // all -- captureTextInsertionTargetForNextDictation() is
+                                // disabled via axFocusedInsertionEnabled (see its own doc
+                                // comment). Resolve one fresh, read-only, purely to observe
+                                // for a post-insertion edit -- this carries none of the risk
+                                // that disabled the AX-targeted *insertion* path, since we
+                                // are not using this resolution to insert anything.
+                                Task { [weak self] in
+                                    guard let self else { return }
+                                    // TextInserter.insert(_:) returns as soon as the
+                                    // synthetic keyboard events are posted, not once
+                                    // the target app has processed them and updated
+                                    // its AX tree -- reading kAXValueAttribute
+                                    // immediately after can observe a stale/empty
+                                    // element (seen in practice: fieldLength=0,
+                                    // cursorRange=(0,0) in TextEdit). Give the
+                                    // target app's run loop a moment to catch up
+                                    // before resolving focus for observation.
+                                    try? await Task.sleep(nanoseconds: 200_000_000)
+                                    do {
+                                        let target = try await Task.detached(priority: .userInitiated) {
+                                            try FocusedTextTargetResolver().captureTarget()
+                                        }.value
+                                        self.postInsertionWatcher.beginWatching(insertedText: textToInsert, target: target)
+                                    } catch {
+                                        log("PostInsertionEditWatcher: post-insertion focus capture failed: \(error)")
+                                    }
+                                }
+                            }
                         }
 
                         log(DictationLatencyMetrics(
@@ -5326,9 +5378,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func correctionImportSummary(for imported: [TranscriptCorrection]) -> CorrectionImportSummary {
-        let existingBySource = Dictionary(uniqueKeysWithValues: settings.transcriptCorrections.map {
-            (normalizedTranscriptCorrectionSource($0.source), $0)
-        })
+        // uniquingKeysWith rather than uniqueKeysWithValues: the store now
+        // keys dedup on this same normalizer (see VocabularyStore.swift,
+        // C1 in the final-review fix report), but data written before
+        // that fix could still contain a whitespace-variant duplicate
+        // pair on disk — this must never crash on such rows. "First wins"
+        // matches allLocked()'s `ORDER BY source COLLATE NOCASE ASC`,
+        // i.e. the row findRowLocked would itself return.
+        let existingBySource = Dictionary(
+            settings.transcriptCorrections.map { (normalizedTranscriptCorrectionSource($0.source), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         var newCount = 0
         var updatedCount = 0
@@ -5363,9 +5423,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return imported
         case .merge:
             var merged = settings.transcriptCorrections
-            var indexBySource = Dictionary(uniqueKeysWithValues: merged.enumerated().map {
-                (normalizedTranscriptCorrectionSource($0.element.source), $0.offset)
-            })
+            // uniquingKeysWith, not uniqueKeysWithValues — same rationale
+            // as correctionImportSummary above. "Last wins" here matches
+            // the loop below, which also does last-write-wins on
+            // `indexBySource[key] = ...`.
+            var indexBySource = Dictionary(
+                merged.enumerated().map { (normalizedTranscriptCorrectionSource($0.element.source), $0.offset) },
+                uniquingKeysWith: { _, second in second }
+            )
 
             for correction in imported {
                 let key = normalizedTranscriptCorrectionSource(correction.source)
@@ -6584,6 +6649,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             NSApp.terminate(nil)
         }
+    }
+
+    private func showVocabularyLearnedToast(_ record: VocabularyRecord, targetFrame: NSRect?) {
+        vocabularyLearnedToastController.show(record, store: settings.vocabularyStore, targetFrame: targetFrame)
     }
 
 }
