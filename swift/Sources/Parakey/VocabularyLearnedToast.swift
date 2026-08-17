@@ -3,6 +3,8 @@
 // that deletes the just-learned row within a short window.
 
 import AppKit
+import CoreGraphics
+import Foundation
 
 @MainActor
 final class VocabularyLearnedToastController {
@@ -10,22 +12,57 @@ final class VocabularyLearnedToastController {
     private var panel: NSPanel?
     private var dismissTask: Task<Void, Never>?
 
+    // Restyle state for dismiss(confirmed:), captured from makeContentView's
+    // return value at show()-time so dismiss can restyle the label in place
+    // (strikethrough + recolor the arrow) without walking the view hierarchy.
+    private weak var label: NSTextField?
+    private var arrowRange: NSRange?
+    private var accentColor: NSColor?
+
+    // Global Escape interception (Task 1): a CGEventTap scoped to Escape
+    // only and to this toast's lifetime, mirroring HotkeyListener's tap in
+    // Hotkeys.swift so Escape reaches the toast even when the frontmost app
+    // — not this nonactivating panel — is key. `pendingUndo` is whatever
+    // show() currently wants Escape to trigger; the tap callback is a free
+    // C function and can't capture per-toast state directly, so it reaches
+    // back into this instance via userInfo instead.
+    private var escapeTap: CFMachPort?
+    private var escapeRunLoopSource: CFRunLoopSource?
+    private var suppressEscapeKeyUp = false
+    private var pendingUndo: (() -> Void)?
+
     func show(_ record: VocabularyRecord, store: VocabularyStore, targetFrame: NSRect? = nil) {
         dismissTask?.cancel()
         panel?.orderOut(nil)
+        teardownEscapeTap()
 
         let panel = Self.makePanel()
         let lightBackground = Self.shouldUseLightBackground()
         let accentColor = Settings.shared.recordingHUDRecordingColor.resolvedColor(lightBackground: lightBackground)
+        self.accentColor = accentColor
+
+        // Single shared undo action, guarded by its own one-shot flag so it
+        // is idempotent no matter which of the three triggers (Escape via
+        // the global tap, Escape via the local button keyEquivalent
+        // fallback, or a click on the pill) fires first — the rest become
+        // no-ops.
+        var didUndo = false
+        let undo: () -> Void = { [weak self] in
+            guard !didUndo else { return }
+            didUndo = true
+            store.delete(id: record.id)
+            self?.dismiss(confirmed: false)
+        }
+        pendingUndo = undo
+
         let content = Self.makeContentView(
             record: record,
             lightBackground: lightBackground,
             accentColor: accentColor,
-            onUndo: { [weak self] in
-                store.delete(id: record.id)
-                self?.dismiss()
-            }
+            onUndo: undo
         )
+        self.label = content.label
+        self.arrowRange = content.arrowRange
         // Resize the panel to the content's already-computed size *before*
         // assigning it as contentView — setting `panel.contentView` resets
         // the view's frame to fill the panel's *existing* content rect, so
@@ -33,8 +70,8 @@ final class VocabularyLearnedToastController {
         // width (every toast would render at minPillWidth instead of fitting
         // its text). Positioning below reads panel.frame.size, so this must
         // happen first.
-        panel.setContentSize(content.frame.size)
-        panel.contentView = content
+        panel.setContentSize(content.view.frame.size)
+        panel.contentView = content.view
         if let targetFrame, let screen = Self.screenFor(point: NSPoint(x: targetFrame.midX, y: targetFrame.midY)) {
             Self.positionAboveTarget(panel, targetFrame: targetFrame, screen: screen)
         } else {
@@ -49,7 +86,7 @@ final class VocabularyLearnedToastController {
         // scaled by the anchor), so `position` is recomputed to compensate
         // and keep the layer's on-screen frame exactly where
         // positionAboveTarget/positionBottomRight already placed it.
-        if let layer = content.layer {
+        if let layer = content.view.layer {
             let bounds = layer.bounds
             layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
             layer.position = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -61,7 +98,7 @@ final class VocabularyLearnedToastController {
         // Animation/NSAnimationContext since this toast is a one-shot
         // show/hide rather than a continuously-live, per-frame-driven view.
         panel.alphaValue = 0
-        content.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
+        content.view.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
         panel.invalidateShadow()
         panel.orderFrontRegardless()
         self.panel = panel
@@ -78,7 +115,7 @@ final class VocabularyLearnedToastController {
         // view's layer and race with scaleIn on the same "transform"
         // keyPath, leaving Core Animation's multi-animation resolution to
         // decide the presented value instead of this code.
-        content.layer?.removeAnimation(forKey: "toastScaleOut")
+        content.view.layer?.removeAnimation(forKey: "toastScaleOut")
         let scaleIn = CABasicAnimation(keyPath: "transform")
         scaleIn.fromValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
         scaleIn.toValue = CATransform3DIdentity
@@ -86,14 +123,96 @@ final class VocabularyLearnedToastController {
         scaleIn.timingFunction = CAMediaTimingFunction(name: .easeOut)
         scaleIn.fillMode = .forwards
         scaleIn.isRemovedOnCompletion = false
-        content.layer?.add(scaleIn, forKey: "toastScaleIn")
-        content.layer?.setAffineTransform(.identity)
+        content.view.layer?.add(scaleIn, forKey: "toastScaleIn")
+        content.view.layer?.setAffineTransform(.identity)
+
+        installEscapeTap()
 
         dismissTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.autoDismissSeconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            self?.dismiss()
+            self?.dismiss(confirmed: true)
         }
+    }
+
+    // MARK: - Global Escape interception (Task 1)
+
+    /// Installs a CGEventTap scoped to Escape (virtual keycode 53) only,
+    /// mirroring HotkeyListener.start()'s tap in Hotkeys.swift (same
+    /// `.cgSessionEventTap`/`.headInsertEventTap` options, run loop source
+    /// registration, and mach port lifecycle) so this toast's Undo works
+    /// even when the frontmost app — not this nonactivating panel — has
+    /// keyboard focus. Scoped independently of HotkeyListener's own tap;
+    /// the two don't interact.
+    private func installEscapeTap() {
+        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                // tapDisabledByTimeout/tapDisabledByUserInput (and anything
+                // else outside our mask) carry no keycode worth reading —
+                // pass them through untouched.
+                guard type == .keyDown || type == .keyUp,
+                      CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)) == ESCAPE_KEYCODE
+                else {
+                    return Unmanaged.passUnretained(event)
+                }
+                let controller = Unmanaged<VocabularyLearnedToastController>.fromOpaque(userInfo).takeUnretainedValue()
+                let suppress = MainActor.assumeIsolated {
+                    controller.handleEscapeTapEvent(isKeyDown: type == .keyDown)
+                }
+                return suppress ? nil : Unmanaged.passUnretained(event)
+            },
+            userInfo: opaqueSelf
+        ) else {
+            // No Input Monitoring permission (or tap creation otherwise
+            // failed) — fall back silently to the local NSButton
+            // keyEquivalent, which still works whenever the panel is key.
+            log("VocabularyLearnedToastController: escape tap create failed — falling back to local keyEquivalent")
+            return
+        }
+
+        escapeTap = tap
+        escapeRunLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), escapeRunLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    /// Returns whether the event should be swallowed (return nil from the
+    /// tap callback). Mirrors HotkeyTransitionState.transitionEscape's
+    /// suppressEscapeKeyUp handling in Hotkeys.swift: the keyDown that
+    /// triggers undo also arms a flag so the matching keyUp is swallowed
+    /// too, rather than leaking through to the frontmost app.
+    private func handleEscapeTapEvent(isKeyDown: Bool) -> Bool {
+        if isKeyDown {
+            suppressEscapeKeyUp = true
+            pendingUndo?()
+            return true
+        }
+        guard suppressEscapeKeyUp else { return false }
+        suppressEscapeKeyUp = false
+        return true
+    }
+
+    /// Invalidates the tap and removes its run loop source. Safe to call
+    /// even when no tap is installed (tap creation can fail).
+    private func teardownEscapeTap() {
+        if let escapeTap {
+            CGEvent.tapEnable(tap: escapeTap, enable: false)
+            CFMachPortInvalidate(escapeTap)
+        }
+        if let escapeRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), escapeRunLoopSource, .commonModes)
+        }
+        escapeTap = nil
+        escapeRunLoopSource = nil
+        suppressEscapeKeyUp = false
+        pendingUndo = nil
     }
 
     /// Scale the toast animates from (on appear) / to (on dismiss). Applied
@@ -102,43 +221,175 @@ final class VocabularyLearnedToastController {
     /// the pill's own center rather than a corner.
     private static let entryExitScale: CGFloat = 0.85
 
-    private func dismiss() {
+    /// Hold time for the "rejected" restyle (strikethrough + dim + recolored
+    /// arrow) before the normal exit animation plays, long enough to read as
+    /// a deliberate beat rather than a flicker.
+    private static let rejectRestyleHoldSeconds: TimeInterval = 0.25
+    /// Duration of the "accepted" glow/scale-bump pulse, timed to overlap
+    /// just the start of the exit animation rather than delay it — this
+    /// path is non-interactive, so it shouldn't make the user wait.
+    private static let confirmGlowSeconds: TimeInterval = 0.2
+
+    /// `confirmed` distinguishes why the toast is going away: `true` for
+    /// the 7s auto-dismiss timer (the correction was accepted/kept — plays
+    /// a brief accent-colored glow pulse), `false` for Escape/click-to-undo
+    /// (the correction was rejected — restyles the label with strikethrough
+    /// before fading out). No default: every call site must say which.
+    private func dismiss(confirmed: Bool) {
         // Guard against double-invocation (e.g. the 7s auto-timer firing
-        // just as the user clicks/Escapes the toast): once the completion
-        // handler below runs, `panel` is nil'd out, so a second call here
-        // is a no-op instead of animating/ordering-out an already-gone panel.
+        // just as the user clicks/Escapes the toast): once `panel` is nil'd
+        // out below, a second call here is a no-op instead of
+        // animating/ordering-out an already-gone panel. This happens
+        // synchronously, before the confirmed==false path's restyle hold,
+        // so a second dismiss() arriving during that hold is still caught.
         guard let panel else { return }
         dismissTask?.cancel()
         dismissTask = nil
         self.panel = nil
+        let label = self.label
+        let arrowRange = self.arrowRange
+        let accentColor = self.accentColor
+        self.label = nil
+        self.arrowRange = nil
+        self.accentColor = nil
+        // Tear down the tap here rather than inside the Escape keyDown
+        // handler that may have triggered this dismiss: the matching keyUp
+        // (see handleEscapeTapEvent's suppressEscapeKeyUp) needs the tap
+        // still alive to be swallowed. Tearing down at the end of the exit
+        // animation, once the toast is actually gone, keeps that window
+        // open. Capture locally rather than reading the instance vars
+        // inside the completion handler — a fresh show() may have installed
+        // its own tap by the time this one's animation finishes.
+        let capturedTap = escapeTap
+        let capturedRunLoopSource = escapeRunLoopSource
+        escapeTap = nil
+        escapeRunLoopSource = nil
+        suppressEscapeKeyUp = false
+        pendingUndo = nil
 
         let content = panel.contentView
-        panel.invalidateShadow()
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
-            panel.orderOut(nil)
-        })
-        // See the matching removeAnimation(forKey:) in show(): the same
-        // race can happen in reverse if dismiss() is somehow reached again
-        // while an entry animation is still attached.
-        content?.layer?.removeAnimation(forKey: "toastScaleIn")
-        let scaleOut = CABasicAnimation(keyPath: "transform")
-        scaleOut.fromValue = CATransform3DIdentity
-        scaleOut.toValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
-        scaleOut.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
-        scaleOut.timingFunction = CAMediaTimingFunction(name: .easeIn)
-        scaleOut.fillMode = .forwards
-        scaleOut.isRemovedOnCompletion = false
-        content?.layer?.add(scaleOut, forKey: "toastScaleOut")
-        // Match show()'s pattern: the model layer holds the true final
-        // value directly, with the CABasicAnimation above only animating
-        // the *presentation* toward it — consistent even if this layer
-        // were ever kept alive past this call instead of being discarded
-        // with the panel right after orderOut(nil) fires.
-        content?.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
+
+        func playExitAnimation() {
+            panel.invalidateShadow()
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0
+            }, completionHandler: {
+                panel.orderOut(nil)
+                if let capturedTap {
+                    CGEvent.tapEnable(tap: capturedTap, enable: false)
+                    CFMachPortInvalidate(capturedTap)
+                }
+                if let capturedRunLoopSource {
+                    CFRunLoopRemoveSource(CFRunLoopGetMain(), capturedRunLoopSource, .commonModes)
+                }
+            })
+            // See the matching removeAnimation(forKey:) in show(): the same
+            // race can happen in reverse if dismiss() is somehow reached
+            // again while an entry animation is still attached.
+            content?.layer?.removeAnimation(forKey: "toastScaleIn")
+            let scaleOut = CABasicAnimation(keyPath: "transform")
+            scaleOut.fromValue = CATransform3DIdentity
+            scaleOut.toValue = CATransform3DMakeScale(Self.entryExitScale, Self.entryExitScale, 1)
+            scaleOut.duration = RECORDING_HUD_ANIMATE_OUT_SECONDS
+            scaleOut.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            scaleOut.fillMode = .forwards
+            scaleOut.isRemovedOnCompletion = false
+            content?.layer?.add(scaleOut, forKey: "toastScaleOut")
+            // Match show()'s pattern: the model layer holds the true final
+            // value directly, with the CABasicAnimation above only
+            // animating the *presentation* toward it — consistent even if
+            // this layer were ever kept alive past this call instead of
+            // being discarded with the panel right after orderOut(nil).
+            content?.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
+        }
+
+        if confirmed {
+            // Accepted: a brief accent-colored shadow glow plus a small
+            // scale bump, layered on top of (not replacing) the exit
+            // animation above. The glow is a CALayer property, so it's
+            // applied to the content view's layer rather than the panel;
+            // panel.setContentSize sizes the panel exactly to the content,
+            // so a shadow radius that would extend past the content's
+            // bounds gets clipped at the window edge.
+            if let layer = content?.layer, let accentColor {
+                layer.shadowColor = accentColor.cgColor
+                // shadowOpacity/shadowRadius default to 0/3 and have never
+                // been set on this layer before, so — unlike scaleIn/
+                // scaleOut's transform, which always has a real "current"
+                // model value to animate from — there's no meaningful
+                // resting state to read back. Pick the resting values
+                // explicitly and write them to the model layer *before*
+                // adding the animations (mirrors scaleOut's
+                // setAffineTransform call below: the model layer holds the
+                // true final value, the CABasicAnimation only animates the
+                // presentation toward it), otherwise the animation would
+                // remove itself and reveal an implicit opacity-0 layer that
+                // never glowed at all.
+                let restingShadowOpacity: Float = 0
+                let restingShadowRadius: CGFloat = 6
+                layer.shadowOpacity = restingShadowOpacity
+                layer.shadowRadius = restingShadowRadius
+
+                let glowOpacity = CABasicAnimation(keyPath: "shadowOpacity")
+                glowOpacity.fromValue = Float(0.9)
+                glowOpacity.toValue = restingShadowOpacity
+                glowOpacity.duration = Self.confirmGlowSeconds
+                glowOpacity.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(glowOpacity, forKey: "toastConfirmGlowOpacity")
+
+                let glowRadius = CABasicAnimation(keyPath: "shadowRadius")
+                glowRadius.fromValue = CGFloat(16)
+                glowRadius.toValue = restingShadowRadius
+                glowRadius.duration = Self.confirmGlowSeconds
+                glowRadius.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(glowRadius, forKey: "toastConfirmGlowRadius")
+
+                // Additive keyframe animation on "transform.scale" so the
+                // ~1.0 → 1.03 → 1.0 bump composes on top of scaleOut's own
+                // "transform" animation above instead of racing it — the
+                // same class of conflict the toastScaleIn/toastScaleOut
+                // removeAnimation(forKey:) calls elsewhere in this file
+                // guard against, just two animations on the same layer at
+                // once here rather than sequential reuse. Left at defaults
+                // (.removed / isRemovedOnCompletion = true) so it vanishes
+                // on its own once done, leaving scaleOut's own transform
+                // animation as the sole surviving one.
+                let bump = CAKeyframeAnimation(keyPath: "transform.scale")
+                bump.values = ([0, 0.03, 0] as [Double]).map { NSNumber(value: $0) }
+                bump.keyTimes = ([0, 0.5, 1] as [Double]).map { NSNumber(value: $0) }
+                bump.duration = Self.confirmGlowSeconds
+                bump.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                bump.isAdditive = true
+                layer.add(bump, forKey: "toastConfirmScaleBump")
+            }
+            playExitAnimation()
+        } else {
+            // Rejected: strike through the whole label, dim both words, and
+            // recolor the arrow away from accentColor to a neutral gray —
+            // then hold briefly so the restyle actually reads before the
+            // normal fade+shrink-out plays.
+            if let label,
+               let attributed = label.attributedStringValue.mutableCopy() as? NSMutableAttributedString {
+                let fullRange = NSRange(location: 0, length: attributed.length)
+                attributed.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: fullRange)
+                attributed.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { value, range, _ in
+                    guard let color = value as? NSColor else { return }
+                    if let arrowRange, NSIntersectionRange(range, arrowRange).length > 0 {
+                        attributed.addAttribute(.foregroundColor, value: NSColor.systemGray, range: range)
+                    } else {
+                        attributed.addAttribute(.foregroundColor, value: color.withAlphaComponent(color.alphaComponent * 0.4), range: range)
+                    }
+                }
+                label.attributedStringValue = attributed
+            }
+
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(Self.rejectRestyleHoldSeconds * 1_000_000_000))
+                playExitAnimation()
+            }
+        }
     }
 
     // Pill geometry, chosen to read as an obviously-rounded capsule (like
@@ -184,10 +435,21 @@ final class VocabularyLearnedToastController {
         )
     }
 
+    /// makeContentView's return value: the assembled pill view, plus a weak
+    /// reference to its label and the arrow segment's NSRange within the
+    /// label's attributed string — captured by the controller so
+    /// dismiss(confirmed:) can restyle the label in place (Task 2) without
+    /// walking the view hierarchy to find it.
+    private struct ContentViewResult {
+        let view: NSView
+        let label: NSTextField
+        let arrowRange: NSRange
+    }
+
     private static func makeContentView(record: VocabularyRecord,
                                         lightBackground: Bool,
                                         accentColor: NSColor,
-                                        onUndo: @escaping () -> Void) -> NSView {
+                                        onUndo: @escaping () -> Void) -> ContentViewResult {
         // Mirrors RecordingHUDView.drawTimerOutlineFill's textColor formula
         // (HUDViews.swift) — NSColor.labelColor resolves against the
         // *system* appearance, which can mismatch this container's forced
@@ -202,10 +464,16 @@ final class VocabularyLearnedToastController {
             .font: font,
             .foregroundColor: textColor,
         ])
+        // Take the arrow's range off the attributed string's own UTF-16
+        // length (NSRange's unit) rather than record.source.count (Swift's
+        // grapheme-cluster count) — the two can disagree for combining
+        // characters/emoji, and an out-of-bounds NSRange later would trap.
+        let arrowStart = text.length
         text.append(NSAttributedString(string: "  →  ", attributes: [
             .font: font,
             .foregroundColor: accentColor,
         ]))
+        let arrowRange = NSRange(location: arrowStart, length: text.length - arrowStart)
         text.append(NSAttributedString(string: record.replacement, attributes: [
             .font: font,
             .foregroundColor: textColor,
@@ -266,7 +534,7 @@ final class VocabularyLearnedToastController {
             undoButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
-        return container
+        return ContentViewResult(view: container, label: label, arrowRange: arrowRange)
     }
 
     private static func positionBottomRight(_ panel: NSPanel) {
