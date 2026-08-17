@@ -18,6 +18,7 @@ final class VocabularyLearnedToastController {
     private weak var label: NSTextField?
     private var arrowRange: NSRange?
     private var accentColor: NSColor?
+    private var textColor: NSColor?
 
     // Global Escape interception (Task 1): a CGEventTap scoped to Escape
     // only and to this toast's lifetime, mirroring HotkeyListener's tap in
@@ -30,6 +31,17 @@ final class VocabularyLearnedToastController {
     private var escapeRunLoopSource: CFRunLoopSource?
     private var suppressEscapeKeyUp = false
     private var pendingUndo: (() -> Void)?
+
+    // Supplied by ParakeyApp at construction time, reading the same
+    // recording-active state HotkeyListener.isRecordingActive already
+    // exposes (Hotkeys.swift). HotkeyListener has its own long-lived
+    // Escape tap that cancels an active recording; because this toast's
+    // tap is created later (when the toast shows), it runs ahead of
+    // HotkeyListener's tap in the .headInsertEventTap chain and would
+    // otherwise swallow Escape before HotkeyListener ever saw it. When
+    // this returns true, the toast's tap must not swallow Escape at all —
+    // it defers to HotkeyListener's own cancel-recording handling.
+    var isRecordingActive: (() -> Bool)?
 
     func show(_ record: VocabularyRecord, store: VocabularyStore, targetFrame: NSRect? = nil) {
         dismissTask?.cancel()
@@ -63,6 +75,7 @@ final class VocabularyLearnedToastController {
         )
         self.label = content.label
         self.arrowRange = content.arrowRange
+        self.textColor = content.textColor
         // Resize the panel to the content's already-computed size *before*
         // assigning it as contentView — setting `panel.contentView` resets
         // the view's frame to fill the panel's *existing* content rect, so
@@ -185,11 +198,26 @@ final class VocabularyLearnedToastController {
 
     /// Returns whether the event should be swallowed (return nil from the
     /// tap callback). Mirrors HotkeyTransitionState.transitionEscape's
-    /// suppressEscapeKeyUp handling in Hotkeys.swift: the keyDown that
-    /// triggers undo also arms a flag so the matching keyUp is swallowed
-    /// too, rather than leaking through to the frontmost app.
+    /// suppressEscapeKeyUp handling in Hotkeys.swift exactly: arm the flag
+    /// on keyDown and only clear it when the matching keyUp itself is
+    /// swallowed — never as a side effect of anything else (in particular,
+    /// dismiss(confirmed:)'s teardown must not clear it before the keyUp
+    /// has arrived, or the keyUp leaks through to the frontmost app while
+    /// the keyDown was swallowed).
+    ///
+    /// Also defers to an active recording: HotkeyListener (Hotkeys.swift)
+    /// has its own long-lived Escape tap that cancels an active recording,
+    /// and it runs *after* this tap in the tap chain (this one is created
+    /// later, when the toast shows, so it sits ahead of HotkeyListener's
+    /// under .headInsertEventTap). If a recording is active, Escape must
+    /// keep meaning "cancel the recording", not "undo the vocabulary
+    /// learn" — pass the event through untouched so HotkeyListener's tap
+    /// still gets to see and handle it, and don't arm/clear our own
+    /// suppression state for it at all (that keyDown/keyUp pair is
+    /// HotkeyListener's to manage, not ours).
     private func handleEscapeTapEvent(isKeyDown: Bool) -> Bool {
         if isKeyDown {
+            guard isRecordingActive?() != true, pendingUndo != nil else { return false }
             suppressEscapeKeyUp = true
             pendingUndo?()
             return true
@@ -249,9 +277,11 @@ final class VocabularyLearnedToastController {
         let label = self.label
         let arrowRange = self.arrowRange
         let accentColor = self.accentColor
+        let textColor = self.textColor
         self.label = nil
         self.arrowRange = nil
         self.accentColor = nil
+        self.textColor = nil
         // Tear down the tap here rather than inside the Escape keyDown
         // handler that may have triggered this dismiss: the matching keyUp
         // (see handleEscapeTapEvent's suppressEscapeKeyUp) needs the tap
@@ -264,7 +294,16 @@ final class VocabularyLearnedToastController {
         let capturedRunLoopSource = escapeRunLoopSource
         escapeTap = nil
         escapeRunLoopSource = nil
-        suppressEscapeKeyUp = false
+        // Deliberately NOT clearing suppressEscapeKeyUp here: when this
+        // dismiss was itself triggered by an Escape keyDown (via
+        // pendingUndo), that keyDown just armed suppressEscapeKeyUp and the
+        // matching keyUp hasn't arrived yet. Clearing it synchronously here
+        // — before the keyUp is swallowed — was the exact bug: the keyDown
+        // gets swallowed (undo runs) but the keyUp then sees
+        // suppressEscapeKeyUp already false and leaks through to the
+        // frontmost app. Only handleEscapeTapEvent's own keyUp branch (or a
+        // later teardownEscapeTap() call, once this tap is actually torn
+        // down) may clear it.
         pendingUndo = nil
 
         let content = panel.contentView
@@ -306,45 +345,41 @@ final class VocabularyLearnedToastController {
         }
 
         if confirmed {
-            // Accepted: a brief accent-colored shadow glow plus a small
+            // Accepted: a brief accent-colored border pulse plus a small
             // scale bump, layered on top of (not replacing) the exit
-            // animation above. The glow is a CALayer property, so it's
-            // applied to the content view's layer rather than the panel;
-            // panel.setContentSize sizes the panel exactly to the content,
-            // so a shadow radius that would extend past the content's
-            // bounds gets clipped at the window edge.
+            // animation above. A CALayer *shadow* (shadowOpacity/
+            // shadowRadius) was tried first but renders entirely outside
+            // the layer's own bounds — panel.setContentSize sizes the
+            // panel's content rect to exactly match this container with
+            // zero margin, so a shadow radius of any visible size would be
+            // clipped away at the window edge and never actually render.
+            // borderWidth/borderColor instead draw along the layer's own
+            // bounds edge, staying fully within the visible pill, so the
+            // pulse reads as a brightened stroke rather than an external
+            // glow.
             if let layer = content?.layer, let accentColor {
-                layer.shadowColor = accentColor.cgColor
-                // shadowOpacity/shadowRadius default to 0/3 and have never
-                // been set on this layer before, so — unlike scaleIn/
-                // scaleOut's transform, which always has a real "current"
-                // model value to animate from — there's no meaningful
-                // resting state to read back. Pick the resting values
-                // explicitly and write them to the model layer *before*
-                // adding the animations (mirrors scaleOut's
-                // setAffineTransform call below: the model layer holds the
-                // true final value, the CABasicAnimation only animates the
-                // presentation toward it), otherwise the animation would
-                // remove itself and reveal an implicit opacity-0 layer that
-                // never glowed at all.
-                let restingShadowOpacity: Float = 0
-                let restingShadowRadius: CGFloat = 6
-                layer.shadowOpacity = restingShadowOpacity
-                layer.shadowRadius = restingShadowRadius
+                // The container's resting stroke is set once in
+                // makeContentView and never changed elsewhere, so it's
+                // safe to read back here as the "return to" value — unlike
+                // the shadow properties this replaces, borderColor/
+                // borderWidth already have real resting values on this
+                // layer.
+                let restingBorderColor = layer.borderColor
+                let restingBorderWidth = layer.borderWidth
 
-                let glowOpacity = CABasicAnimation(keyPath: "shadowOpacity")
-                glowOpacity.fromValue = Float(0.9)
-                glowOpacity.toValue = restingShadowOpacity
-                glowOpacity.duration = Self.confirmGlowSeconds
-                glowOpacity.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                layer.add(glowOpacity, forKey: "toastConfirmGlowOpacity")
+                let borderColorPulse = CABasicAnimation(keyPath: "borderColor")
+                borderColorPulse.fromValue = accentColor.cgColor
+                borderColorPulse.toValue = restingBorderColor
+                borderColorPulse.duration = Self.confirmGlowSeconds
+                borderColorPulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(borderColorPulse, forKey: "toastConfirmBorderColor")
 
-                let glowRadius = CABasicAnimation(keyPath: "shadowRadius")
-                glowRadius.fromValue = CGFloat(16)
-                glowRadius.toValue = restingShadowRadius
-                glowRadius.duration = Self.confirmGlowSeconds
-                glowRadius.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                layer.add(glowRadius, forKey: "toastConfirmGlowRadius")
+                let borderWidthPulse = CABasicAnimation(keyPath: "borderWidth")
+                borderWidthPulse.fromValue = CGFloat(3)
+                borderWidthPulse.toValue = restingBorderWidth
+                borderWidthPulse.duration = Self.confirmGlowSeconds
+                borderWidthPulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(borderWidthPulse, forKey: "toastConfirmBorderWidth")
 
                 // Additive keyframe animation on "transform.scale" so the
                 // ~1.0 → 1.03 → 1.0 bump composes on top of scaleOut's own
@@ -371,16 +406,25 @@ final class VocabularyLearnedToastController {
             // then hold briefly so the restyle actually reads before the
             // normal fade+shrink-out plays.
             if let label,
+               let textColor,
                let attributed = label.attributedStringValue.mutableCopy() as? NSMutableAttributedString {
                 let fullRange = NSRange(location: 0, length: attributed.length)
                 attributed.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: fullRange)
-                attributed.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { value, range, _ in
-                    guard let color = value as? NSColor else { return }
-                    if let arrowRange, NSIntersectionRange(range, arrowRange).length > 0 {
-                        attributed.addAttribute(.foregroundColor, value: NSColor.systemGray, range: range)
-                    } else {
-                        attributed.addAttribute(.foregroundColor, value: color.withAlphaComponent(color.alphaComponent * 0.4), range: range)
-                    }
+                // Direct, unconditional writes rather than enumerating
+                // existing .foregroundColor runs and conditionally
+                // patching them: enumerate-and-patch degenerates if
+                // accentColor ever equals textColor (all three text
+                // segments would already share one run, and "the run that
+                // intersects arrowRange" would then be the *entire* label
+                // — recoloring it gray instead of just the arrow). Dim the
+                // whole label first to the captured resting textColor
+                // (makeContentView's textColor, not whatever run happens to
+                // be captured), then unconditionally overwrite exactly
+                // arrowRange to gray — this can't degenerate regardless of
+                // what accentColor/textColor resolve to.
+                attributed.addAttribute(.foregroundColor, value: textColor.withAlphaComponent(textColor.alphaComponent * 0.4), range: fullRange)
+                if let arrowRange {
+                    attributed.addAttribute(.foregroundColor, value: NSColor.systemGray, range: arrowRange)
                 }
                 label.attributedStringValue = attributed
             }
@@ -435,15 +479,17 @@ final class VocabularyLearnedToastController {
         )
     }
 
-    /// makeContentView's return value: the assembled pill view, plus a weak
-    /// reference to its label and the arrow segment's NSRange within the
-    /// label's attributed string — captured by the controller so
-    /// dismiss(confirmed:) can restyle the label in place (Task 2) without
-    /// walking the view hierarchy to find it.
+    /// makeContentView's return value: the assembled pill view, plus a
+    /// strong reference to its label and the arrow segment's NSRange
+    /// within the label's attributed string — captured by the controller
+    /// (which itself only keeps a *weak* reference to the label, see
+    /// `label` above) so dismiss(confirmed:) can restyle the label in
+    /// place (Task 2) without walking the view hierarchy to find it.
     private struct ContentViewResult {
         let view: NSView
         let label: NSTextField
         let arrowRange: NSRange
+        let textColor: NSColor
     }
 
     private static func makeContentView(record: VocabularyRecord,
@@ -534,7 +580,7 @@ final class VocabularyLearnedToastController {
             undoButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
-        return ContentViewResult(view: container, label: label, arrowRange: arrowRange)
+        return ContentViewResult(view: container, label: label, arrowRange: arrowRange, textColor: textColor)
     }
 
     private static func positionBottomRight(_ panel: NSPanel) {

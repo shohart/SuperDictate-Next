@@ -267,6 +267,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Sounds.playError()
         }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
+        // So the toast's own Escape tap (VocabularyLearnedToast.swift) can
+        // defer to an active recording rather than shadowing
+        // HotkeyListener's existing Escape-cancels-recording handling —
+        // see VocabularyLearnedToastController.isRecordingActive.
+        vocabularyLearnedToastController.isRecordingActive = { [weak self] in self?.isRecording == true }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
         // must not flip state for it. The missing-permissions case is
