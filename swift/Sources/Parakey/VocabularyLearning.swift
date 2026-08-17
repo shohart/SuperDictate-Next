@@ -128,7 +128,7 @@ struct VocabularyLearningTestFailure: Error, CustomStringConvertible {
 @MainActor
 final class PostInsertionEditWatcher {
     static let watchWindowSeconds: TimeInterval = 45
-    static let debounceSeconds: TimeInterval = 1.2
+    static let debounceSeconds: TimeInterval = 0.8
     /// Second-stage "confirm" delay: once a debounce cycle finds a valid
     /// learn candidate, we don't commit it immediately — we wait this much
     /// longer, uninterrupted, before actually saving. Any further edit
@@ -136,7 +136,13 @@ final class PostInsertionEditWatcher {
     /// debounce → evaluate cycle, so a user who is still mid-correction
     /// (edit, pause, edit again) keeps resetting the clock instead of
     /// having a half-finished correction learned.
-    static let confirmSeconds: TimeInterval = 2.5
+    ///
+    /// Kept short deliberately: the toast's own dismiss window (see
+    /// VocabularyLearnedToastController.autoDismissSeconds, 7s) is where the
+    /// user actually gets time to review/undo a learned correction, so this
+    /// stage only needs to rule out "still mid-correction," not also serve
+    /// as review time.
+    static let confirmSeconds: TimeInterval = 1.0
     private static let secureSubroles: Set<String> = ["AXSecureTextField"]
 
     private let store: VocabularyStore
