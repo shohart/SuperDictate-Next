@@ -42,6 +42,29 @@ The current Mac has enough system RAM for a Q8_0 experiment, but the AMD RX
 and CPU fallback buffers must be measured rather than estimated from file
 size alone.
 
+## Initial capability run on the Intel Mac
+
+The exact `tdt-1.1b-q8_0.gguf` was downloaded to a temporary path and tested
+without changing the production model or application. Its SHA-256 was
+`1f0f112a7b30771ff5a01033562118e72f1146f0659fdd5cbba4bd1ac201aade`.
+
+The test used the existing bridge, eight threads, the real AMD RX 6600 Vulkan
+backend, and the existing CPU backend. The inference clip was the synthetic
+near-silence clip used by the integration self-tests, so these numbers measure
+compatibility and resource cost, **not recognition quality**.
+
+| Model/backend | Peak RSS | Warm inference in self-test | Result |
+| --- | ---: | ---: | --- |
+| 0.6B v3 Q8 / CPU | ~0.99 GB | 1.17 s | PASS |
+| 1.1B Q8 / CPU | ~1.60 GB | 1.76 s | PASS |
+| 0.6B v3 Q8 / Vulkan | ~1.05 GB | 0.20 s | PASS |
+| 1.1B Q8 / Vulkan | ~1.63 GB | 0.18 s | PASS |
+
+The Vulkan timings are close enough that the short synthetic clip should not
+be used to claim a 1.1B speedup; a real repeated speech corpus is required.
+The meaningful early result is that 1.1B Q8 loads and runs on this Mac, while
+using roughly 55–62% more resident memory and being about 1.5× slower on CPU.
+
 ## What upstream changed
 
 ### parakeet.cpp
