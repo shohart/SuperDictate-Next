@@ -8,21 +8,48 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
-- **Automatic vocabulary learning**: SuperDictate now notices when you
-  hand-correct a short word or phrase right after it inserts a dictation
-  (classic case: an English loanword written out phonetically in Cyrillic)
-  and remembers the fix on its own — a HUD toast confirms what was learned
-  with an "Отменить"/Undo button, no manual entry required. Off switch in
-  Settings ("Автоматически учить словарь по вашим правкам").
-- New **Vocabulary** manager window (opened from Settings): a full table of
-  every text correction — manual and auto-learned — with add/edit/delete,
-  plus the existing JSON import/export.
-- Text corrections now live in a local SQLite database
-  (`~/Library/Application Support/SuperDictate/corrections.sqlite`) instead
-  of `UserDefaults`. Existing corrections migrate automatically, once, on
-  first launch after upgrading — nothing to do on your end. Cross-Mac
-  folder sync (Dropbox/iCloud/etc.) still uses the same JSON file format as
-  before.
+
+## v0.5.2 — 2026-08-17
+
+### Added
+
+- Split the Settings window into compact thematic tabs: Dictation, Text,
+  Audio, Appearance, and System. Each tab has its own scroll area and starts
+  at the top of the viewport, making the panel usable on small screens.
+- Automatic vocabulary learning now continues watching an insertion after a
+  correction is saved, allowing multiple independently corrected words in one
+  dictated passage to be learned.
+- Added a full-surface learning flash and stronger confirmation animation for
+  the vocabulary toast.
+
+### Fixed
+
+- Prevented deletion-only edits and partial word trimming from being learned
+  as corrections.
+- Reduced vocabulary-learning debounce and confirmation delays from about
+  1.8 seconds total to about 0.85 seconds.
+- Removed the unwanted AppKit focus ring around the toast's transparent undo
+  control.
+- Fixed two-modifier shortcut capture: the first key release captures the
+  complete chord and the trailing release can no longer overwrite it with a
+  single modifier.
+- Command-based finish shortcuts now work with Control, Option, or Fn even
+  when the primary dictation shortcut is Right Command. The settings validator
+  no longer rejects this intentional shared-modifier arrangement.
+- Fixed the launch-agent restart race that could leave the service stopped
+  while switching between configurations or applying settings.
+- Fixed Vulkan recovery after a CPU fallback by resetting a stale process-wide
+  Parakeet backend when the requested device changes. Vulkan can now be
+  re-enabled without restarting the whole user session.
+- SQLite vocabulary writes now use WAL where possible, surface manual-save
+  errors, and log the actual reason when automatic learning cannot persist a
+  correction.
+
+### Validation
+
+- Added regression coverage for deletion-only edits, multiple corrections,
+  Command modifier finish shortcuts, multi-modifier recording, stale Vulkan
+  backend recovery, and compact settings behavior.
 
 ## v0.5.1 — 2026-08-07
 

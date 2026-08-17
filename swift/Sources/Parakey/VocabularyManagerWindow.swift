@@ -155,7 +155,18 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
             presentError("Parakey keeps at most \(MAX_TRANSCRIPT_CORRECTIONS) corrections, and that limit has been reached. Delete an existing entry before adding a new one.")
             return
         }
-        _ = try? store.upsert(source: validated.source, replacement: validated.replacement, origin: .manual)
+        do {
+            _ = try store.upsert(source: validated.source, replacement: validated.replacement, origin: .manual)
+        } catch {
+            // Never swallow this: the agent process holds its own
+            // connection to the same corrections.sqlite, and a lock
+            // contention (or any other SQLite failure) that silently
+            // drops the row is exactly how "I saved a correction but it
+            // didn't appear" happens.
+            presentError("Could not save that correction: \(error.localizedDescription)")
+            reload()
+            return
+        }
         reload()
     }
 
@@ -180,7 +191,13 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         if normalizedTranscriptCorrectionSource(validated.source) != normalizedTranscriptCorrectionSource(record.source) {
             store.delete(id: record.id)
         }
-        _ = try? store.upsert(source: validated.source, replacement: validated.replacement, origin: record.origin)
+        do {
+            _ = try store.upsert(source: validated.source, replacement: validated.replacement, origin: record.origin)
+        } catch {
+            presentError("Could not save that correction: \(error.localizedDescription)")
+            reload()
+            return
+        }
         reload()
     }
 
@@ -234,10 +251,22 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
             presentError("Could not read that corrections file.")
             return
         }
+        var failedCount = 0
+        var firstFailureMessage = ""
         for correction in normalizedTranscriptCorrections(imported) {
-            _ = try? store.upsert(source: correction.source, replacement: correction.replacement, origin: .manual)
+            do {
+                _ = try store.upsert(source: correction.source, replacement: correction.replacement, origin: .manual)
+            } catch {
+                failedCount += 1
+                if firstFailureMessage.isEmpty {
+                    firstFailureMessage = error.localizedDescription
+                }
+            }
         }
         reload()
+        if failedCount > 0 {
+            presentError("\(failedCount) correction(s) could not be imported (first error: \(firstFailureMessage)).")
+        }
     }
 
     @objc private func exportTapped() {

@@ -123,6 +123,14 @@ enum ControlPanelUpdateState: Equatable, Sendable {
     case failed(String)
 }
 
+private enum SettingsTab: Int, CaseIterable {
+    case dictation
+    case text
+    case audio
+    case appearance
+    case system
+}
+
 @MainActor
 final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
@@ -136,6 +144,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
+    private var selectedSettingsTab: SettingsTab = .dictation
     private var hotkeyRecorder: HotkeyRecorderController?
     private weak var settingsSaveButton: NSButton?
     private weak var settingsDiscardButton: NSButton?
@@ -260,7 +269,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                 .map { $0 != ControlPanelSettingsDraft(settings: settings) } ?? false
             if force || !hasUnsavedChanges {
                 settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-                settingsWindow.contentView = makeSettingsContentView()
+                settingsWindow.contentView = makeTabbedSettingsContentView()
             }
         }
     }
@@ -479,6 +488,194 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                                         constant: innerWidthInset).isActive = true
         }
         return background
+    }
+
+    private func makeTabbedSettingsContentView() -> NSView {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 24, bottom: 18, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addArrangedSubview(settingsHeaderView())
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(settingsTabSelector())
+        root.addArrangedSubview(settingsTabScrollView(draft: draft))
+        root.addArrangedSubview(settingsActionsRow(draft: draft))
+
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
+
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+        ])
+
+        let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
+        for view in root.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                        constant: innerWidthInset).isActive = true
+        }
+        return background
+    }
+
+    private func settingsTabSelector() -> NSView {
+        let selector = NSSegmentedControl(
+            labels: SettingsTab.allCases.map { localizedSettingsTabTitle($0) },
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(selectSettingsTab(_:))
+        )
+        selector.selectedSegment = selectedSettingsTab.rawValue
+        selector.segmentStyle = .texturedRounded
+        selector.controlSize = .small
+        selector.setAccessibilityLabel(t("Раздел настроек", "Settings section"))
+        return selector
+    }
+
+    private func settingsTabScrollView(draft: ControlPanelSettingsDraft) -> NSView {
+        let document = settingsTabContent(draft: draft)
+        document.translatesAutoresizingMaskIntoConstraints = false
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.documentView = document
+        scrollView.heightAnchor.constraint(equalToConstant: 342).isActive = true
+        document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
+        // Keep short tab contents pinned to the top of the viewport. Without
+        // a minimum document height, AppKit centers a document that is
+        // shorter than the clip view, leaving a large blank gap above the
+        // first setting on Dictation/Audio/Appearance/System tabs.
+        document.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor).isActive = true
+        return scrollView
+    }
+
+    private func settingsTabContent(draft: ControlPanelSettingsDraft) -> NSView {
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 9
+        content.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 8, right: 12)
+
+        switch selectedSettingsTab {
+        case .dictation:
+            content.addArrangedSubview(hotkeyRow(
+                title: t("Диктовка", "Dictation"),
+                shortcut: draft.dictationHotkey,
+                kind: .dictation,
+                toolTip: t("Начать запись. Повторное нажатие завершает её выбранным способом.",
+                           "Start recording. Press again to finish using the selected action.")
+            ))
+            content.addArrangedSubview(primaryCompletionBehaviorRow(draft))
+            content.addArrangedSubview(alternateCompletionRow(draft))
+            content.addArrangedSubview(enterDelayRow(draft))
+            content.addArrangedSubview(hotkeyRow(
+                title: t("История", "History"),
+                shortcut: draft.historyHotkey,
+                kind: .history,
+                toolTip: t("Открыть или закрыть последние транскрипции.",
+                           "Open or close recent transcriptions.")
+            ))
+
+        case .text:
+            content.addArrangedSubview(normalizeNumbersRow(draft))
+            content.addArrangedSubview(fillerWordsRow(draft))
+            content.addArrangedSubview(correctionsInfoRow())
+            content.addArrangedSubview(autoLearnVocabularyRow(draft))
+
+        case .audio:
+            content.addArrangedSubview(microphoneSettingsRow(draft))
+            content.addArrangedSubview(muteWhileRecordingRow(draft))
+            content.addArrangedSubview(autoStopOnSilenceRow(draft))
+            content.addArrangedSubview(autoStopSilenceDurationRow(draft))
+
+        case .appearance:
+            content.addArrangedSubview(popupRow(
+                title: t("Размер капсулы", "Capsule size"),
+                detail: t("Размер плавающего индикатора записи.",
+                          "Size of the floating recording indicator."),
+                selectedValue: draft.hudSize.rawValue,
+                options: RecordingHUDSize.allCases.map { (localizedHUDSizeName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDSize(_:)),
+                toolTip: t("Выбрать компактную, обычную или крупную капсулу.",
+                           "Choose a compact, standard, or large capsule.")
+            ))
+            content.addArrangedSubview(popupRow(
+                title: t("Цвет записи", "Recording color"),
+                detail: t("Цвет аудиоволн, пока микрофон слушает.",
+                          "Color used while the microphone is listening."),
+                selectedValue: draft.recordingColor.rawValue,
+                options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDRecordingColor(_:)),
+                toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
+            ))
+            content.addArrangedSubview(popupRow(
+                title: t("Индикатор записи", "Recording indicator"),
+                detail: t("Полоски уровня громкости или таймер длительности после 10 секунд записи.",
+                          "Volume level bars, or an elapsed-time timer after 10 seconds of recording."),
+                selectedValue: draft.hudDisplayMode.rawValue,
+                options: RecordingHUDDisplayMode.allCases.map { (localizedDisplayModeName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDDisplayMode(_:)),
+                toolTip: t("Переключить вид плавающего индикатора во время записи.",
+                           "Switch how the floating recording indicator looks while recording.")
+            ))
+            content.addArrangedSubview(popupRow(
+                title: t("Цвет транскрибации", "Transcribing color"),
+                detail: t("Цвет анимации во время распознавания речи.",
+                          "Color used while speech is being converted to text."),
+                selectedValue: draft.transcribingColor.rawValue,
+                options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDTranscribingColor(_:)),
+                toolTip: t("Цвет индикатора во время распознавания речи.",
+                           "Color used while speech is being transcribed.")
+            ))
+            content.addArrangedSubview(popupRow(
+                title: t("Фон капсулы", "HUD background"),
+                detail: t("Системная тема или постоянный светлый/тёмный фон.",
+                          "Follow the system appearance or use a fixed background."),
+                selectedValue: draft.backgroundStyle.rawValue,
+                options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDBackgroundStyle(_:)),
+                toolTip: t("Выбрать фон плавающего индикатора диктовки.",
+                           "Choose the floating dictation indicator background.")
+            ))
+
+        case .system:
+            content.addArrangedSubview(launchAtLoginRow())
+            content.addArrangedSubview(privacyInfoView())
+        }
+
+        for view in content.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: content.widthAnchor,
+                                        constant: -(content.edgeInsets.left + content.edgeInsets.right)).isActive = true
+        }
+        return content
+    }
+
+    private func localizedSettingsTabTitle(_ tab: SettingsTab) -> String {
+        switch tab {
+        case .dictation: return t("Диктовка", "Dictation")
+        case .text: return t("Текст", "Text")
+        case .audio: return t("Аудио", "Audio")
+        case .appearance: return t("Внешний вид", "Appearance")
+        case .system: return t("Система", "System")
+        }
+    }
+
+    @objc private func selectSettingsTab(_ sender: NSSegmentedControl) {
+        guard let tab = SettingsTab(rawValue: sender.selectedSegment) else { return }
+        selectedSettingsTab = tab
+        settingsWindow?.contentView = makeTabbedSettingsContentView()
     }
 
     private func compactHeaderView() -> NSView {
@@ -1792,23 +1989,35 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
-        let shortcuts = draft.alternateCompletionEnabled
-            ? [draft.dictationHotkey, draft.alternateCompletionHotkey, draft.historyHotkey]
-            : [draft.dictationHotkey, draft.historyHotkey]
-        for firstIndex in shortcuts.indices {
-            for secondIndex in shortcuts.indices where secondIndex > firstIndex {
-                let first = shortcuts[firstIndex]
-                let second = shortcuts[secondIndex]
+        // The dictation/finish pair is intentionally allowed to share a
+        // modifier prefix. For example, the primary shortcut can be bare
+        // Right Command while the finish shortcut is Command + Control,
+        // Option, or Fn: the extra modifier is pressed while recording is
+        // already active, so this is not an ambiguous prefix in the
+        // transition state machine. History still keeps the stricter
+        // prefix-conflict rule.
+        let shortcutPairs: [(HotkeyChoice, HotkeyChoice, Bool)] = {
+            var pairs: [(HotkeyChoice, HotkeyChoice, Bool)] = [
+                (draft.dictationHotkey, draft.historyHotkey, true),
+            ]
+            if draft.alternateCompletionEnabled {
+                pairs.append((draft.dictationHotkey, draft.alternateCompletionHotkey, false))
+                pairs.append((draft.alternateCompletionHotkey, draft.historyHotkey, true))
+            }
+            return pairs
+        }()
+
+        for (first, second, allowModifierPrefix) in shortcutPairs {
                 if hotkeysConflict(first, second) {
                     return t("Сочетания для диктовки, завершения и истории должны отличаться.",
                              "Dictation, finish, and history shortcuts must be different.")
                 }
-                if hotkeyIsModifierPrefix(first, of: second)
-                    || hotkeyIsModifierPrefix(second, of: first) {
+                if allowModifierPrefix == false,
+                   (hotkeyIsModifierPrefix(first, of: second)
+                    || hotkeyIsModifierPrefix(second, of: first)) {
                     return t("Одна активная комбинация не должна быть частью другой.",
                              "One active shortcut cannot be a prefix of another.")
                 }
-            }
         }
         return nil
     }
@@ -2147,7 +2356,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
 
     @objc private func openSettingsClicked(_ sender: NSButton) {
         if let settingsWindow {
-            settingsWindow.contentView = makeSettingsContentView()
+            settingsWindow.contentView = makeTabbedSettingsContentView()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -2156,17 +2365,17 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 560),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 660)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 660)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 560)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 560)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
-        settingsWindow.contentView = makeSettingsContentView()
+        settingsWindow.contentView = makeTabbedSettingsContentView()
         if let mainWindow = window, let visibleFrame = mainWindow.screen?.visibleFrame {
             let mainFrame = mainWindow.frame
             let preferredRight = mainFrame.maxX + 14
@@ -2497,7 +2706,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
 
     private func refreshSettingsWindow() {
         guard let settingsWindow else { return }
-        settingsWindow.contentView = makeSettingsContentView()
+        settingsWindow.contentView = makeTabbedSettingsContentView()
     }
 
     @objc private func grantPermissionClicked(_ sender: NSButton) {
@@ -2528,4 +2737,3 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         alert.runModal()
     }
 }
-

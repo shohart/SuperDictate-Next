@@ -38,7 +38,31 @@ enum LearnCandidateDetector {
         let replacement = newSpan.joined(separator: " ")
         guard source != replacement else { return nil }
 
+        // A pure deletion teaches nothing. Two deletion-only shapes reach
+        // this point with a non-empty newSpan and must be rejected:
+        //  - intra-word trimming: "инглиш" cut back to "глиш" (newSpan is
+        //    a fragment of the old span), and
+        //  - non-contiguous word removal: "очень длинное слово" reduced to
+        //    "длинное" (the surviving word is a subset of the old span).
+        // Without this guard, a user who deletes a word and then pauses to
+        // think (longer than debounce + confirm) gets the half-finished
+        // deletion learned as a "correction" — and a toast for it.
+        // Rule: if the edited span adds no text that wasn't already in the
+        // original span, there is nothing to remember. Case-insensitive so
+        // a casing-only touch-up ("Инглиш" → "инглиш") is not learned
+        // either — it teaches the model no new vocabulary.
+        guard !normalizedSpan(source).contains(normalizedSpan(replacement)) else { return nil }
+
         return LearnCandidate(source: source, replacement: replacement)
+    }
+
+    /// Canonical form used by the deletion check: lowercase, internal
+    /// whitespace collapsed — same normalization family as
+    /// `normalizedTranscriptCorrectionSource`, applied to a joined span.
+    private static func normalizedSpan(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     private static func words(in text: String) -> [String] {
@@ -113,6 +137,69 @@ func testLearnCandidateDetector() throws {
     ) == nil else {
         throw VocabularyLearningTestFailure("pure insertion (no removed span) should not produce a candidate")
     }
+
+    // Intra-word trimming is a deletion in progress, not a correction:
+    // the user cut "инглиш" back to "глиш" and paused before typing the
+    // replacement. Nothing new was typed, so nothing may be learned.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "напиши на инглиш пожалуйста",
+        editedText: "напиши на глиш пожалуйста"
+    ) == nil else {
+        throw VocabularyLearningTestFailure("intra-word trimming (deleted, no replacement typed yet) should not produce a candidate")
+    }
+
+    // Non-contiguous word removal: "очень" and "слово" deleted, middle
+    // word "длинное" survives. Still a deletion — no new text.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "очень длинное слово",
+        editedText: "длинное"
+    ) == nil else {
+        throw VocabularyLearningTestFailure("non-contiguous word deletion should not produce a candidate")
+    }
+
+    // Deleting the whole span down to a leftover fragment of another word
+    // is still deletion-only.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "поправь инглиш тут",
+        editedText: "поправь иш тут"
+    ) == nil else {
+        throw VocabularyLearningTestFailure("partial fragment deletion should not produce a candidate")
+    }
+
+    // A casing-only touch-up is not vocabulary learning either.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "напиши инглиш",
+        editedText: "напиши Инглиш"
+    ) == nil else {
+        throw VocabularyLearningTestFailure("casing-only edit should not produce a candidate")
+    }
+
+    // Sanity: the motivating real correction still works after the
+    // deletion guard.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "напиши на инглиш пожалуйста",
+        editedText: "напиши на English пожалуйста"
+    ) == LearnCandidate(source: "инглиш", replacement: "English") else {
+        throw VocabularyLearningTestFailure("real replacement must still produce a candidate after the deletion guard")
+    }
+
+    // Rebasing after a committed correction must make a later correction in
+    // the same dictated region independently learnable. This mirrors the
+    // watcher's post-commit baseline update: first fix the transliteration,
+    // then fix a second word without losing either correction.
+    let firstCorrection = "напиши на English пожалуйста"
+    guard LearnCandidateDetector.candidate(
+        insertedText: "напиши на инглиш пожалуйста",
+        editedText: firstCorrection
+    ) == LearnCandidate(source: "инглиш", replacement: "English") else {
+        throw VocabularyLearningTestFailure("first correction in a multi-correction region was not detected")
+    }
+    guard LearnCandidateDetector.candidate(
+        insertedText: firstCorrection,
+        editedText: "напиши на English please"
+    ) == LearnCandidate(source: "пожалуйста", replacement: "please") else {
+        throw VocabularyLearningTestFailure("second correction after rebasing was not detected")
+    }
 }
 
 struct VocabularyLearningTestFailure: Error, CustomStringConvertible {
@@ -128,7 +215,7 @@ struct VocabularyLearningTestFailure: Error, CustomStringConvertible {
 @MainActor
 final class PostInsertionEditWatcher {
     static let watchWindowSeconds: TimeInterval = 45
-    static let debounceSeconds: TimeInterval = 0.8
+    static let debounceSeconds: TimeInterval = 0.35
     /// Second-stage "confirm" delay: once a debounce cycle finds a valid
     /// learn candidate, we don't commit it immediately — we wait this much
     /// longer, uninterrupted, before actually saving. Any further edit
@@ -142,7 +229,7 @@ final class PostInsertionEditWatcher {
     /// user actually gets time to review/undo a learned correction, so this
     /// stage only needs to rule out "still mid-correction," not also serve
     /// as review time.
-    static let confirmSeconds: TimeInterval = 1.0
+    static let confirmSeconds: TimeInterval = 0.5
     private static let secureSubroles: Set<String> = ["AXSecureTextField"]
 
     private let store: VocabularyStore
@@ -370,6 +457,29 @@ final class PostInsertionEditWatcher {
         }
     }
 
+    /// Reads the current anchored middle region. Keeping this separate lets
+    /// the watcher rebase after each committed correction instead of ending
+    /// the whole watch after the first one.
+    private func currentInsertedRegion() -> String? {
+        guard let observedElement,
+              let currentValue = stringAttribute(observedElement, kAXValueAttribute as CFString),
+              currentValue.hasPrefix(anchorPrefix),
+              currentValue.hasSuffix(anchorSuffix) else {
+            return nil
+        }
+
+        let currentNSString = currentValue as NSString
+        let prefixLength = (anchorPrefix as NSString).length
+        let suffixLength = (anchorSuffix as NSString).length
+        guard currentNSString.length >= prefixLength + suffixLength else { return nil }
+
+        let middleRange = NSRange(
+            location: prefixLength,
+            length: currentNSString.length - prefixLength - suffixLength
+        )
+        return currentNSString.substring(with: middleRange)
+    }
+
     /// Called only after the confirm-stage timer fires uninterrupted.
     /// Actually persists the candidate found by evaluateEdit() and reports
     /// it, using the observed element's on-screen frame (if resolvable) so
@@ -379,19 +489,36 @@ final class PostInsertionEditWatcher {
             log("PostInsertionEditWatcher: commitPendingCandidate — no pending candidate, nothing to do")
             return
         }
-        // A learn candidate was found: recordLearned returning nil means the
-        // store declined to store it (already known, or the cap was hit) —
-        // not a failure to detect the correction — so either way this
-        // insertion's correction has been captured and there's no need to
-        // keep watching it.
+        // A learn candidate was found. Keep watching this insertion after
+        // the commit and rebase the baseline
+        // to the text that is now in the anchored region, so a later edit to
+        // another word is detected as a fresh correction instead of being
+        // compared against the original full transcript (which would often
+        // produce one oversized diff or no candidate at all).
+        let regionAfterEdit = currentInsertedRegion()
         if let record = store.recordLearned(source: candidate.source, replacement: candidate.replacement) {
             log("PostInsertionEditWatcher: recorded new correction id=\(record.id)")
             let frame = observedElement.flatMap(resolveElementFrame)
             onLearned(record, frame)
         } else {
-            log("PostInsertionEditWatcher: recordLearned declined (already known or cap reached)")
+            // The store declined: already known, cap reached, or an
+            // actual SQLite failure — the store logs the real reason
+            // itself (see VocabularyStore.recordLearned).
+            log("PostInsertionEditWatcher: recordLearned declined (already known, cap reached, or insert failed — see store log)")
         }
-        stopWatching()
+
+        pendingCandidate = nil
+        confirmTask = nil
+        debounceTask?.cancel()
+        debounceTask = nil
+
+        guard let regionAfterEdit, !regionAfterEdit.isEmpty else {
+            log("PostInsertionEditWatcher: committed correction but could not rebase the anchored region; stopping")
+            stopWatching()
+            return
+        }
+        insertedText = regionAfterEdit
+        log("PostInsertionEditWatcher: rebased after correction; continuing to watch for additional edits")
     }
 
     private func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {

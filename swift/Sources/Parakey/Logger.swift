@@ -230,7 +230,20 @@ enum SuperDictateAgentService {
 
     static func restart() throws {
         stop()
-        Thread.sleep(forTimeInterval: 0.35)
+        // Wait for the old agent to actually die before rebinding the
+        // label. The old fixed 0.35s sleep raced a slow teardown
+        // (recording cleanup, unmute, model unload can take longer):
+        // bootstrapping/kickstarting against a still-dying instance —
+        // or skipping the kickstart because isAgentRunning() still saw
+        // the old pid — could leave the label with NO running agent at
+        // all ("service stuck at stopping, model never loads"). Poll
+        // briefly instead; if the old process somehow outlives the
+        // deadline, proceed anyway — it received SIGTERM in stop() and
+        // is on its way out.
+        let deadline = Date().addingTimeInterval(5)
+        while isAgentRunning() && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         try installAndStart()
     }
 

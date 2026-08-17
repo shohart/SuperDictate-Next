@@ -284,7 +284,7 @@ final class VocabularyLearnedToastController {
     /// a deliberate beat rather than a flicker.
     private static let rejectRestyleHoldSeconds: TimeInterval = 0.25
     /// Duration of the "accepted" glow/scale-bump pulse.
-    private static let confirmGlowSeconds: TimeInterval = 0.2
+    private static let confirmGlowSeconds: TimeInterval = 0.35
     /// Hold time for the "confirmed" glow pulse before the normal exit
     /// animation plays. Shorter than rejectRestyleHoldSeconds (this path is
     /// non-interactive/automatic, so it shouldn't make the user wait as
@@ -292,7 +292,7 @@ final class VocabularyLearnedToastController {
     /// actually visible before the fade-out starts covering it — a zero
     /// hold made the glow play almost entirely underneath the simultaneous
     /// fade, effectively invisible.
-    private static let confirmGlowHoldSeconds: TimeInterval = 0.15
+    private static let confirmGlowHoldSeconds: TimeInterval = 0.2
 
     /// `confirmed` distinguishes why the toast is going away: `true` for
     /// the 7s auto-dismiss timer (the correction was accepted/kept — plays
@@ -402,6 +402,13 @@ final class VocabularyLearnedToastController {
                 // layer.
                 let restingBorderColor = layer.borderColor
                 let restingBorderWidth = layer.borderWidth
+
+                let fillPulse = CABasicAnimation(keyPath: "backgroundColor")
+                fillPulse.fromValue = accentColor.withAlphaComponent(0.9).cgColor
+                fillPulse.toValue = layer.backgroundColor
+                fillPulse.duration = Self.confirmGlowSeconds
+                fillPulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(fillPulse, forKey: "toastConfirmFill")
 
                 let borderColorPulse = CABasicAnimation(keyPath: "borderColor")
                 borderColorPulse.fromValue = accentColor.cgColor
@@ -617,6 +624,16 @@ final class VocabularyLearnedToastController {
         // keyEquivalent, so clicking anywhere on the toast — or pressing
         // Escape — still fires onUndo with zero visible button chrome.
         undoButton.isTransparent = true
+        // ...but isTransparent does NOT suppress the AppKit focus ring:
+        // clicking the pill makes this nonactivating panel the key window
+        // and the full-size button its first responder, so a dotted focus
+        // outline would appear around the toast and linger through the
+        // dismiss animations. Kill it at the source: no focus ring, and
+        // never become first responder in the first place (keyEquivalent
+        // matching works via performKeyEquivalent regardless of first
+        // responder status, so the Escape fallback is unaffected).
+        undoButton.focusRingType = .none
+        undoButton.refusesFirstResponder = true
         undoButton.keyEquivalent = "\u{1b}"
         undoButton.translatesAutoresizingMaskIntoConstraints = false
         let action = UndoButtonAction(handler: onUndo)

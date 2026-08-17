@@ -97,6 +97,21 @@ final class VocabularyStore: @unchecked Sendable {
         // give SQLite's own retry-on-lock behavior a real window instead
         // of failing (and being silently swallowed by try?) instantly.
         sqlite3_busy_timeout(handle, 3000)
+        // Same two-process access pattern: WAL mode lets a reader not
+        // block the writer and vice versa, eliminating most of the
+        // SQLITE_BUSY contention above. journal_mode is persistent in
+        // the database file, so this needs to succeed only once for all
+        // future connections. Best-effort: a transient failure (busy,
+        // read-only directory) must not prevent the store from opening
+        // in rollback-journal mode as before.
+        if sqlitePath != ":memory:" {
+            var walError: UnsafeMutablePointer<CChar>?
+            if sqlite3_exec(handle, "PRAGMA journal_mode=WAL;", nil, nil, &walError) != SQLITE_OK {
+                let message = walError.map { String(cString: $0) } ?? "unknown error"
+                log("VocabularyStore: WAL mode not enabled (continuing with rollback journal): \(message)")
+            }
+            if let walError { sqlite3_free(walError) }
+        }
         try queue.sync { try createSchema() }
     }
 
@@ -255,10 +270,23 @@ final class VocabularyStore: @unchecked Sendable {
     /// clobbered by auto-learning.
     func recordLearned(source: String, replacement: String) -> VocabularyRecord? {
         queue.sync {
-            guard let db else { return nil }
+            guard let db else {
+                log("VocabularyStore: recordLearned dropped — database connection is closed")
+                return nil
+            }
             if findRowLocked(db: db, sourceCaseInsensitive: source) != nil { return nil }
             guard countLocked(db: db) < MAX_TRANSCRIPT_CORRECTIONS else { return nil }
-            return try? insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+            do {
+                return try insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+            } catch {
+                // Never mask an actual SQLite failure (busy, disk, ...)
+                // behind "already known / cap reached": a silently
+                // dropped auto-learn is indistinguishable from a real
+                // decline to the caller, so the real reason must be
+                // visible in the log.
+                log("VocabularyStore: recordLearned insert failed for \"\(source)\": \(error)")
+                return nil
+            }
         }
     }
 
