@@ -167,17 +167,32 @@ final class VocabularyLearnedToastController {
             eventsOfInterest: mask,
             callback: { _, type, event, userInfo in
                 guard let userInfo else { return Unmanaged.passUnretained(event) }
-                // tapDisabledByTimeout/tapDisabledByUserInput (and anything
-                // else outside our mask) carry no keycode worth reading —
-                // pass them through untouched.
+                let controller = Unmanaged<VocabularyLearnedToastController>.fromOpaque(userInfo).takeUnretainedValue()
+                // tapDisabledByTimeout/tapDisabledByUserInput mean the OS
+                // disabled the tap itself (e.g. this callback ran too
+                // slowly once) — re-enable it, mirroring HotkeyListener's
+                // own tap (Hotkeys.swift:830-837). Without this, a tap
+                // disabled between a swallowed Escape keyDown and its
+                // matching keyUp never reactivates, so the keyUp reaches
+                // the frontmost app unbalanced — the same keyUp-leak class
+                // fixed elsewhere in this file, via a different path.
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    MainActor.assumeIsolated {
+                        if let escapeTap = controller.escapeTap {
+                            CGEvent.tapEnable(tap: escapeTap, enable: true)
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                // Anything else outside our mask carries no keycode worth
+                // reading — pass it through untouched.
                 guard type == .keyDown || type == .keyUp,
                       CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)) == ESCAPE_KEYCODE
                 else {
                     return Unmanaged.passUnretained(event)
                 }
-                let controller = Unmanaged<VocabularyLearnedToastController>.fromOpaque(userInfo).takeUnretainedValue()
                 let suppress = MainActor.assumeIsolated {
-                    controller.handleEscapeTapEvent(isKeyDown: type == .keyDown)
+                    controller.handleEscapeTapEvent(isKeyDown: type == .keyDown, flags: event.flags)
                 }
                 return suppress ? nil : Unmanaged.passUnretained(event)
             },
@@ -185,7 +200,13 @@ final class VocabularyLearnedToastController {
         ) else {
             // No Input Monitoring permission (or tap creation otherwise
             // failed) — fall back silently to the local NSButton
-            // keyEquivalent, which still works whenever the panel is key.
+            // keyEquivalent. In practice this fallback only fires when the
+            // panel itself is key (the panel is non-activating and shown
+            // via orderFrontRegardless(), so that's rare — mostly after a
+            // click, which already triggers undo directly via the click
+            // handler anyway), so Escape mostly won't reach undo without
+            // the tap; the click-anywhere-on-the-toast affordance still
+            // works regardless.
             log("VocabularyLearnedToastController: escape tap create failed — falling back to local keyEquivalent")
             return
         }
@@ -197,8 +218,10 @@ final class VocabularyLearnedToastController {
     }
 
     /// Returns whether the event should be swallowed (return nil from the
-    /// tap callback). Mirrors HotkeyTransitionState.transitionEscape's
-    /// suppressEscapeKeyUp handling in Hotkeys.swift exactly: arm the flag
+    /// tap callback). Mirrors the shape of
+    /// HotkeyTransitionState.transitionEscape's suppressEscapeKeyUp
+    /// handling in Hotkeys.swift (not an exact match — that function also
+    /// handles autorepeat, this one doesn't): arm the flag
     /// on keyDown and only clear it when the matching keyUp itself is
     /// swallowed — never as a side effect of anything else (in particular,
     /// dismiss(confirmed:)'s teardown must not clear it before the keyUp
@@ -215,8 +238,15 @@ final class VocabularyLearnedToastController {
     /// still gets to see and handle it, and don't arm/clear our own
     /// suppression state for it at all (that keyDown/keyUp pair is
     /// HotkeyListener's to manage, not ours).
-    private func handleEscapeTapEvent(isKeyDown: Bool) -> Bool {
+    private func handleEscapeTapEvent(isKeyDown: Bool, flags: CGEventFlags) -> Bool {
         if isKeyDown {
+            // Modified Escape (e.g. Cmd+Opt+Escape / Force Quit) is a
+            // different gesture entirely, not "undo the correction" — only
+            // bare Escape should be swallowed. Without this check, Force
+            // Quit (and any other modified-Escape combo) would get eaten by
+            // this tap for up to 7 seconds after every auto-learned
+            // correction.
+            guard flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty else { return false }
             guard isRecordingActive?() != true, pendingUndo != nil else { return false }
             suppressEscapeKeyUp = true
             pendingUndo?()
@@ -253,10 +283,16 @@ final class VocabularyLearnedToastController {
     /// arrow) before the normal exit animation plays, long enough to read as
     /// a deliberate beat rather than a flicker.
     private static let rejectRestyleHoldSeconds: TimeInterval = 0.25
-    /// Duration of the "accepted" glow/scale-bump pulse, timed to overlap
-    /// just the start of the exit animation rather than delay it — this
-    /// path is non-interactive, so it shouldn't make the user wait.
+    /// Duration of the "accepted" glow/scale-bump pulse.
     private static let confirmGlowSeconds: TimeInterval = 0.2
+    /// Hold time for the "confirmed" glow pulse before the normal exit
+    /// animation plays. Shorter than rejectRestyleHoldSeconds (this path is
+    /// non-interactive/automatic, so it shouldn't make the user wait as
+    /// long as the reject path does) but long enough that the glow is
+    /// actually visible before the fade-out starts covering it — a zero
+    /// hold made the glow play almost entirely underneath the simultaneous
+    /// fade, effectively invisible.
+    private static let confirmGlowHoldSeconds: TimeInterval = 0.15
 
     /// `confirmed` distinguishes why the toast is going away: `true` for
     /// the 7s auto-dismiss timer (the correction was accepted/kept — plays
@@ -399,7 +435,13 @@ final class VocabularyLearnedToastController {
                 bump.isAdditive = true
                 layer.add(bump, forKey: "toastConfirmScaleBump")
             }
-            playExitAnimation()
+            // Hold briefly so the glow pulse actually reads before the
+            // fade-out starts covering it — mirrors the reject path's own
+            // hold-before-fade structure just below, with a shorter delay.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(Self.confirmGlowHoldSeconds * 1_000_000_000))
+                playExitAnimation()
+            }
         } else {
             // Rejected: strike through the whole label, dim both words, and
             // recolor the arrow away from accentColor to a neutral gray —
@@ -424,7 +466,17 @@ final class VocabularyLearnedToastController {
                 // what accentColor/textColor resolve to.
                 attributed.addAttribute(.foregroundColor, value: textColor.withAlphaComponent(textColor.alphaComponent * 0.4), range: fullRange)
                 if let arrowRange {
-                    attributed.addAttribute(.foregroundColor, value: NSColor.systemGray, range: arrowRange)
+                    // A fixed gray, not NSColor.systemGray: this file's
+                    // convention (see textColor above) is to avoid
+                    // system-appearance-dynamic colors, since the toast's
+                    // light/dark background is forced independently of
+                    // system appearance and a dynamic color can mismatch
+                    // it. Dimmed by the same ~0.4 factor as fullRange above
+                    // so the arrow reads as muted along with the rest of
+                    // the label, instead of standing out at full alpha in a
+                    // state whose entire point is "this looks rejected."
+                    let dimmedArrowGray = NSColor(calibratedWhite: 0.5, alpha: textColor.alphaComponent * 0.4)
+                    attributed.addAttribute(.foregroundColor, value: dimmedArrowGray, range: arrowRange)
                 }
                 label.attributedStringValue = attributed
             }
