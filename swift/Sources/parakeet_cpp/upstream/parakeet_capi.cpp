@@ -32,7 +32,10 @@
 //     Added stream_drain_events / free_events (typed per-event records) and
 //     the "events" array in the stream_feed_json / stream_finalize_json
 //     documents.
-#define PARAKEET_CAPI_ABI_VERSION 5
+// v6: transcribe_pcm_logits, exposing the CTC head's log-prob matrix (row-major
+//     [T, vocab+1], already log-softmaxed) instead of decoded text, freed with
+//     the new free_logits. Original entry points unchanged.
+#define PARAKEET_CAPI_ABI_VERSION 6
 
 // The opaque context: a loaded model plus a buffer for the last error message.
 struct parakeet_ctx {
@@ -203,6 +206,48 @@ extern "C" char* parakeet_capi_transcribe_pcm(parakeet_ctx* ctx, const float* sa
     // Delegate with the model default language.
     return parakeet_capi_transcribe_pcm_lang(ctx, samples, n_samples, sample_rate,
                                              decoder, nullptr);
+}
+
+extern "C" int parakeet_capi_transcribe_pcm_logits(parakeet_ctx* ctx,
+                                                    const float* samples, int n_samples,
+                                                    int sample_rate, float** out_logits,
+                                                    int* out_T, int* out_vocab_plus_1) {
+    if (!ctx) return 1;
+    if (!out_logits || !out_T || !out_vocab_plus_1) {
+        ctx->last_error = "invalid output pointer(s)";
+        return 1;
+    }
+    *out_logits = nullptr;
+    *out_T = 0;
+    *out_vocab_plus_1 = 0;
+    if (!ctx->model) { ctx->last_error = "context has no loaded model"; return 1; }
+    if (!samples || n_samples < 0) { ctx->last_error = "invalid samples buffer"; return 1; }
+    try {
+        std::vector<float> pcm(samples, samples + n_samples);
+        std::vector<float> logits;
+        int T = 0, vocab_plus_1 = 0;
+        ctx->model->transcribe_pcm_ctc_logits(pcm, sample_rate, logits, T, vocab_plus_1);
+
+        float* buf = static_cast<float*>(std::malloc(logits.size() * sizeof(float)));
+        if (!buf) { ctx->last_error = "out of memory"; return 1; }
+        std::memcpy(buf, logits.data(), logits.size() * sizeof(float));
+
+        ctx->last_error.clear();
+        *out_logits = buf;
+        *out_T = T;
+        *out_vocab_plus_1 = vocab_plus_1;
+        return 0;
+    } catch (const std::exception& e) {
+        ctx->last_error = e.what();
+        return 1;
+    } catch (...) {
+        ctx->last_error = "unknown error";
+        return 1;
+    }
+}
+
+extern "C" void parakeet_capi_free_logits(float* logits) {
+    std::free(logits);
 }
 
 extern "C" int parakeet_capi_transcribe_pcm_batch_lang(parakeet_ctx* ctx,

@@ -3693,6 +3693,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                      const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
                      int64_t ldc, int Atype, int Btype, int Ctype) {
 
+    if (m < 0 || n < 0 || k < 0 || lda < k || ldb < k || ldc < m) {
+        return false;
+    }
+
     assert(m >= 0);
     assert(n >= 0);
     assert(k >= 0);

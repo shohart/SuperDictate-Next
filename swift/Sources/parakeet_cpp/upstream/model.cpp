@@ -183,6 +183,57 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                           encoded.d_model, encoded.frames, use_tdt);
 }
 
+void Model::transcribe_16k_ctc_logits(const std::vector<float>& pcm16k,
+                                      std::vector<float>& logits, int& T,
+                                      int& vocab_plus_1,
+                                      const std::string& target_lang) const {
+    const ParakeetConfig& cfg = loader_.config();
+    const int prompt_index = resolve_prompt_index(target_lang);
+
+    // 1. Log-mel front end -> feats [n_mels, T]. Mirrors transcribe_16k exactly.
+    std::vector<float> feats;
+    int n_mels = 0, Tmel = 0;
+    if (std::string(pk::global_backend().device_name()) != "cpu") {
+        GpuMel gmel(loader_);
+        gmel.compute(pcm16k, feats, n_mels, Tmel);
+    } else {
+        MelFrontend mel(loader_);
+        mel.compute(pcm16k, feats, n_mels, Tmel);
+    }
+
+    // 2. FastConformer encoder -> enc_out [d_model, Tout] (channels-first).
+    //    Long audio: tile the subsampling stage exactly as transcribe_16k does.
+    Encoder encoder(loader_);
+    std::vector<float> enc_out;
+    int d_model = 0, Tout = 0;
+    const int sub_tile = subsampling_tile_for(cfg, loader_, Tmel);
+    if (sub_tile > 0) {
+        MelBatch mb1;
+        mb1.B = 1; mb1.n_mels = n_mels; mb1.T_max = Tmel; mb1.valid_T = { Tmel };
+        mb1.data = feats;
+        std::vector<std::vector<float>> eo; std::vector<int> vT;
+        int dm1 = 0, To1 = 0;
+        encoder.forward_batch_tiled(mb1, eo, dm1, To1, vT, sub_tile);
+        enc_out = std::move(eo[0]);
+        d_model = dm1;
+        Tout = vT[0];
+    } else {
+        encoder.forward(feats, n_mels, Tmel, enc_out, d_model, Tout);
+    }
+
+    // 2b. Prompt conditioning (multilingual nemotron): project the encoder
+    //     output with the selected language one-hot before decoding. No-op
+    //     for other models (prompt.present == false).
+    maybe_apply_prompt(loader_, enc_out, d_model, Tout, prompt_index);
+
+    // 3. CTC head only — always, regardless of the model's preferred decoder.
+    //    Throws std::runtime_error (from ctc_head_tensor, via CTCDecoder::forward)
+    //    if the model has no CTC head, e.g. a TDT/RNNT-only streaming model.
+    CTCDecoder ctc(loader_);
+    ctc.forward(enc_out, d_model, Tout, logits, vocab_plus_1);
+    T = Tout;
+}
+
 // Max mel frames per encoder pass before the first subsampling conv output
 // (n_mels/2 * T/2 * conv_channels) approaches INT_MAX. ggml's CUDA unary (relu)
 // kernel indexes elements with int32, so a tensor > 2^31 elements crashes
@@ -553,6 +604,21 @@ std::string Model::transcribe_pcm(const std::vector<float>& pcm, int sample_rate
     }
     std::vector<float> pcm16k = resample_linear(pcm, sample_rate, 16000);
     return transcribe_16k(pcm16k, decoder, target_lang);
+}
+
+void Model::transcribe_pcm_ctc_logits(const std::vector<float>& pcm, int sample_rate,
+                                      std::vector<float>& logits, int& T,
+                                      int& vocab_plus_1,
+                                      const std::string& target_lang) const {
+    if (sample_rate <= 0) {
+        throw std::runtime_error("parakeet: invalid sample_rate");
+    }
+    if (sample_rate == 16000) {
+        transcribe_16k_ctc_logits(pcm, logits, T, vocab_plus_1, target_lang);
+        return;
+    }
+    std::vector<float> pcm16k = resample_linear(pcm, sample_rate, 16000);
+    transcribe_16k_ctc_logits(pcm16k, logits, T, vocab_plus_1, target_lang);
 }
 
 std::string Model::transcribe_path(const std::string& wav_path,

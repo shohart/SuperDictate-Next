@@ -70,6 +70,19 @@ public:
         Decoder decoder = Decoder::kDefault,
         const std::string& target_lang = "") const;
 
+    // Run mel + encoder + CTC head only, returning the log-prob matrix
+    // (row-major [T, vocab+1], already log-softmaxed) instead of decoded text —
+    // the seam external decoder stacks (e.g. pyctcdecode + KenLM) need. If
+    // `sample_rate != 16000` the audio is linearly resampled to 16 kHz first.
+    // `target_lang` as in transcribe_pcm (ignored by non-prompt models). Always
+    // runs the CTC head regardless of the model's preferred decoder; throws
+    // std::runtime_error if the model has no CTC head (e.g. a TDT/RNNT-only
+    // streaming model).
+    void transcribe_pcm_ctc_logits(const std::vector<float>& pcm, int sample_rate,
+                                   std::vector<float>& logits, int& T,
+                                   int& vocab_plus_1,
+                                   const std::string& target_lang = "") const;
+
     // Transcribe raw mono float PCM, returning the flat text plus per-word and
     // per-token timestamps + confidence (matching NeMo timestamps=True +
     // 'max_prob' confidence). If `sample_rate != 16000` the audio is linearly
@@ -140,6 +153,14 @@ private:
     std::vector<NBestTranscription> transcribe_16k_nbest(
         const std::vector<float>& pcm16k, int beam_size, int nbest,
         bool score_norm, const std::string& target_lang) const;
+
+    // Core orchestration for transcribe_pcm_ctc_logits: 16 kHz mono PCM -> CTC
+    // log-prob matrix. Mirrors transcribe_16k through the encoder, then runs
+    // the CTC head directly instead of decode_enc_out.
+    void transcribe_16k_ctc_logits(const std::vector<float>& pcm16k,
+                                   std::vector<float>& logits, int& T,
+                                   int& vocab_plus_1,
+                                   const std::string& target_lang = "") const;
 
     ModelLoader loader_;
 };
