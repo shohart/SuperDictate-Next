@@ -3,7 +3,7 @@
 Do not hand-edit anything under this directory — re-run the vendor script.
 
 - parakeet.cpp: https://github.com/mudler/parakeet.cpp
-  commit: e747acdaee69b916cef62263ae5f718bda9ff3f3
+  commit: 1bfbebfaaf493866f49597cd3b7901959d395c60
 - ggml (parakeet.cpp's own pinned submodule, third_party/ggml):
   commit: e705c5fed490514458bdd2eaddc43bd098fcce9b (v0.13.0)
 - Vendored: CPU backend (Accelerate/BLAS on macOS) plus the Vulkan backend
@@ -16,4 +16,4 @@ Do not hand-edit anything under this directory — re-run the vendor script.
 - License: both parakeet.cpp and ggml are MIT-licensed. See
   LICENSE-parakeet-cpp.txt and LICENSE-ggml.txt in this directory for the
   exact upstream notices at the pinned commits above.
-- Vendored on: 2026-07-28T15:26:07Z
+- Vendored on: 2026-08-18T07:43:50Z

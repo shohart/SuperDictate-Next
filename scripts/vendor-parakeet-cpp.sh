@@ -68,7 +68,7 @@
 # already-committed shader corpus.
 set -euo pipefail
 
-PARAKEET_CPP_COMMIT="e747acdaee69b916cef62263ae5f718bda9ff3f3"
+PARAKEET_CPP_COMMIT="1bfbebfaaf493866f49597cd3b7901959d395c60"
 PARAKEET_CPP_REMOTE="https://github.com/mudler/parakeet.cpp.git"
 # Expected pinned ggml submodule revision/tag, verified after checkout below.
 # Do not override independently of PARAKEET_CPP_COMMIT — this is whatever

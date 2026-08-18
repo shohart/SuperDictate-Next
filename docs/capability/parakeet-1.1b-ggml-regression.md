@@ -12,9 +12,10 @@ path, model revision, or model default will be changed here. The 1.1B research
 below is retained only as background and will not be implemented in this
 branch.
 
-This branch updates and tests only parakeet.cpp, its vendored ggml submodule,
-the extracted Silero VAD source, and the Vulkan headers/loader, MoltenVK
-compatibility, and SPIR-V shader generation.
+This branch updates and tests only parakeet.cpp together with the exact ggml
+submodule revision selected by the parakeet.cpp maintainer. We will not merge
+an unrelated newer ggml into parakeet.cpp manually. Silero VAD and the Vulkan
+toolchain are deferred until this runtime pair has been validated.
 
 Each component update must remain independently bisectable.
 
@@ -33,7 +34,7 @@ keep the current 0.6B v3 model fixed.
 
 | Component | Current pin | Notes |
 | --- | --- | --- |
-| parakeet.cpp | `e747acdaee69b916cef62263ae5f718bda9ff3f3` | 28 Jul 2026 |
+| parakeet.cpp | `1bfbebfaaf493866f49597cd3b7901959d395c60` | current upstream v0.5.0 commit |
 | parakeet.cpp ggml submodule | `e705c5fed490514458bdd2eaddc43bd098fcce9b` / v0.13.0 | vendored exactly |
 | current model | `tdt-0.6b-v3-q8_0.gguf` | 940.7 MB, SHA pinned in `ModelDownload.swift` |
 | Silero VAD source | whisper.cpp `4523d0ce373ee4b2176b3251fff29fd4864fcf38` | extracted VAD tree |
@@ -96,10 +97,11 @@ justify a blind re-vendor.
 
 ### ggml
 
-The project pins ggml v0.13.0 while upstream has released v0.20.1. This is a
-large compatibility jump, not a routine patch update. It may improve backend
-kernels, allocator behavior, Vulkan support, and CPU operations, but it can
-also invalidate:
+Upstream ggml has released v0.20.1, while the current parakeet.cpp maintainer
+pin remains ggml v0.13.0. We will follow the maintainer's tested submodule
+pair rather than manually mixing ggml v0.20.1 into parakeet.cpp. A future
+parakeet.cpp release that moves its own submodule can be evaluated as a single
+unit. Manually mixing a newer ggml could invalidate:
 
 - the C++ bridge assumptions;
 - backend registry/device lifecycle code;
@@ -107,8 +109,7 @@ also invalidate:
 - generated SPIR-V shader compatibility;
 - Intel compiler flags and Accelerate/BLAS integration.
 
-The ggml update must be tested independently before combining it with a model
-change.
+No independent ggml update is planned in this branch.
 
 ### MoltenVK and Vulkan toolchain
 
@@ -184,23 +185,21 @@ quality decision for this Russian/English application.
 Freeze the current production binary/model and record all metrics above for
 0.6B v3 Q8_0 on CPU and Vulkan.
 
-### Stage 2 — parakeet.cpp and ggml upgrade
+### Stage 2 — parakeet.cpp with maintainer-selected ggml
 
-Move the vendored parakeet.cpp and ggml pins to selected current upstream
-commits while keeping the 0.6B v3 model unchanged. Re-run all C++ bridge and
-Vulkan tests before touching another component. Keep the old pin available for
-immediate bisect/revert.
+Move parakeet.cpp to the selected upstream commit and regenerate its vendored
+tree and shaders. Keep the exact ggml submodule revision pinned by that
+parakeet.cpp commit. Keep the old pair available for immediate bisect/revert.
 
-### Stage 3 — VAD source update
+### Stage 3 — deferred VAD/toolchain follow-up
 
-Re-vendor current Silero VAD source from whisper.cpp without changing the
-pinned `ggml-silero-v6.2.0.bin` model. Validate the extracted API, VAD real
-fixture, and long-audio segmentation.
+VAD source and Vulkan toolchain updates are intentionally deferred until the
+parakeet.cpp/ggml pair passes all regression tests.
 
-### Stage 4 — Vulkan toolchain update
+### Stage 4 — deferred Vulkan/VAD follow-up
 
-Update Homebrew Vulkan headers/loader, rebuild the shader corpus, and compare
-Vulkan stability/performance independently of model and ggml changes.
+Only after the runtime pair is accepted, evaluate Homebrew Vulkan
+headers/loader and VAD source in separate follow-up commits.
 
 ### Stage 5 — decision
 
