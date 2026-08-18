@@ -1,8 +1,22 @@
-# Parakeet 1.1B / ggml capability-regression plan
+# ggml / parakeet.cpp capability-regression plan
 
-**Status:** research only — no production code changes
+**Status:** experimental branch — no production code changes
 
 **Date:** 2026-08-18
+
+## Scope lock
+
+The model is explicitly **out of scope** for this track. Production remains on
+the existing multilingual `tdt-0.6b-v3-q8_0.gguf`; no model download, model
+path, model revision, or model default will be changed here. The 1.1B research
+below is retained only as background and will not be implemented in this
+branch.
+
+This branch updates and tests only parakeet.cpp, its vendored ggml submodule,
+the extracted Silero VAD source, and the Vulkan headers/loader, MoltenVK
+compatibility, and SPIR-V shader generation.
+
+Each component update must remain independently bisectable.
 
 ## Executive summary
 
@@ -12,8 +26,8 @@ drop-in quality upgrade: the published GGUF catalogue presents the 1.1B TDT
 family separately from the multilingual v3 checkpoint. A larger English model
 can be worse than the current 0.6B v3 model on Russian speech.
 
-The experiment must therefore measure Russian and English dictation quality,
-not infer quality from parameter count or the catalogue's single WER fixture.
+The 1.1B model is not being adopted. All runtime comparisons in this branch
+keep the current 0.6B v3 model fixed.
 
 ## Current pins
 
@@ -101,15 +115,14 @@ change.
 Recent MoltenVK upstream work includes fixes for `memoryTypeBits` on input
 attachments and support for newer Vulkan extensions. Homebrew currently has
 newer Vulkan headers/loader than installed on this Mac. This is a useful
-separate capability experiment, but should not be mixed with the ggml/model
-upgrade in the first run.
+separate capability experiment, but should not be mixed with the ggml or VAD
+update in the first run.
 
 ### Silero VAD
 
 The VAD model bytes are still current and match the pinned SHA. The source
-extraction is behind current whisper.cpp by many commits, but re-vendoring it
-would also pull in ggml/API drift. It should remain unchanged during the first
-1.1B experiment.
+extraction is behind current whisper.cpp by many commits; it may be updated in
+its own commit, but the VAD model itself must remain unchanged.
 
 ## Regression matrix
 
@@ -171,52 +184,39 @@ quality decision for this Russian/English application.
 Freeze the current production binary/model and record all metrics above for
 0.6B v3 Q8_0 on CPU and Vulkan.
 
-### Stage 2 — model-only experiment
+### Stage 2 — parakeet.cpp and ggml upgrade
 
-Keep the current pinned parakeet.cpp and ggml. Add an opt-in model path/profile
-for 1.1B Q8_0 only. Do not change the production default. Verify that the
-existing bridge can load the model and that the actual backend remains Vulkan.
+Move the vendored parakeet.cpp and ggml pins to selected current upstream
+commits while keeping the 0.6B v3 model unchanged. Re-run all C++ bridge and
+Vulkan tests before touching another component. Keep the old pin available for
+immediate bisect/revert.
 
-### Stage 3 — quantization comparison
+### Stage 3 — VAD source update
 
-If Q8_0 is promising, compare 1.1B Q6_K and F16. Stop if Russian quality does
-not improve enough to justify the memory/latency cost.
+Re-vendor current Silero VAD source from whisper.cpp without changing the
+pinned `ggml-silero-v6.2.0.bin` model. Validate the extracted API, VAD real
+fixture, and long-audio segmentation.
 
-### Stage 4 — ggml upgrade
-
-In a separate experiment commit, move the vendored ggml to a current stable
-release. Re-run all C++ bridge and Vulkan tests before combining with the 1.1B
-model. Keep the old pin available for immediate bisect/revert.
-
-### Stage 5 — Vulkan toolchain update
+### Stage 4 — Vulkan toolchain update
 
 Update Homebrew Vulkan headers/loader, rebuild the shader corpus, and compare
 Vulkan stability/performance independently of model and ggml changes.
 
-### Stage 6 — decision
+### Stage 5 — decision
 
 Promote a candidate only if all of the following hold:
 
-- Russian quality is no worse than current production and improves the target
-  correction cases;
-- English quality is no worse;
+- Current 0.6B v3 quality and post-processing remain unchanged;
 - no Vulkan fallback/reload regression;
 - peak memory and latency fit the interactive dictation budget;
 - long-audio and insertion tests pass;
 - the model can be downloaded and verified by an immutable SHA-256 pin.
 
-## Preliminary recommendation
+## Runtime-only recommendation
 
-Start with a model-only 1.1B Q8_0 capability build. Do **not** update ggml and
-parakeet.cpp in the same first commit. The likely outcomes are:
-
-1. 1.1B improves difficult English/proper-noun recognition but gives no Russian
-   benefit — keep 0.6B v3 as production and consider a language-aware model
-   selector later.
-2. 1.1B improves both languages within an acceptable latency budget — proceed
-   to ggml/Vulkan experiments.
-3. 1.1B is too slow or memory-heavy — test 0.6B v3 F16/Q6_K instead; the
-   catalogue reports the same fixture WER but different runtime tradeoffs.
+Start with the parakeet.cpp/ggml pin update only. Then update the VAD source,
+then the Vulkan toolchain. Do not combine all three updates in one commit. The
+current 0.6B v3 model remains the fixed regression oracle throughout.
 
 ## Sources
 
