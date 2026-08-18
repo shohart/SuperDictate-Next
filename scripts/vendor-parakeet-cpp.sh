@@ -316,6 +316,26 @@ vendor_vulkan_backend() {
 }
 vendor_vulkan_backend
 
+# The optional tinyBLAS fast path must decline unsupported matrix layouts
+# instead of asserting; Silero VAD can produce a valid generic ggml matmul
+# with ldb < k on the Intel CPU path. Keep this deterministic compatibility
+# patch next to the vendor step so a re-vendor does not resurrect the crash.
+python3 - "$UPSTREAM_DEST/ggml-cpu/llamafile/sgemm.cpp" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+needle = "    assert(m >= 0);\n"
+replacement = ("    if (m < 0 || n < 0 || k < 0 || lda < k || ldb < k || ldc < m) {\n"
+               "        return false;\n"
+               "    }\n\n"
+               "    assert(m >= 0);\n")
+if needle not in text:
+    raise SystemExit("vendor-parakeet-cpp.sh: tinyBLAS assert location not found")
+path.write_text(text.replace(needle, replacement, 1))
+PY
+
 upstream_file_count=$(find "$UPSTREAM_DEST" -type f | wc -l | tr -d ' ')
 upstream_size=$(du -sh "$UPSTREAM_DEST" | cut -f1)
 echo "vendor-parakeet-cpp.sh: vendored $upstream_file_count files ($upstream_size) into $UPSTREAM_DEST"

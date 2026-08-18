@@ -105,6 +105,22 @@ backend. The updated pair therefore shows no observed functional regression
 and a small performance improvement, but the gain is not large enough to
 justify changing the model or making broader ggml changes on its own.
 
+## VAD compatibility fix
+
+The real Silero VAD test exposed an Intel/Accelerate edge case in the pinned
+ggml tinyBLAS fast path: an otherwise valid generic matmul shape could reach
+`llamafile_sgemm` with `ldb < k`, causing an assertion instead of falling back
+to the normal CPU kernel. The fix makes that optional fast path return `false`
+for unsupported layouts and keeps Silero VAD on the CPU scheduler rather than
+registering the ACCEL/BLAS backend for this small segmentation graph.
+
+The pinned `ggml-silero-v6.2.0.bin` model is unchanged. After the fix:
+
+- `silero-vad-real`: PASS;
+- `vad-boundary-oracle-real`: PASS;
+- full self-test: PASS;
+- Parakeet Vulkan integration: PASS.
+
 ### parakeet.cpp
 
 The pinned commit is behind the current `v0.5.0` release by two commits:

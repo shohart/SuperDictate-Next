@@ -16,4 +16,4 @@ Do not hand-edit anything under this directory — re-run the vendor script.
 - License: both parakeet.cpp and ggml are MIT-licensed. See
   LICENSE-parakeet-cpp.txt and LICENSE-ggml.txt in this directory for the
   exact upstream notices at the pinned commits above.
-- Vendored on: 2026-08-18T07:43:50Z
+- Vendored on: 2026-08-18T16:59:35Z

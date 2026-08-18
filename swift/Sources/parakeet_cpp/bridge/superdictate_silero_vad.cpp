@@ -44,55 +44,15 @@ namespace {
 // once at sd_silero_vad_create time; it is not on any per-utterance hot
 // path.
 //
-// Returns 0 if the probe fails to find a transition within the bound
-// (should not happen for any real Silero VAD model; window sizes are on
-// the order of hundreds of samples, far under the cap below) — callers
-// treat 0 as "unknown", not a hard error, since out_window_size_samples is
-// documented as best-effort diagnostic/convenience metadata, not something
-// whose absence should block a real probabilities call.
+// The pinned Silero v6.2.0 model uses a 512-sample inference window at 16 kHz.
+// Do not discover this by running synthetic inference during context creation:
+// both sub-frame and exactly-one-frame probes can reach an invalid SGEMM shape
+// (ldb < k) in the Accelerate/BLAS path. The window is diagnostic metadata,
+// not a runtime capability that needs probing, so return the model contract
+// directly and keep all real inference in the normal probabilities path.
 uint64_t probeWindowSizeSamples(whisper_vad_context *native) {
-    constexpr int kCap = 1 << 20; // ~64s at 16kHz; far above any real window size.
-
-    auto probsAt = [&](int n) -> int {
-        std::vector<float> buf(static_cast<size_t>(n), 0.0f);
-        if (!whisper_vad_detect_speech(native, buf.data(), n)) {
-            return -1;
-        }
-        return whisper_vad_n_probs(native);
-    };
-
-    // n_samples == 1 must yield exactly 1 chunk for any n_window >= 1.
-    if (probsAt(1) != 1) {
-        return 0;
-    }
-
-    // Doubling search for an upper bound where n_probs >= 2.
-    int lo = 1;   // known: probsAt(lo) == 1
-    int hi = 2;
-    while (hi < kCap) {
-        int p = probsAt(hi);
-        if (p < 0) return 0;
-        if (p >= 2) break;
-        lo = hi;
-        hi *= 2;
-    }
-    if (hi >= kCap) {
-        return 0;
-    }
-
-    // Binary search the exact boundary: largest n with n_probs(n) == 1.
-    while (hi - lo > 1) {
-        int mid = lo + (hi - lo) / 2;
-        int p = probsAt(mid);
-        if (p < 0) return 0;
-        if (p == 1) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    // lo is the largest n_samples with exactly 1 chunk, i.e. lo == n_window.
-    return static_cast<uint64_t>(lo);
+    (void)native;
+    return 512;
 }
 
 } // namespace
