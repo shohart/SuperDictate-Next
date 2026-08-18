@@ -8,6 +8,29 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## v0.5.3 — 2026-08-18
+
+### Changed
+
+- Updated vendored `parakeet.cpp` to the maintainer's current v0.5.0 commit
+  while retaining its exact pinned ggml v0.13.0 submodule.
+- Updated Vulkan headers and loader on the Intel capability Mac to 1.4.357.0
+  and regenerated the bundled SPIR-V shader corpus.
+
+### Fixed
+
+- Preserved Silero VAD and fixed an Intel tinyBLAS assertion on valid VAD
+  matrix layouts by allowing the optional fast path to fall back to the normal
+  CPU kernel.
+- Removed unsafe VAD startup probing that could execute a problematic tiny
+  internal frame before the real segmentation call.
+
+### Validation
+
+- CPU and Vulkan Parakeet integration pass on AMD RX 6600.
+- `silero-vad-real`, `vad-boundary-oracle-real`, and the full self-test pass.
+- The existing multilingual `tdt-0.6b-v3-q8_0.gguf` model is unchanged.
+
 
 ## v0.5.2 — 2026-08-17
 
