@@ -82,6 +82,29 @@ using roughly 55–62% more resident memory and being about 1.5× slower on CPU.
 
 ## What upstream changed
 
+## Production release comparison
+
+The production v0.5.2 release binary and the capability release binary were
+run against the same eight-clip synthetic RU/EN/mixed corpus, with three
+repeats per clip, the same `tdt-0.6b-v3-q8_0.gguf` model, and eight threads.
+The production binary was `/Applications/SuperDictate.app`; the capability
+binary was built in release mode from this branch.
+
+| Metric | Production v0.5.2 | Capability branch | Result |
+| --- | ---: | ---: | --- |
+| CPU median RTF | 0.1411 | 0.1339 | ~5% faster |
+| Vulkan median RTF | 0.0941 | 0.0905 | ~5% faster |
+| CPU median load | 0.692 s | 0.565 s | faster |
+| Vulkan median load | 1.281 s | 1.150 s | faster |
+| CPU median warm-up | 0.114 s | 0.102 s | comparable/faster |
+| Vulkan median warm-up | 0.219 s | 0.228 s | comparable |
+
+All 16 corresponding transcripts (8 clips × CPU/Vulkan) were identical. Peak
+RSS stayed effectively unchanged: roughly 0.95–1.43 GB depending on clip and
+backend. The updated pair therefore shows no observed functional regression
+and a small performance improvement, but the gain is not large enough to
+justify changing the model or making broader ggml changes on its own.
+
 ### parakeet.cpp
 
 The pinned commit is behind the current `v0.5.0` release by two commits:
