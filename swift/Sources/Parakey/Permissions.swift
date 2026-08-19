@@ -486,3 +486,30 @@ final class Permissions {
     }
 }
 
+    /// Revoke every macOS permission the app holds via `tccutil reset`.
+    /// Only ever called from an explicit user action (the Reset button in
+    /// the permissions card) — never automatically.
+    static func resetAll() {
+        let services: [Permission: String] = [
+            .microphone: "Microphone",
+            .accessibility: "Accessibility",
+            .inputMonitoring: "ListenEvent",
+        ]
+        for permission in Permission.allCases {
+            guard let service = services[permission] else { continue }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            process.arguments = ["reset", service, SETTINGS_SUITE]
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus != 0 {
+                    log("Permissions.resetAll: tccutil reset \(service) exited \(process.terminationStatus)")
+                }
+            } catch {
+                log("Permissions.resetAll: tccutil reset \(service) failed: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
