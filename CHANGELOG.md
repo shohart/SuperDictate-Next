@@ -8,6 +8,24 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## v0.5.4 — 2026-08-19
+
+### Changed
+
+- Full UI rebrand: every user-visible panel, dialog, tooltip, and document
+  type now says "SuperDictate Next" (menu bar, control panel, settings,
+  shortcut recorder, update window, permission prompts).
+- New app icon: same microphone concept, now on a modern vivid
+  indigo-violet-pink gradient with a soft sheen and sound-wave arcs.
+  Regenerated deterministically via `icon/generate-appicon.swift`.
+
+### Documentation
+
+- README (EN/RU) now documents Silero VAD pause detection, automatic
+  vocabulary learning, the tabbed Settings window, and re-recordable
+  modifier-chord shortcuts.
+
+
 ## v0.5.3 — 2026-08-18
 
 ### Changed

@@ -734,7 +734,7 @@ final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, NSWindow
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
-        window.title = t("Обновление SuperDictate", "Updating SuperDictate")
+        window.title = t("Обновление SuperDictate Next", "Updating SuperDictate Next")
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -744,13 +744,13 @@ final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, NSWindow
         root.spacing = 12
         root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
-        let title = updateProgressLabel(t("Обновление SuperDictate до v\(launch.targetVersion)",
-                                          "Updating SuperDictate to v\(launch.targetVersion)"),
+        let title = updateProgressLabel(t("Обновление SuperDictate Next до v\(launch.targetVersion)",
+                                          "Updating SuperDictate Next to v\(launch.targetVersion)"),
                                         font: .systemFont(ofSize: 18, weight: .semibold))
         messageLabel = updateProgressLabel(t("Запускаю обновление…", "Starting update…"),
                                            font: .systemFont(ofSize: 13, weight: .medium))
-        detailLabel = updateProgressLabel(t("SuperDictate автоматически откроется после установки.",
-                                             "SuperDictate will reopen automatically when the update finishes."),
+        detailLabel = updateProgressLabel(t("SuperDictate Next автоматически откроется после установки.",
+                                             "SuperDictate Next will reopen automatically when the update finishes."),
                                           font: .systemFont(ofSize: 12),
                                           color: .secondaryLabelColor)
         detailLabel.preferredMaxLayoutWidth = 390
@@ -848,12 +848,12 @@ final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, NSWindow
             detailLabel.stringValue = t("Старая версия закрыта, новая устанавливается. Приложение откроется автоматически.",
                                         "The old version has closed while the new one is installed. It will reopen automatically.")
         case "relaunching":
-            detailLabel.stringValue = t("Запускаю новую версию SuperDictate.",
-                                        "Opening the new version of SuperDictate.")
+            detailLabel.stringValue = t("Запускаю новую версию SuperDictate Next.",
+                                        "Opening the new version of SuperDictate Next.")
             scheduleClose(after: 0.5)
         default:
-            detailLabel.stringValue = t("SuperDictate автоматически откроется после установки.",
-                                        "SuperDictate will reopen automatically when the update finishes.")
+            detailLabel.stringValue = t("SuperDictate Next автоматически откроется после установки.",
+                                        "SuperDictate Next will reopen automatically when the update finishes.")
         }
     }
     private func scheduleClose(after delay: TimeInterval) {

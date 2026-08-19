@@ -4298,7 +4298,7 @@ enum ParakeySelfTest {
             "/usr/bin/ditto \"$STAGED_APP\" \"$APP_PATH\" || rollback",
             "/usr/bin/codesign --verify --deep --strict \"$APP_PATH\"",
             "if [ -d \"$BACKUP_APP\" ]; then",
-            "state \"complete\" 'SuperDictate v9.8.7 is installed.'",
+            "state \"complete\" 'SuperDictate Next v9.8.7 is installed.'",
         ] {
             guard directScript.contains(fragment) else {
                 throw SelfTestFailure.failed("direct update helper missing fragment: \(fragment)")

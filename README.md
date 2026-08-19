@@ -48,7 +48,9 @@ exists:
 | Settings window | partial | adds Launch at Login, mute-while-recording, adaptive **Contrast** HUD color, capsule size, indicator modes (level bars / elapsed-timer outline) |
 | Russian numbers | words | optional ITN: dictated numbers written as digits (25, not двадцать пять) |
 | Long dictations | single pass | pause-based segmentation with overlap seam deduplication |
-| Corrections | — | text-corrections manager (menu bar) for persistent ASR fixes |
+| Pause detection | — | optional Silero VAD (local ggml port) for smarter pause boundaries |
+| Vocabulary learning | — | automatic: hand-correct a word right after dictation and it's remembered — with an Undo toast and a SQLite-backed manager |
+| Corrections | — | vocabulary manager (Settings → Text): add/edit/delete, JSON import/export, cross-Mac folder sync |
 
 ## 🚀 One-minute install
 
@@ -97,10 +99,12 @@ page.
 - **Right Command** — start dictating; press again to stop the recording.
 - Settings let you choose what a second press does: just insert the text, or
   insert the text and then press Enter.
-- **Right Option + right Command** — an alternate way to stop the active
-  recording. It does the opposite of the primary hotkey: if the primary key
-  presses Enter, this one stops without Enter, and vice versa. The alternate
-  hotkey can be turned off.
+- **Right Option + right Command** (default; fully re-recordable) — an
+  alternate way to stop the active recording. It does the opposite of the
+  primary hotkey: if the primary key presses Enter, this one stops without
+  Enter, and vice versa. Any combination works, including modifier-only
+  chords such as `Control + Command` — record it by holding the chord and
+  releasing either key. The alternate hotkey can be turned off.
 - **Right Shift + right Command** — open or close the quick history.
 - All three shortcuts can be changed independently. Single keys, function
   keys, regular combinations, and modifier-only combinations (e.g.
@@ -119,9 +123,16 @@ The main panel is compact: it shows the background service status, any
 missing permissions, and an available update. Service controls sit to the
 right of the status; hovering shows a tooltip for each button.
 
-The gear button opens the Settings window: the three shortcuts, stop-action
-behavior, filler-word manager, auto-stop on silence, microphone, Launch at
-Login, mute while recording, capsule size, indicator colors and background.
+The gear button opens the Settings window, organized into five compact tabs:
+
+- **Dictation** — the three shortcuts and the stop-action behavior (insert,
+  or insert + Enter).
+- **Text** — filler words, Russian number formatting, vocabulary learning.
+- **Audio** — microphone picker, auto-stop on silence, mute while recording.
+- **Appearance** — capsule size, recording/transcribing colors, indicator
+  mode, background.
+- **System** — Launch at Login, privacy info.
+
 The `RU / EN` toggle instantly switches the language of both panels. Changes
 stay as a draft first; the `Save and Restart` button applies them together
 and restarts only the background service — history and the model are left
@@ -141,6 +152,26 @@ Settings → `Remove filler words` opens a four-column checklist:
 - **Your own words and phrases**: type one, press Enter — it joins the same
   list, already ticked. Untick to keep it on the list but unused; the `×`
   button deletes it.
+
+## 📖 Vocabulary learning
+
+When you hand-correct a short word or phrase right after SuperDictate
+inserts a dictation (the classic case: an English word dictated
+phonetically in Cyrillic), the app notices the fix and remembers it as a
+text correction — the next time the same word is dictated, it is replaced
+automatically.
+
+- Only short edits count (up to three words swapped). Pure deletions,
+  half-finished trims, and casing-only touch-ups are ignored.
+- A small pill-shaped toast appears near the field, confirming what was
+  learned. Press **Escape** (or click the toast) to undo it immediately.
+- You can keep correcting: multiple fixes in the same dictated passage are
+  each learned independently.
+- Automatic learning can be turned off in Settings → Text.
+- Corrections live in a local SQLite database
+  (`~/Library/Application Support/SuperDictate/corrections.sqlite`), with a
+  full manager — add, edit, delete, JSON import/export — and optional
+  folder-based sync between your Macs.
 
 ## ⏸️ Auto-stop on silence
 
@@ -259,6 +290,17 @@ Vulkan across all 4 clips. Full details, including measurements from a
 separate CMake build (without the Swift/bridge overhead, where Vulkan speeds
 up even short clips by 30%+), are in
 `.superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-5-vulkan-integration-report.md`.
+
+## 🎚️ Pause detection (Silero VAD)
+
+Long dictations are split into segments at pauses. By default, pause
+boundaries are found with a lightweight mel-energy heuristic. If you place
+a [Silero VAD](https://github.com/snakers4/silero-vad) model — the ggml
+build, `ggml-silero-v6.2.0.bin` — into
+`~/Library/Application Support/SuperDictate/Models/`, SuperDictate picks it
+up and uses it for noticeably smarter pause boundaries and overlap-seam
+placement. The VAD runs locally on the CPU and works fully offline; without
+the file, the heuristic fallback keeps everything working.
 
 ## ✅ Checks before a pull request
 
