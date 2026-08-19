@@ -66,6 +66,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var hudDisplayMode: RecordingHUDDisplayMode
     var normalizeNumbersToDigits: Bool
     var removeFillerWords: Bool
+    var removeFinalPeriod: Bool
     var enabledFillerPresetKeys: Set<String>
     var customFillerWords: [String]
     var disabledCustomFillerWords: Set<String>
@@ -90,6 +91,7 @@ struct ControlPanelSettingsDraft: Equatable {
         hudDisplayMode = settings.recordingHUDDisplayMode
         normalizeNumbersToDigits = settings.normalizeNumbersToDigits
         removeFillerWords = settings.removeFillerWords
+        removeFinalPeriod = settings.removeFinalPeriod
         enabledFillerPresetKeys = settings.enabledFillerPresetKeys
         customFillerWords = settings.customFillerWords
         disabledCustomFillerWords = settings.disabledCustomFillerWords
@@ -587,9 +589,10 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                            "Open or close recent transcriptions.")
             ))
 
-        case .text:
+case .text:
             content.addArrangedSubview(normalizeNumbersRow(draft))
             content.addArrangedSubview(fillerWordsRow(draft))
+            content.addArrangedSubview(removeFinalPeriodRow(draft))
             content.addArrangedSubview(correctionsInfoRow())
             content.addArrangedSubview(autoLearnVocabularyRow(draft))
 
@@ -874,12 +877,20 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                                              size: 12.5,
                                              weight: .semibold))
         header.addArrangedSubview(NSView())
-        header.addArrangedSubview(panelLabel(
+header.addArrangedSubview(panelLabel(
             missing.isEmpty ? t("Все выданы", "All granted")
                             : t("Нужно: \(missing.count)", "Missing: \(missing.count)"),
-            size: 11.5,
-            weight: .medium,
-            color: color
+                        size: 11.5,
+                        weight: .medium,
+                        color: color
+                    ))
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(panelButton(
+            t("Сбросить", "Reset"),
+            action: #selector(resetPermissionsClicked(_:)),
+            enabled: serviceOperation == nil,
+            toolTip: t("Отозвать все разрешения macOS у SuperDictate (микрофон, вставка текста, хоткей). После сброса их нужно выдать заново.",
+                       "Revoke all macOS permissions from SuperDictate (microphone, text insertion, hotkey). You'll need to grant them again.")
         ))
         content.addArrangedSubview(header)
 
@@ -1721,6 +1732,44 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         return row
     }
 
+    }
+
+    private func removeFinalPeriodRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Убирать финальную точку", "Remove final period"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Удалять точку в конце продиктованного текста (кроме многоточий).",
+              "Drop the trailing period from dictated text (ellipses are kept)."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleRemoveFinalPeriodSetting(_:))
+        toggle.state = draft.removeFinalPeriod ? .on : .off
+        toggle.toolTip = t("Удалять точку в конце продиктованного текста (кроме многоточий).",
+                           "Drop the trailing period from dictated text (ellipses are kept).")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func autoLearnVocabularyRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -2497,6 +2546,13 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         refreshSettingsWindow()
     }
 
+    @objc private func toggleRemoveFinalPeriodSetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.removeFinalPeriod = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func toggleFillerPreset(_ sender: NSButton) {
         guard let key = sender.identifier?.rawValue else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
@@ -2725,6 +2781,20 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         } else {
             Permissions.request(permission)
         }
+        refresh(force: true)
+    }
+
+    @objc private func resetPermissionsClicked(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = t("Сбросить разрешения?", "Reset Permissions?")
+        alert.informativeText = t("macOS отзовёт у SuperDictate Next микрофон, вставку текста и мониторинг ввода. Приложение перезапустится и снова попросит доступ.",
+                                  "macOS will revoke SuperDictate Next's microphone, text insertion, and input monitoring. The app will relaunch and ask again.")
+        alert.addButton(withTitle: t("Отмена", "Cancel"))
+        alert.addButton(withTitle: t("Сбросить", "Reset"))
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        Permissions.resetAll()
+        permissionClickCount = [:]
         refresh(force: true)
     }
 

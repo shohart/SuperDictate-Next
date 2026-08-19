@@ -38,9 +38,21 @@ struct DictationTextProcessingResult: Equatable {
     let removedFillerWordCount: Int
 }
 
+/// Optional final-period removal (ported from upstream shlgd/SuperDictate
+/// v0.2.40's `remove_final_period` setting). Only a single trailing "." is
+/// dropped; a text ending in ".." (i.e. an ellipsis "...") is kept as-is —
+/// the user's punctuation intent there is explicit.
+func removingFinalPeriod(from text: String) -> String {
+    guard text.last == "." else { return text }
+    let withoutFinalPeriod = text.dropLast()
+    guard withoutFinalPeriod.last != "." else { return text }
+    return String(withoutFinalPeriod)
+}
+
 func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
+                                    removeFinalPeriod: Bool = false,
                                     normalizeNumbersToDigits: Bool = false,
                                     language: DictationLanguage = .auto,
                                     enabledFillerPresetKeys: Set<String> = FillerWordRemover.defaultEnabledPresetKeys,
@@ -58,17 +70,26 @@ func processedDictationText(rawTranscript: String,
 
     let corrected = TranscriptCorrector.apply(to: numberNormalized, corrections: corrections)
 
-    guard removeFillerWords else {
-        return DictationTextProcessingResult(text: corrected.text,
-                                             appliedCorrectionCount: corrected.appliedCount,
-                                             removedFillerWordCount: 0)
+    let textAfterFillers: String
+    let removedFillerWordCount: Int
+    if removeFillerWords {
+        let stripped = FillerWordRemover.apply(to: corrected.text,
+                                               enabledPresetKeys: enabledFillerPresetKeys,
+                                               customWords: customFillerWords)
+        textAfterFillers = stripped.text
+        removedFillerWordCount = stripped.removedCount
+    } else {
+        textAfterFillers = corrected.text
+        removedFillerWordCount = 0
     }
 
-    let stripped = FillerWordRemover.apply(to: corrected.text,
-                                           enabledPresetKeys: enabledFillerPresetKeys,
-                                           customWords: customFillerWords)
-    return DictationTextProcessingResult(text: stripped.text,
+    // Final-period removal runs LAST (same as upstream): the toggle drops the
+    // trailing dot of the finished, corrected, filler-stripped text.
+    let finalText = removeFinalPeriod
+        ? removingFinalPeriod(from: textAfterFillers)
+        : textAfterFillers
+    return DictationTextProcessingResult(text: finalText,
                                          appliedCorrectionCount: corrected.appliedCount,
-                                         removedFillerWordCount: stripped.removedCount)
+                                         removedFillerWordCount: removedFillerWordCount)
 }
 
