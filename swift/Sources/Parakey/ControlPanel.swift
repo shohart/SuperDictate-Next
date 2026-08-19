@@ -221,7 +221,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
-        window.title = "SuperDictate"
+        window.title = "SuperDictate Next"
         window.contentMinSize = NSSize(width: 520, height: 310)
         window.contentMaxSize = NSSize(width: 520, height: 310)
         window.isReleasedWhenClosed = false
@@ -253,7 +253,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
         resizeCompactPanel(window)
-        window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
+        window.title = t("SuperDictate Next — панель управления", "SuperDictate Next — Control Panel")
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
             // Rebuilding the content view mid-edit destroys the very
@@ -268,7 +268,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
             let hasUnsavedChanges = settingsDraft
                 .map { $0 != ControlPanelSettingsDraft(settings: settings) } ?? false
             if force || !hasUnsavedChanges {
-                settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+                settingsWindow.title = t("Настройки SuperDictate Next", "SuperDictate Next Settings")
                 settingsWindow.contentView = makeTabbedSettingsContentView()
             }
         }
@@ -688,7 +688,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 1
-        text.addArrangedSubview(panelLabel("SuperDictate", size: 20, weight: .semibold))
+        text.addArrangedSubview(panelLabel("SuperDictate Next", size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
             t("Локальная диктовка · работает в фоне", "Local dictation · runs in the background"),
             size: 11.5,
@@ -697,7 +697,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
 
         let version = panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor)
         version.setContentHuggingPriority(.required, for: .horizontal)
-        version.toolTip = t("Установленная версия SuperDictate", "Installed SuperDictate version")
+        version.toolTip = t("Установленная версия SuperDictate Next", "Installed SuperDictate Next version")
 
         let languageControl = NSSegmentedControl(labels: ["RU", "EN"],
                                                  trackingMode: .selectOne,
@@ -890,8 +890,8 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                 size: 11,
                 color: .secondaryLabelColor
             )
-            ready.toolTip = t("SuperDictate получил все три необходимых разрешения macOS.",
-                              "SuperDictate has all three required macOS permissions.")
+            ready.toolTip = t("SuperDictate Next получил все три необходимых разрешения macOS.",
+                              "SuperDictate Next has all three required macOS permissions.")
             content.addArrangedSubview(ready)
         } else {
             for permission in missing {
@@ -978,7 +978,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                     nil, nil, false, nil)
         case .upToDate:
             return ("checkmark.circle.fill", .systemGreen,
-                    t("SuperDictate актуален", "SuperDictate is up to date"),
+                    t("SuperDictate Next актуален", "SuperDictate Next is up to date"),
                     t("Установлена последняя версия v\(currentBundleVersion())",
                       "Latest version v\(currentBundleVersion()) is installed"),
                     t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
@@ -989,8 +989,8 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                     t("Скачается, проверится и установится автоматически",
                       "Downloads, verifies, and installs automatically"),
                     t("Обновить", "Update"), #selector(updateButtonClicked(_:)), serviceOperation == nil,
-                    t("Обновить SuperDictate до v\(release.version) одной кнопкой",
-                      "Update SuperDictate to v\(release.version) with one click"))
+                    t("Обновить SuperDictate Next до v\(release.version) одной кнопкой",
+                      "Update SuperDictate Next to v\(release.version) with one click"))
         case .preparing(let version, let phase):
             return ("arrow.down.circle", .systemBlue,
                     t("Обновляю до v\(version)", "Updating to v\(version)"),
@@ -1658,8 +1658,8 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
             weight: .semibold
         ))
         text.addArrangedSubview(panelLabel(
-            t("Открывать SuperDictate автоматически при входе в macOS.",
-              "Open SuperDictate automatically when you log in to macOS."),
+            t("Открывать SuperDictate Next автоматически при входе в macOS.",
+              "Open SuperDictate Next automatically when you log in to macOS."),
             size: 12,
             color: .secondaryLabelColor
         ))
@@ -2370,7 +2370,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
             backing: .buffered,
             defer: false
         )
-        settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+        settingsWindow.title = t("Настройки SuperDictate Next", "SuperDictate Next Settings")
         settingsWindow.contentMinSize = NSSize(width: 680, height: 560)
         settingsWindow.contentMaxSize = NSSize(width: 680, height: 560)
         settingsWindow.isReleasedWhenClosed = false

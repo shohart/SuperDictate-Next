@@ -193,7 +193,7 @@ final class HotkeyRecorderController: NSObject, NSWindowDelegate {
                               action: nil)
         super.init()
 
-        panel.title = "SuperDictate"
+        panel.title = "SuperDictate Next"
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.delegate = self
