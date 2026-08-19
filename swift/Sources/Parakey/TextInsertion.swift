@@ -1054,18 +1054,42 @@ enum ClipboardPasteInserter {
     private static let confirmationTimeout: TimeInterval = 2.0
     private static let confirmationUnreadableBailout: TimeInterval = 0.35
 
-    static func write(_ text: String, to pb: NSPasteboard) -> Bool {
+    // The nspasteboard.org convention (honored by clipboard-history tools —
+    // Alfred, Paste, Maccy, Raycast — and the closest public signal for
+    // "this write isn't a real user copy, don't treat it as one") for a
+    // pasteboard item that exists only to be immediately consumed and then
+    // reverted, same as a password manager's one-shot paste-and-forget.
+    // See docs/superpowers/specs/2026-08-20-universal-clipboard-
+    // interference-design.md.
+    private static let transientMarkerType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+
+    /// `transient` marks the write as ephemeral (about to be immediately
+    /// consumed by a synthetic paste, then reverted) so external observers
+    /// — clipboard-history tools, and best-effort Continuity/Universal
+    /// Clipboard — don't mistake it for a real user copy. Defaults to
+    /// `false`: the two other call sites (ParakeyApp.swift's "save
+    /// transcript to clipboard after target disappeared" safety net, and
+    /// SelfTest.swift's pasteboard probe) write content meant to be pasted
+    /// manually, possibly much later, and must not be marked transient.
+    static func write(_ text: String, to pb: NSPasteboard, transient: Bool = false) -> Bool {
         pb.clearContents()
-        return pb.setString(text, forType: .string)
+        guard transient, let stringData = text.data(using: .utf8) else {
+            return pb.setString(text, forType: .string)
+        }
+        let item = NSPasteboardItem()
+        item.setData(stringData, forType: .string)
+        item.setData(Data(), forType: transientMarkerType)
+        return pb.writeObjects([item])
     }
 
     static func insert(_ text: String) -> Bool {
         let pasteboard = NSPasteboard.general
         let previous = PasteboardSnapshot.capture(from: pasteboard)
-        guard write(text, to: pasteboard) else {
+        guard write(text, to: pasteboard, transient: true) else {
             log("pasteboard write failed")
             return false
         }
+        log("clipboard: wrote transient dictation text (org.nspasteboard.TransientType)")
         let transientChangeCount = pasteboard.changeCount
 
         let steps = clipboardPasteKeyboardEventSteps(commandKey: virtualKeyCommand,
@@ -1135,10 +1159,17 @@ enum ClipboardPasteInserter {
             DispatchQueue.main.async {
                 guard pasteboard.changeCount == changeCount,
                       pasteboard.string(forType: .string) == text else {
+                    // Something else took ownership of the pasteboard while
+                    // this was waiting — could be the user copying something
+                    // new on this Mac, or an incoming Universal Clipboard
+                    // write. Logged so a future Universal Clipboard report
+                    // can be correlated against this timeline.
+                    log("clipboard: restore skipped, pasteboard changed during paste wait")
                     completion?()
                     return
                 }
                 snapshot.restore(to: pasteboard)
+                log("clipboard: restored previous contents")
                 completion?()
             }
         }

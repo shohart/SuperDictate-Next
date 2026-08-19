@@ -60,6 +60,8 @@ enum ParakeySelfTest {
             return runSuite("readiness", testReadiness)
         case "paste":
             return runSuite("paste", testPasteSuffixFormatting)
+        case "paste-transient-marking":
+            return runSuite("paste-transient-marking", testClipboardPasteInserterTransientMarking)
         case "paste-confirmation":
             return runSuite("paste-confirmation", testPasteConfirmationPoller)
         case "paste-restore":
@@ -203,6 +205,7 @@ enum ParakeySelfTest {
         try testHotkey()
         try testReadiness()
         try testPasteSuffixFormatting()
+        try testClipboardPasteInserterTransientMarking()
         try testPasteConfirmationPoller()
         try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
@@ -1435,6 +1438,52 @@ enum ParakeySelfTest {
             pasteboardProbe.stored,
             equals: "pasteboard probe",
             "clipboard paste should write the intended string before posting Cmd+V"
+        )
+    }
+
+    // Covers the org.nspasteboard.TransientType marking added to mitigate
+    // Universal Clipboard interference (docs/superpowers/specs/2026-08-20-
+    // universal-clipboard-interference-design.md): a `transient: true`
+    // write must carry the marker type without disturbing the readable
+    // .string payload, and the default (non-transient) write — used by the
+    // "save transcript after target disappeared" safety net and this
+    // suite's own probe above — must never carry it.
+    private static func testClipboardPasteInserterTransientMarking() throws {
+        let probe = MainActor.assumeIsolated { () -> (transientTypes: [NSPasteboard.PasteboardType], transientString: String?, permanentTypes: [NSPasteboard.PasteboardType], permanentString: String?) in
+            let pasteboardName = NSPasteboard.Name("com.local.superdictate.self-test.transient.\(UUID().uuidString)")
+            let pasteboard = NSPasteboard(name: pasteboardName)
+
+            _ = ClipboardPasteInserter.write("dictated text", to: pasteboard, transient: true)
+            let transientTypes = pasteboard.pasteboardItems?.first?.types ?? []
+            let transientString = pasteboard.string(forType: .string)
+
+            _ = ClipboardPasteInserter.write("saved transcript", to: pasteboard)
+            let permanentTypes = pasteboard.pasteboardItems?.first?.types ?? []
+            let permanentString = pasteboard.string(forType: .string)
+
+            return (transientTypes, transientString, permanentTypes, permanentString)
+        }
+        let markerType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+
+        try expect(
+            probe.transientTypes.contains(markerType),
+            equals: true,
+            "a transient: true write should carry org.nspasteboard.TransientType"
+        )
+        try expect(
+            probe.transientString,
+            equals: "dictated text",
+            "a transient: true write should still expose its text via the standard .string type"
+        )
+        try expect(
+            probe.permanentTypes.contains(markerType),
+            equals: false,
+            "the default (non-transient) write must not carry org.nspasteboard.TransientType"
+        )
+        try expect(
+            probe.permanentString,
+            equals: "saved transcript",
+            "the default (non-transient) write should still write the intended text"
         )
     }
 
