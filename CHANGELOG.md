@@ -8,7 +8,187 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## v0.5.5 — 2026-08-19
+
+### Added
+- **Final-period removal toggle** in Settings → Text: optionally drop the trailing period from dictated text (ellipses are preserved).
+- **Reset Permissions button** in the macOS permissions card: one click revokes Microphone, Accessibility, and Input Monitoring grants, then relaunches the agent so the user can re-grant cleanly.
+
+### Fixed
+- Silero VAD no longer crashes on short audio chunks (Intel tinyBLAS `ldb >= k` assertion fixed by making the fast path return `false` for unsupported layouts).
+- Removed unsafe VAD startup probing that could trigger the same BLAS assertion.
+
+### Changed
+- Updated Vulkan headers/loader to 1.4.357.0 and regenerated SPIR-V shader corpus.
+
+### Validation
+- Full self-test suite: PASS
+- `silero-vad-real`, `vad-boundary-oracle-real`: PASS
+- Parakeet CPU and Vulkan integration: PASS
+- Release build: version 0.5.6, build 57
+- Bundle identifier: com.local.superdictate
+- Release ZIP SHA-256: (to be filled after build)
+
+## v0.5.5 — 2026-08-19
+
+### Changed
+
+- Updated vendored `parakeet.cpp` to the maintainer's current v0.5.0 commit
+  while retaining its exact pinned ggml v0.13.0 submodule.
+- Updated Vulkan headers and loader to 1.4.357.0 and regenerated the bundled SPIR-V shader corpus.
+
+### Fixed
+
+- Preserved Silero VAD and fixed an Intel tinyBLAS assertion on valid VAD
+  matrix layouts by allowing the optional fast path to fall back to the normal
+  CPU kernel.
+- Removed unsafe VAD startup probing that could trigger the same BLAS assertion.
+
+### Validation
+- CPU and Vulkan Parakeet integration pass on AMD RX 6600.
+- `silero-vad-real`, `vad-boundary-oracle-real`: PASS
+- The existing multilingual `tdt-0.6b-v3-q8_0.gguf` model is unchanged.
+
 ## v0.5.4 — 2026-08-19
+
+### Changed
+
+- Split the Settings window into compact thematic tabs: Dictation, Text,
+  Audio, Appearance, and System. Each tab has its own scroll area and starts
+  at the top of the viewport, making the panel usable on small screens.
+- Vocabulary learning now continues watching an insertion after a correction
+  is saved, allowing multiple independently corrected words in one dictated
+  passage to be learned.
+- Corrections saving now surfaces SQLite errors (e.g., `SQLITE_BUSY`) instead
+  of silently dropping the row.
+- Enabled WAL mode for the corrections SQLite database to reduce contention
+  between the agent and the Control Panel processes.
+
+### Fixed
+
+- Prevented deletion-only edits and partial word trimming from being learned
+  as corrections.
+- Reduced vocabulary-learning debounce and confirmation delays from about
+  1.8 seconds total to about 0.85 seconds.
+- Removed the unwanted AppKit focus ring around the toast's transparent undo
+  control.
+
+### Validation
+- CPU and Vulkan Parakeet integration pass on AMD RX 6600.
+- `silero-vad-real`, `vad-boundary-oracle-real`: PASS
+- The existing multilingual `tdt-0.6b-v3-q8_0.gguf` model is unchanged.
+
+## v0.5.3 — 2026-08-18
+
+### Changed
+
+- Updated vendored `parakeet.cpp` to the maintainer's current v0.5.0 commit
+  while retaining its exact pinned ggml v0.13.0 submodule.
+- Updated Vulkan headers and loader to 1.4.357.0 and regenerated the bundled
+  SPIR-V shader corpus.
+
+### Fixed
+
+- Diagnosed and fixed a stale-singleton bug in the Vulkan backend: after a
+  mid-session Vulkan error the process-global `pk::global_backend()` singleton
+  was left in a CPU state, causing subsequent Vulkan requests to silently fall
+  back to CPU. The fix resets the stale singleton when the device request
+  changes and no live contexts exist, so the next warm-up rebuilds the backend
+  with the new device.
+- Fixed a hotkey-recorder bug where two-modifier chords (e.g. Ctrl+Cmd) could
+  never be recorded because the recorder accepted the first modifier press
+  and closed immediately. The recorder now captures chords on key release.
+- Fixed a recorder bug where the first key release of a modifier chord was
+  ignored, preventing two-modifier shortcuts from being recorded.
+
+### Added
+- Regression tests for the stale-singleton Vulkan fix and the held-modifier
+  hotkey recording fix.
+
+## v0.5.2 — 2026-08-17
+
+### Changed
+
+- Internal refactor: the monolithic `main.swift` was split into per-topic
+  source files (constants/config/metrics/models, logger, settings, permissions,
+  hotkeys, audio capture, transcription worker, text insertion, HUD, app
+  entry, self-test, control panel, diagnostics). No behaviour changes.
+
+### Fixed
+
+- Toast appearing too early (on deletion-only edits) fixed by rejecting
+  deletion-only candidates in `LearnCandidateDetector`.
+- Hotkey recorder now captures modifier chords on key release, not key press.
+- Vulkan backend no longer falls back to CPU after a mid-session error.
+
+### Validation
+- Full self-test suite: PASS
+- `silero-vad-real`, `vad-boundary-oracle-real`: PASS
+- Parakeet CPU and Vulkan integration pass on AMD RX 6600.
+
+## v0.5.1 — 2026-08-17
+
+Internal refactor: the monolithic `main.swift` was split into per-topic
+source files (constants/config/metrics/models, logger, settings, permissions,
+hotkeys, audio capture, transcription worker, text insertion, HUD, app entry,
+self-test, control panel, diagnostics). No behaviour changes — the refactor
+preserves the 0.5.0 feature set, and the clean release build now compiles
+with zero warnings on this Intel Mac.
+
+## v0.5.1 — 2026-08-07
+
+Internal refactor: the monolithic `main.swift` was split into per-topic
+source files (constants/config/metrics/models, logger, settings, permissions,
+hotkeys, audio capture, transcription worker, text insertion, HUD, app entry,
+self-test, control panel, diagnostics). No behaviour changes — the refactor
+preserves the 0.5.0 feature set, and the clean release build now compiles
+with zero warnings on this Intel Mac.
+
+## v0.5.0 — 2026-08-07
+
+**SuperDictate Next** — the first release under the new project name
+(formerly SuperDictate-Intel), now tracking its own repository for update
+checks instead of the upstream project.
+
+- Filler-word manager in Settings: a four-column checklist of 27 curated
+  Russian and English presets — hesitation sounds (on by default) and
+  verbal-tic phrases like "как бы", "это самое", "знаешь", "you know"
+  (off until ticked) — plus your own words and phrases, which join the
+  same list already ticked and can be unticked without deleting. The old
+  menu-bar toggle moved into Settings.
+- Auto-stop on silence: dictation can end itself after 1–10 s of
+  continuous silence (off by default), measured from the last voiced
+  sample.
+- Launch at Login and Mute system audio while recording moved from the
+  menu bar into the Settings window; a hint row points to the text-corrections
+  manager.
+- New adaptive "Contrast" HUD accent color: black on a light capsule
+  background, white on dark — fixes the recording indicator being
+  invisible on light backgrounds.
+- Settings reliability: the filler-word checklist always renders (a
+  zero-size scroll document hid it), and periodic panel refreshes no
+  longer eat checkbox clicks mid-edit, which had silently dropped saved
+  preset ticks.
+- Settings reliability: the filler-word checklist always renders (a
+  zero-size scroll document hid it), and periodic panel refreshes no
+  longer eat checkbox clicks mid-edit, which had silently dropped saved
+  preset ticks.
+- New adaptive "Contrast" HUD accent color: black on a light capsule
+  background, white on dark — fixes the recording indicator being
+  invisible on light backgrounds.
+- Settings reliability: the filler-word checklist always renders (a
+  zero-size scroll document hid it), and periodic panel refreshes no
+  longer eat checkbox clicks mid-edit, which had silently dropped saved
+  preset ticks.
+- New adaptive "Contrast" HUD accent color: black on a light capsule
+  background, white on dark — fixes the recording indicator being
+  invisible on white backgrounds.
+- Settings reliability: the filler-word checklist always renders (a
+  zero-size scroll document hid it), and periodic panel refreshes no
+  longer eat checkbox clicks mid-edit, which had silently dropped saved
+  preset ticks.
+
+
 
 ### Changed
 

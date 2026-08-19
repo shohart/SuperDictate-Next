@@ -71,8 +71,6 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFinalPeriod = "remove_final_period_v1"
-    private static let keyRemoveFinalPeriod = "remove_final_period_v1"
-    private static let keyRemoveFinalPeriod = "remove_final_period_v1"
     private static let keyRemoveFillerWords = "remove_filler_words"
     private static let keyEnabledFillerPresetKeys = "enabled_filler_preset_keys"
     private static let keyCustomFillerWords = "custom_filler_words"
@@ -796,16 +794,6 @@ final class Settings: @unchecked Sendable {
             changed = true
         }
         return changed
-    }
-
-    var removeFinalPeriod: Bool {
-        get { defaults.bool(forKey: Self.keyRemoveFinalPeriod) }
-        set { defaults.set(newValue, forKey: Self.keyRemoveFinalPeriod) }
-    }
-
-    var removeFinalPeriod: Bool {
-        get { defaults.bool(forKey: Self.keyRemoveFinalPeriod) }
-        set { defaults.set(newValue, forKey: Self.keyRemoveFinalPeriod) }
     }
 
     var removeFinalPeriod: Bool {

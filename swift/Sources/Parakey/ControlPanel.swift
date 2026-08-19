@@ -1732,8 +1732,6 @@ header.addArrangedSubview(panelLabel(
         return row
     }
 
-    }
-
     private func removeFinalPeriodRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -2798,7 +2796,7 @@ header.addArrangedSubview(panelLabel(
         refresh(force: true)
     }
 
-    private func showError(title: String, detail: String) {
+    @MainActor private func showError(title: String, detail: String) {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = title

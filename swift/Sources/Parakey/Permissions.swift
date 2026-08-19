@@ -484,7 +484,6 @@ final class Permissions {
             NSWorkspace.shared.open(url)
         }
     }
-}
 
     /// Revoke every macOS permission the app holds via `tccutil reset`.
     /// Only ever called from an explicit user action (the Reset button in
