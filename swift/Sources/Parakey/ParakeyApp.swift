@@ -60,6 +60,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let asr = TranscriptionWorker()
     private let insertionTargetTracker = FocusedInsertionTargetTracker()
     private let settings = Settings.shared
+    private let llmPostprocessing = LLMPostprocessingCoordinator()
 
     private var isRecording = false
     private var isBusy = false
@@ -262,6 +263,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
         hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
+        hotkey.onToggleCorrection = { [weak self] in self?.toggleTextCorrectionMode() }
         hotkey.onRejectedBusyPress = { [weak self] in
             guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()
@@ -294,6 +296,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.onReleaseAlternate = nil
             hotkey.onCancel = nil
             hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
             hotkey.isRecordingActive = nil
             hotkey.canStartRecording = nil
@@ -364,6 +367,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
         hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
+        hotkey.setCorrectionHotkey(settings.configuredCorrectionHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -426,6 +430,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         controlPanelLaunchInProgress = false
         hotkeyRecorder?.cancel()
         hotkeyRecorder = nil
+        let postprocessing = llmPostprocessing
+        Task { await postprocessing.stop() }
         publishAgentState(status: "stopping", detail: "Dictation service is stopping.")
         settings.hasActiveRunMarker = false
         startupTask?.cancel()
@@ -726,13 +732,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                        language: settings.dictationLanguage,
                                                        enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
                                                        customFillerWords: settings.enabledCustomFillerWords)
-                if !processed.text.isEmpty {
+                let finalText = await llmPostprocessing.finalizedText(processed.text, settings: settings)
+                if !finalText.isEmpty {
                     addToHistory(
-                        processed.text,
+                        finalText,
                         transcriptionDurationSeconds: timing.totalSeconds,
                         asrTiming: timing
                     )
-                    recordDictationUsage(text: processed.text,
+                    recordDictationUsage(text: finalText,
                                          audioSeconds: duration,
                                          asrSeconds: timing.totalSeconds)
                 }
@@ -757,7 +764,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 } else {
                     PendingDictationRecovery.remove(url)
-                    log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+                    log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(finalText.count) chars in history")
                 }
             } catch {
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
@@ -794,6 +801,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -865,6 +873,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -988,6 +997,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -1049,6 +1059,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -1105,6 +1116,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -1448,6 +1460,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             showRecordingHUD(mode: .transcribing, level: 0)
         }
+        startRecordingHUDMotion()
+    }
+
+    /// Switches the already-visible transcribing HUD to the "improving
+    /// text" animation right before the LLM correction request goes out.
+    /// Callers must only invoke this once they know
+    /// LLMPostprocessingCoordinator.finalizedText is actually about to do
+    /// real work (settings.textPostprocessingMode == .correction) --
+    /// otherwise it's a needless flicker for users who never enabled
+    /// correction, since finalizedText itself no-ops instantly in that case.
+    /// A no-op if the HUD panel isn't visible at all (e.g. showRecordingWaveform
+    /// disabled, or the silent startup-recovery path that never shows a HUD).
+    private func showCorrectingHUD() {
+        guard settings.textPostprocessingMode == .correction,
+              recordingHUDPanel?.isVisible == true else { return }
+        updateRecordingHUD(mode: .correcting, level: 0)
         startRecordingHUDMotion()
     }
 
@@ -2301,7 +2329,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if processed.removedFillerWordCount > 0 {
                         log("filler words removed: \(processed.removedFillerWordCount)")
                     }
-                    let cleaned = processed.text
+                    showCorrectingHUD()
+                    let cleaned = await llmPostprocessing.finalizedText(processed.text, settings: settings)
                     if completed.transcription.hadSegmentFailure {
                         dictationFailed = true
                     }
@@ -2573,13 +2602,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            language: settings.dictationLanguage,
                                                            enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
                                                            customFillerWords: settings.enabledCustomFillerWords)
-                    if !processed.text.isEmpty {
+                    showCorrectingHUD()
+                    let finalText = await llmPostprocessing.finalizedText(processed.text, settings: settings)
+                    if !finalText.isEmpty {
                         addToHistory(
-                            processed.text,
+                            finalText,
                             transcriptionDurationSeconds: timing.totalSeconds,
                             asrTiming: timing
                         )
-                        recordDictationUsage(text: processed.text,
+                        recordDictationUsage(text: finalText,
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                     }
@@ -2590,7 +2621,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     } else {
                         PendingDictationRecovery.remove(captured.recoveryURL)
                     }
-                    log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+                    log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(finalText.count) chars in history")
                 }
             } catch {
                 recoveryFailed = true
@@ -2636,6 +2667,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onToggleCorrection = nil
         hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
@@ -2951,6 +2983,33 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.recentTranscriptEntries = []
         log("history cleared (\(count) entries)")
         rebuildMenu()
+    }
+
+    /// Flips LLM text correction on/off directly via the hotkey — does NOT
+    /// go through the Settings window's Save flow, so no background-service
+    /// restart happens (that restart already tears down the LLM host
+    /// subprocess on every save, defeating the point of a fast toggle).
+    /// finalizedText(_:settings:) already reads settings.textPostprocessingMode
+    /// fresh on every call, so this takes effect on the very next dictation
+    /// with no other propagation needed.
+    private func toggleTextCorrectionMode() {
+        let next: TextPostprocessingMode = settings.textPostprocessingMode == .correction ? .off : .correction
+        settings.textPostprocessingMode = next
+        log("text correction: \(next == .correction ? "enabled" : "disabled") via hotkey")
+        if settings.playFeedbackSounds {
+            if next == .correction {
+                Sounds.playStart()
+            } else {
+                Sounds.playDone()
+            }
+        }
+        Task { [llmPostprocessing] in
+            if next == .correction {
+                await llmPostprocessing.cancelScheduledUnload()
+            } else {
+                await llmPostprocessing.scheduleDelayedUnload()
+            }
+        }
     }
 
     private func toggleHistoryOverlay() {
@@ -4529,8 +4588,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             useGPU.isEnabled = true
             let deviceDescription = parakeetVulkanDeviceDescription()
             useGPU.toolTip = localizedText(
-                "Запускает Vulkan-бэкенд Parakeet вместо CPU (обнаружено: \(deviceDescription)). Требует перезагрузки речевой модели.",
-                "Runs Parakeet's Vulkan backend instead of CPU (detected: \(deviceDescription)). Reloads the speech model.",
+                "Запускает Vulkan-бэкенд вместо CPU для Parakeet и для модели коррекции текста (обнаружено: \(deviceDescription)). Перезагружает обе модели.",
+                "Runs the Vulkan backend instead of CPU for Parakeet and the text-correction model (detected: \(deviceDescription)). Reloads both models.",
                 language: gpuLanguage
             )
         } else {
@@ -6035,6 +6094,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch {
                 log("ASR: failed to reload after GPU setting change: \(error)")
             }
+            // The bundled correction-model host, if already running, was
+            // launched with the OLD --gpu-layers value baked into its
+            // process arguments (LLMHostProcess has no live-reconfigure
+            // path, unlike ParakeetEngine). Stop it so the next correction
+            // request lazily respawns it with the new useGPU value --
+            // mirrors the ASR reload immediately above, one user-facing
+            // toggle for both models.
+            await self.llmPostprocessing.stop()
             self.rebuildMenu()
         }
         rebuildMenu()

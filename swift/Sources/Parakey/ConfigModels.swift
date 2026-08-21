@@ -26,6 +26,14 @@ enum MenuBarState {
 enum RecordingHUDMode {
     case recording
     case transcribing
+    /// Shown while the LLM correction pass (LLMPostprocessingCoordinator)
+    /// is running on already-transcribed text -- a visually distinct
+    /// "improving" animation (orbiting sparkles, see
+    /// RecordingHUDView.drawCorrectingStars) so it doesn't read as a
+    /// continuation of transcription. Only entered when correction mode is
+    /// actually enabled (ParakeyApp.showCorrectingHUD gates the call), so
+    /// nothing changes for users who never turned this feature on.
+    case correcting
     /// Brief flash shown when a dictation fails (transcription error,
     /// paste failure). Renders a static yellow capsule so the user
     /// gets visual feedback even when the menu-bar icon is hidden.
@@ -394,6 +402,45 @@ func productionSpeechModelProfile(rawValue: String?) -> SpeechModelProfile {
         return .productionDefault
     }
     return profile
+}
+
+/// Text postprocessing after ASR + the deterministic corrections/filler/
+/// number passes in RecordingLifecycle.swift's `processedDictationText`.
+/// Per the architecture note this implements (local memory atom
+/// a81da166-460a-467e-ae78-f53667069cb0 §2-4): correction and rewrite are
+/// two DIFFERENT user-facing functions, never chained (`GEC → REWRITE` is
+/// explicitly disallowed) — only `.correction` exists today. `.off` and
+/// `.correction` are the only real states; a future rewrite mode adds its
+/// own case here rather than reusing this one, matching the atom's staged
+/// rollout (correction must fully ship and stabilize first).
+enum TextPostprocessingMode: String, CaseIterable, Codable {
+    case off
+    case correction
+}
+
+/// Where the correction model actually runs. `.bundledLocal` spawns
+/// SuperDictateLLMHost (swift/Sources/llama_cpp_host/) as a subprocess and
+/// talks to it over loopback HTTP; `.customEndpoint` points the exact same
+/// OpenAI-compatible client (OpenAICompatibleClient.swift) at a
+/// user-supplied server instead. See LLMHostProcess.swift's own doc
+/// comment for why this is a subprocess, not a linked library.
+enum LLMEngineBackend: String, CaseIterable, Codable {
+    case bundledLocal
+    case customEndpoint
+}
+
+func normalizedTextPostprocessingMode(rawValue: String?) -> TextPostprocessingMode {
+    guard let rawValue, let mode = TextPostprocessingMode(rawValue: rawValue) else {
+        return .off
+    }
+    return mode
+}
+
+func normalizedLLMEngineBackend(rawValue: String?) -> LLMEngineBackend {
+    guard let rawValue, let backend = LLMEngineBackend(rawValue: rawValue) else {
+        return .bundledLocal
+    }
+    return backend
 }
 
 enum RecentTranscriptLimit: String, CaseIterable {

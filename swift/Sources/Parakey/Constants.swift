@@ -79,6 +79,11 @@ let RECORDING_HUD_DISPLAY_LINK_MAX_FPS: Float = 120
 let RECORDING_HUD_RECORDING_BASE_PHASE_SPEED: CGFloat = 16.96
 let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
+// Deliberately slower/steadier than transcribing's phase speed -- an
+// orbiting-sparkle "improving" animation reads best at a calmer, more
+// deliberate pace than the fast transcribing wave (see
+// RecordingHUDView.drawCorrectingStars).
+let RECORDING_HUD_CORRECTING_PHASE_SPEED: CGFloat = 6.4
 let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-begin")
 let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-end")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45

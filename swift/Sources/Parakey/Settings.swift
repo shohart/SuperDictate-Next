@@ -31,6 +31,8 @@ final class Settings: @unchecked Sendable {
     private static let keyEnterHotkeyModifiers = "enter_hotkey_modifiers"
     private static let keyHistoryHotkeyKeycode = "history_hotkey_keycode"
     private static let keyHistoryHotkeyModifiers = "history_hotkey_modifiers"
+    private static let keyCorrectionHotkeyKeycode = "correction_hotkey_keycode"
+    private static let keyCorrectionHotkeyModifiers = "correction_hotkey_modifiers"
     private static let keyPrimaryCompletionBehavior = "primary_completion_behavior_v1"
     private static let keyAlternateCompletionEnabled = "alternate_completion_enabled_v1"
     private static let keyInterfaceLanguage = "interface_language"
@@ -87,6 +89,11 @@ final class Settings: @unchecked Sendable {
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
+    private static let keyTextPostprocessingMode = "text_postprocessing_mode_v1"
+    private static let keyLLMEngineBackend = "llm_engine_backend_v1"
+    private static let keyLLMCustomBaseURL = "llm_custom_base_url_v1"
+    private static let keyLLMCustomAPIKey = "llm_custom_api_key_v1"
+    private static let keyLLMCustomModelName = "llm_custom_model_name_v1"
 
     private let defaults: UserDefaults
     let vocabularyStore: VocabularyStore
@@ -297,6 +304,40 @@ final class Settings: @unchecked Sendable {
     func setConfiguredHistoryHotkey(_ choice: HotkeyChoice) {
         historyHotkeyKeycode = choice.keycode
         historyHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var correctionHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyCorrectionHotkeyKeycode))
+                ?? LEFT_COMMAND_KEYCODE
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? LEFT_COMMAND_KEYCODE
+            defaults.set(Int(normalized), forKey: Self.keyCorrectionHotkeyKeycode)
+        }
+    }
+
+    var correctionHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyCorrectionHotkeyModifiers) as? NSNumber
+            if raw == nil { return [] }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyCorrectionHotkeyModifiers)
+        }
+    }
+
+    var configuredCorrectionHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: correctionHotkeyKeycode, modifiers: correctionHotkeyModifiers)
+    }
+
+    func setConfiguredCorrectionHotkey(_ choice: HotkeyChoice) {
+        correctionHotkeyKeycode = choice.keycode
+        correctionHotkeyModifiers = choice.requiredModifiers
     }
 
     var interfaceLanguage: InterfaceLanguage {
@@ -852,6 +893,44 @@ final class Settings: @unchecked Sendable {
     var useGPU: Bool {
         get { defaults.bool(forKey: Self.keyUseGPU) }
         set { defaults.set(newValue, forKey: Self.keyUseGPU) }
+    }
+
+    /// Off / correction (see TextPostprocessingMode's own doc comment for
+    /// why there is no rewrite case yet).
+    var textPostprocessingMode: TextPostprocessingMode {
+        get { normalizedTextPostprocessingMode(rawValue: defaults.string(forKey: Self.keyTextPostprocessingMode)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyTextPostprocessingMode) }
+    }
+
+    var llmEngineBackend: LLMEngineBackend {
+        get { normalizedLLMEngineBackend(rawValue: defaults.string(forKey: Self.keyLLMEngineBackend)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyLLMEngineBackend) }
+    }
+
+    /// Base URL for `.customEndpoint`. Stored verbatim (trimmed); validity
+    /// is checked at the point of use (OpenAICompatibleClient rejects a
+    /// malformed URL per-request) rather than here, so a user can save a
+    /// draft value before finishing it.
+    var llmCustomBaseURL: String {
+        get { defaults.string(forKey: Self.keyLLMCustomBaseURL)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyLLMCustomBaseURL) }
+    }
+
+    /// API key for `.customEndpoint`. NOT stored in the Keychain — this
+    /// mirrors how this app already stores no other secret today (there is
+    /// no existing Keychain integration to extend), and the key only ever
+    /// leaves this Mac in an Authorization header the user's own configured
+    /// endpoint receives. Revisit if a future custom-endpoint feature needs
+    /// stronger at-rest protection than the standard `~/Library/Preferences`
+    /// plist already gets from full-disk encryption.
+    var llmCustomAPIKey: String {
+        get { defaults.string(forKey: Self.keyLLMCustomAPIKey) ?? "" }
+        set { defaults.set(newValue, forKey: Self.keyLLMCustomAPIKey) }
+    }
+
+    var llmCustomModelName: String {
+        get { defaults.string(forKey: Self.keyLLMCustomModelName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyLLMCustomModelName) }
     }
 
     var hasActiveRunMarker: Bool {

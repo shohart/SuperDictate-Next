@@ -44,6 +44,14 @@ swift build -c release --package-path "$ROOT_DIR/swift"
 BIN_DIR="$(swift build -c release --package-path "$ROOT_DIR/swift" --show-bin-path)"
 BIN="$BIN_DIR/Parakey"
 [[ -x "$BIN" ]] || fail "The Swift build did not produce $BIN"
+# SuperDictateLLMHost (Ветка 1/2: local correction-model host) is a
+# SEPARATE product built by the same `swift build` invocation above -- see
+# its own comment in Package.swift for why it's never a dependency of
+# Parakey. Bundled into Contents/Helpers/ (not Contents/MacOS/, which is
+# reserved for the app's own main executable that Launch Services/Dock
+# identify the app by) so LLMHostProcess.swift's
+# resolvedHelperBinaryURL() finds it at runtime.
+LLM_HOST_BIN="$BIN_DIR/SuperDictateLLMHost"
 
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-build.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -51,6 +59,12 @@ STAGE_APP="$STAGE_DIR/SuperDictate.app"
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources"
 cp "$BIN" "$STAGE_APP/Contents/MacOS/SuperDictate"
+if [[ -x "$LLM_HOST_BIN" ]]; then
+    mkdir -p "$STAGE_APP/Contents/Helpers"
+    cp "$LLM_HOST_BIN" "$STAGE_APP/Contents/Helpers/SuperDictateLLMHost"
+else
+    echo "build-app.sh: WARNING: $LLM_HOST_BIN not found -- shipping without the local correction-model helper (text-correction mode will be unavailable in this build)" >&2
+fi
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"

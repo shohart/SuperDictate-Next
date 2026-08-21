@@ -247,6 +247,12 @@ final class RecordingHUDView: NSView {
         let accent: NSColor
         switch mode {
         case .transcribing: accent = transcribingColor
+        // Reuses transcribingColor rather than introducing a fourth
+        // configurable HUD color: correction immediately follows
+        // transcription in the same "processing" family, and the product
+        // ask was for the SAME color already configured for that stage,
+        // just a different animation.
+        case .correcting:   accent = transcribingColor
         case .error:        accent = .systemYellow
         case .recording:    accent = recordingColor
         }
@@ -267,6 +273,10 @@ final class RecordingHUDView: NSView {
         defer { NSGraphicsContext.restoreGraphicsState() }
         if mode == .transcribing {
             drawTranscribingWave(in: capsuleRect, alpha: 1)
+            return
+        }
+        if mode == .correcting {
+            drawCorrectingStars(in: capsuleRect, accent: vividAccent, alpha: 1)
             return
         }
         if mode == .error {
@@ -464,6 +474,59 @@ final class RecordingHUDView: NSView {
             fillColor.withAlphaComponent((0.58 + (0.26 * front) + (0.20 * reversePulse) + (0.14 * conversion)) * alpha).setFill()
             path.fill()
         }
+    }
+    /// Small 4-point sparkles orbiting the capsule center while LLM
+    /// correction runs -- visually distinct from `drawTranscribingWave`'s
+    /// running bars so the popup doesn't read as "still transcribing" once
+    /// correction takes over. `phase` (already scaled by
+    /// RECORDING_HUD_CORRECTING_PHASE_SPEED via recordingHUDPhaseSpeed) drives
+    /// both the orbit and each sparkle's own twinkle/spin, same convention
+    /// the level-bar and transcribing-wave animations already use.
+    private func drawCorrectingStars(in capsuleRect: NSRect, accent: NSColor, alpha: CGFloat) {
+        guard alpha > 0.001 else { return }
+        let visualScale = self.visualScale
+        let starCount = 3
+        let orbitRadius = min(capsuleRect.width, capsuleRect.height) * 0.30
+        let baseStarSize: CGFloat = 3.6 * visualScale
+        let center = NSPoint(x: capsuleRect.midX, y: capsuleRect.midY)
+        let orbitAngle = phase * 0.62
+        for index in 0..<starCount {
+            let i = CGFloat(index)
+            let angle = orbitAngle + ((2 * CGFloat.pi / CGFloat(starCount)) * i)
+            let position = NSPoint(x: center.x + (cos(angle) * orbitRadius),
+                                   y: center.y + (sin(angle) * orbitRadius))
+            let twinkle = (sin((phase * 1.35) + (i * 2.3)) + 1) / 2
+            let starSize = baseStarSize * (0.62 + (0.5 * twinkle))
+            let spin = (phase * 1.4) + (i * 0.9)
+            let star = starPath(center: position, outerRadius: starSize, innerRadius: starSize * 0.42, rotation: spin)
+            let glowDiameter = starSize * 3.4
+            let glowRect = NSRect(x: position.x - (glowDiameter / 2),
+                                  y: position.y - (glowDiameter / 2),
+                                  width: glowDiameter,
+                                  height: glowDiameter)
+            accent.withAlphaComponent((0.10 + (0.16 * twinkle)) * alpha).setFill()
+            NSBezierPath(ovalIn: glowRect).fill()
+            accent.withAlphaComponent((0.55 + (0.40 * twinkle)) * alpha).setFill()
+            star.fill()
+        }
+    }
+    /// A simple concave 4-point star/sparkle polygon, alternating outer and
+    /// inner radius points around `center`, rotated by `rotation` radians.
+    private func starPath(center: NSPoint, outerRadius: CGFloat, innerRadius: CGFloat, rotation: CGFloat) -> NSBezierPath {
+        let path = NSBezierPath()
+        let points = 4
+        for i in 0..<(points * 2) {
+            let radius = i % 2 == 0 ? outerRadius : innerRadius
+            let angle = rotation + (CGFloat(i) * CGFloat.pi / CGFloat(points))
+            let point = NSPoint(x: center.x + (cos(angle) * radius), y: center.y + (sin(angle) * radius))
+            if i == 0 {
+                path.move(to: point)
+            } else {
+                path.line(to: point)
+            }
+        }
+        path.close()
+        return path
     }
     /// Static exclamation mark drawn inside the yellow error capsule.
     private func drawErrorIndicator(in capsuleRect: NSRect) {

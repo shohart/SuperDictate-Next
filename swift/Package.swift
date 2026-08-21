@@ -19,6 +19,11 @@ let package = Package(
     ],
     products: [
         .executable(name: "Parakey", targets: ["Parakey"]),
+        // A SEPARATE executable, deliberately never a dependency of
+        // "Parakey" above -- see the SuperDictateLLMHost target's own
+        // comment below for why (two independently vendored ggml copies
+        // cannot share one linked binary).
+        .executable(name: "SuperDictateLLMHost", targets: ["SuperDictateLLMHost"]),
     ],
     dependencies: [],
     targets: [
@@ -186,6 +191,146 @@ let package = Package(
             // where Bundle.main finds them via the standard search
             // path. Source PNGs live in swift/Resources/ at the repo
             // root, NOT in the SwiftPM target, so SwiftPM never sees them.
+        ),
+        // SuperDictateLLMHost — a minimal, hand-authored OpenAI-compatible
+        // chat-completions HTTP host built on a vendored llama.cpp
+        // (scripts/vendor-llama-cpp.sh; see swift/Sources/llama_cpp_host/
+        // upstream/PROVENANCE.md for the exact pin). Deliberately its OWN
+        // executableTarget/product, NEVER a dependency of "Parakey" above:
+        // this target vendors its own independent copy of ggml (a
+        // different pin than parakeet_cpp/upstream's own, separately
+        // vendored ggml v0.13.0), and SwiftPM statically links a target's
+        // object files straight into whichever executable depends on it —
+        // two independently vendored copies of ggml's flat C symbols
+        // (ggml_init, the ggml_backend_reg singleton, etc.) in the same
+        // linked binary is a guaranteed duplicate-symbol error. Instead,
+        // this ships as its own separate binary in the .app
+        // (Contents/Helpers/SuperDictateLLMHost, see scripts/build-app.sh)
+        // that Parakey spawns as a subprocess and talks to over loopback
+        // HTTP (LLMHostProcess.swift) via the same OpenAI-compatible
+        // client (OpenAICompatibleClient.swift) used for a user-supplied
+        // custom baseURL -- the two ggml copies never share an address
+        // space.
+        .executableTarget(
+            name: "SuperDictateLLMHost",
+            path: "Sources/llama_cpp_host",
+            // Same rationale as parakeet_cpp's own `exclude` for its
+            // ggml-vulkan/vulkan-shaders/ directory: this holds loose
+            // pre-compiled `.spv` binaries (not source), loaded at runtime
+            // by explicit file path (ggml-vulkan-shaders-runtime.cpp), not
+            // compiled in -- and never through SwiftPM `resources:`.
+            // scripts/build-test-app.sh / build-app.sh copy this directory
+            // into the shipped bundle directly.
+            exclude: [
+                "upstream/ggml-vulkan/vulkan-shaders",
+            ],
+            cSettings: [
+                .define("GGML_USE_ACCELERATE"),
+                .define("GGML_USE_CPU"),
+                .define("GGML_USE_BLAS"),
+                .define("GGML_USE_LLAMAFILE"),
+                .define("GGML_BLAS_USE_ACCELERATE"),
+                .define("ACCELERATE_NEW_LAPACK"),
+                .define("ACCELERATE_LAPACK_ILP64"),
+                // Vulkan backend, same GPU the main Parakeet model uses
+                // (parakeet_cpp target above) -- one user-facing "Use GPU"
+                // switch (Settings.useGPU) governs both models' backend at
+                // runtime via `--gpu-layers` (see
+                // LLMHostProcess.swift/superdictate_llm_host_main.cpp);
+                // this define only makes the Vulkan backend available to
+                // register, same as parakeet_cpp's own use of this define.
+                .define("GGML_USE_VULKAN"),
+                .define("LLAMA_VERSION", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .define("LLAMA_COMMIT", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .define("GGML_VERSION", to: "\"0.20.2\""),
+                .define("GGML_COMMIT", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .headerSearchPath("upstream"),
+                .headerSearchPath("upstream/include"),
+                // common/ before src/: common/jinja/*.cpp quote-includes
+                // bare "unicode.h" with no same-directory match, and both
+                // src/ and common/ vendor their OWN same-named-but-
+                // different unicode.h/.cpp (two distinct upstream files) --
+                // search-path order is the only thing disambiguating which
+                // one a common/jinja/ file resolves to for a non-same-
+                // directory quote-include. Files inside src/ itself always
+                // resolve their own "unicode.h" via the same-directory
+                // rule first, so this order never affects them.
+                .headerSearchPath("upstream/common"),
+                .headerSearchPath("upstream/src"),
+                .headerSearchPath("upstream/ggml-cpu"),
+                .headerSearchPath("upstream/ggml-vulkan"),
+                .headerSearchPath("upstream/vendor"),
+                .headerSearchPath("upstream/vendor/cpp-httplib"),
+                // Same Intel-ISA + Vulkan-headers flags as the parakeet_cpp
+                // target — proven on the real target machine.
+                .unsafeFlags([
+                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
+                    "-Wno-ambiguous-macro",
+                    "-I/usr/local/opt/vulkan-headers/include",
+                ]),
+            ],
+            cxxSettings: [
+                .define("GGML_USE_ACCELERATE"),
+                .define("GGML_USE_CPU"),
+                .define("GGML_USE_BLAS"),
+                .define("GGML_USE_LLAMAFILE"),
+                .define("GGML_BLAS_USE_ACCELERATE"),
+                .define("ACCELERATE_NEW_LAPACK"),
+                .define("ACCELERATE_LAPACK_ILP64"),
+                .define("GGML_USE_VULKAN"),
+                .define("LLAMA_VERSION", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .define("LLAMA_COMMIT", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .define("GGML_VERSION", to: "\"0.20.2\""),
+                .define("GGML_COMMIT", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
+                .headerSearchPath("upstream"),
+                .headerSearchPath("upstream/include"),
+                // common/ before src/: common/jinja/*.cpp quote-includes
+                // bare "unicode.h" with no same-directory match, and both
+                // src/ and common/ vendor their OWN same-named-but-
+                // different unicode.h/.cpp (two distinct upstream files) --
+                // search-path order is the only thing disambiguating which
+                // one a common/jinja/ file resolves to for a non-same-
+                // directory quote-include. Files inside src/ itself always
+                // resolve their own "unicode.h" via the same-directory
+                // rule first, so this order never affects them.
+                .headerSearchPath("upstream/common"),
+                .headerSearchPath("upstream/src"),
+                .headerSearchPath("upstream/ggml-cpu"),
+                .headerSearchPath("upstream/ggml-vulkan"),
+                .headerSearchPath("upstream/vendor"),
+                .headerSearchPath("upstream/vendor/cpp-httplib"),
+                .unsafeFlags([
+                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
+                    "-Wno-ambiguous-macro",
+                    "-I/usr/local/opt/vulkan-headers/include",
+                ]),
+            ],
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("Foundation"),
+                // Vulkan/MoltenVK, statically linked -- same approach as
+                // parakeet_cpp (see that target's own linkerSettings
+                // comment): links MoltenVK's static archive directly so
+                // its Vulkan-ABI entry points resolve straight into this
+                // binary, no Khronos loader / Homebrew runtime dependency.
+                .linkedFramework("IOSurface"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreGraphics"),
+                // Unlike parakeet_cpp's own linkerSettings (which gets away
+                // without this), this target's link step failed with
+                // undefined MTLCreateSystemDefaultDevice/MTL* ObjC class
+                // symbols from libMoltenVK.a until Metal was linked
+                // explicitly (verified empirically).
+                .linkedFramework("Metal"),
+                .linkedLibrary("objc"),
+                .linkedLibrary("c++"),
+                .unsafeFlags([
+                    "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
+                ]),
+            ]
         ),
     ],
     cLanguageStandard: .c17,

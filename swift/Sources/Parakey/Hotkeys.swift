@@ -456,6 +456,11 @@ enum HotkeyTransitionAction: Equatable, Sendable {
     /// (transcription in flight). Does NOT flip toggle state. Lets the
     /// app play feedback so the user knows the press was received.
     case rejectedBusyPress
+    /// Global shortcut to flip LLM text correction on/off without opening
+    /// Settings (which would trigger a full background-service restart —
+    /// see LLMPostprocessingCoordinator.scheduleDelayedUnload's own doc
+    /// comment for why this hotkey exists as a separate, restart-free path).
+    case toggleCorrection
 }
 
 struct HotkeyTransitionResult: Equatable, Sendable {
@@ -614,6 +619,7 @@ struct HotkeyTransitionState {
     private var standardShortcutState = HotkeyShortcutState()
     private var enterShortcutState = HotkeyShortcutState()
     private var historyShortcutState = HotkeyShortcutState()
+    private var correctionShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
     /// Previous `isRecording` value seen by `transition(for:...)`, used
@@ -625,6 +631,7 @@ struct HotkeyTransitionState {
         standardShortcutState.reset()
         enterShortcutState.reset()
         historyShortcutState.reset()
+        correctionShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
         wasRecording = false
@@ -647,6 +654,19 @@ struct HotkeyTransitionState {
         alternateCompletionEnabled: Bool = true,
         historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift),
+        // Left Command, deliberately NOT built on Right Command (the
+        // primary dictation key): every other hotkey here (enter, history)
+        // shares Right Command as its base and relies on
+        // HotkeyShortcutState's "adopt the already-held primary modifier"
+        // mechanism, which reacts to ANY event carrying one of a
+        // shortcut's required modifier flags while that base key is held
+        // -- including flags from a DIFFERENT shortcut's chord. A
+        // correction hotkey sharing Right Command would risk firing
+        // mid-recording whenever the user's own configured enter-chord
+        // modifier is pressed (reproduced with the default Right Command +
+        // Control combination during development). A distinct physical
+        // base key sidesteps that whole class of collision.
+        correctionHotkey: HotkeyChoice = hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE),
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
@@ -672,6 +692,10 @@ struct HotkeyTransitionState {
                                                     isRecording: isRecording,
                                                     historyHotkey: historyHotkey) {
             return history
+        }
+
+        if let correction = transitionCorrectionShortcut(for: event, correctionHotkey: correctionHotkey) {
+            return correction
         }
 
         if alternateCompletionEnabled {
@@ -745,6 +769,25 @@ struct HotkeyTransitionState {
         }
     }
 
+    /// Unlike transitionHistoryShortcut, this deliberately does NOT reset
+    /// standardShortcutState/enterShortcutState/toggleActive on press --
+    /// toggling correction is unrelated to an in-progress dictation
+    /// gesture and must not cancel or interfere with one.
+    private mutating func transitionCorrectionShortcut(
+        for event: HotkeyEventSnapshot,
+        correctionHotkey: HotkeyChoice
+    ) -> HotkeyTransitionResult? {
+        let shortcutResult = correctionShortcutState.consume(event, shortcut: correctionHotkey)
+        switch shortcutResult.edge {
+        case .press:
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: [.toggleCorrection])
+        case .release, .suppress:
+            return shortcutResult.suppress ? .suppressOnly : nil
+        case .pass:
+            return nil
+        }
+    }
+
     private mutating func transitionEnterShortcut(
         for event: HotkeyEventSnapshot,
         isRecording: Bool,
@@ -803,6 +846,7 @@ final class HotkeyListener {
     var alternateCompletionEnabled = true
     var historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift)
+    var correctionHotkey: HotkeyChoice = hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE)
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -814,6 +858,7 @@ final class HotkeyListener {
     var onReleaseAlternate: ((TimeInterval) -> Void)?
     var onCancel: (() -> Void)?
     var onShowHistory: (() -> Void)?
+    var onToggleCorrection: (() -> Void)?
     /// Toggle mode: a press arrived while the app is busy (transcription
     /// in flight). The toggle did NOT flip. Play feedback so the user
     /// knows the press was received but rejected.
@@ -911,6 +956,12 @@ final class HotkeyListener {
         log("HotkeyListener: history hotkey changed → \(choice.name)")
     }
 
+    func setCorrectionHotkey(_ choice: HotkeyChoice) {
+        correctionHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: correction toggle hotkey changed → \(choice.name)")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -934,6 +985,7 @@ final class HotkeyListener {
                                                 enterHotkey: enterHotkey,
                                                 alternateCompletionEnabled: alternateCompletionEnabled,
                                                 historyHotkey: historyHotkey,
+                                                correctionHotkey: correctionHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -958,6 +1010,7 @@ final class HotkeyListener {
             case .releaseAlternate: onReleaseAlternate?(detectedAt)
             case .cancel: onCancel?()
             case .showHistory: onShowHistory?()
+            case .toggleCorrection: onToggleCorrection?()
             case .rejectedBusyPress: onRejectedBusyPress?()
             }
         }

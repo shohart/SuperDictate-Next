@@ -164,6 +164,244 @@ func downloadParakeetModelIfNeeded() async throws -> URL {
     return destination
 }
 
+// MARK: - GEC correction model download + checksum verification
+//
+// Same download/verify/atomic-rename shape as downloadParakeetModelIfNeeded
+// above, for the correction-mode model. The ship form is TWO files:
+//
+// 1. Base weights: Qwen3.5-0.8B vanilla Q6_K (bartowski GGUF, pinned
+//    revision), 0.69 GB.
+// 2. A ~2.9 MB LoRA adapter GGUF: VoiceScribe/qwen3-5-0.8b-dictation-
+//    corrector-lora-adapter (V15 R-3), a Russian-dictation-corrector LoRA
+//    trained EXACTLY on this app's task (post-ASR cleanup of Russian
+//    dictation, foreign-term/script normalization гитхаб -> GitHub,
+//    conservative editing policy). The adapter is converted to GGUF once
+//    (upstream llama.cpp convert_lora_to_gguf.py @ the same commit the
+//    llama_cpp_host tree is vendored at, --outtype f32) and committed to
+//    THIS repository at models/gec-lora-adapter.gguf; the app downloads it
+//    from this repo's raw GitHub URL, checksum-pinned like everything else.
+//
+// Model-selection history (all verified empirically against the real
+// SuperDictateLLMHost via curl, see LLMPostprocessingPrompts.swift for the
+// prompt side of the same story):
+//   - loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG (the atom's original pick):
+//     catastrophic forgetting, doesn't know the terms. Rejected.
+//   - vanilla Qwen3.5-0.8B zero-shot: knows terms, no discipline
+//     (hallucinates shell commands). Rejected.
+//   - vanilla Qwen3.5-4B Q6_K + few-shot prompt: good quality, but 3.8 GB
+//     download and multi-second correction latency. Superseded.
+//   - synterr-nlp/bea2026-gec-adapters LoRA: regressed normalization
+//     (English GEC benchmark, not this task). Rejected.
+//   - VoiceScribe dictation-corrector LoRA on Qwen3.5-0.8B (CURRENT):
+//     trained on this exact task; ~2.8 s per correction on CPU (measured),
+//     0.69 GB download, excellent term normalization and request-echo
+//     safety. Known weaknesses, accepted with mitigations: occasionally
+//     drops the input's leading word ("я"/"расскажи"/...) and rarely
+//     hallucinates unfamiliar terms (кубернейтс -> "Cerebral" seen once) —
+//     both are caught by LLMCorrectionGuardrail (leading-word preservation
+//     check) which falls back to the uncorrected input, per this pipeline's
+//     never-lose-text policy. Punctuation fixing is also weaker than the
+//     4B's — accepted: this app already has deterministic punctuation/final
+//     period layers of its own.
+//
+// The adapter is rsLoRA (PEFT use_rslora=true): effective scale is
+// alpha/sqrt(rank) = 80/4 = 20, while llama.cpp's loader computes
+// adapter_scale * alpha/rank — so the host must be launched with
+// --lora-scale 4.0 (4.0 * 80/16 == 20). That constant lives here
+// (GEC_LORA_SCALE) next to the pins it derives from, and is threaded
+// through LLMHostProcess/SuperDictateLLMHost (--lora-scale flag).
+//
+// Pinned to specific revisions, never `main` — same rationale as the
+// Parakeet pin. Downloaded on demand only, exactly once the user enables
+// "Исправлять ошибки" (TextPostprocessingMode.correction) — never bundled
+// into the .app, never fetched eagerly at first launch, matching the
+// Parakeet ASR model's own on-demand policy.
+
+enum GECModelDownloadError: LocalizedError {
+    case checksumMismatch(expected: String, actual: String)
+    case sizeMismatch(expected: Int64, actual: Int64)
+    case downloadFailed(underlying: Error)
+    case httpError(statusCode: Int)
+    case unsafeDestination(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch(let expected, let actual):
+            return "Downloaded GEC model checksum mismatch: expected \(expected), got \(actual)"
+        case .sizeMismatch(let expected, let actual):
+            return "Downloaded GEC model size mismatch: expected \(expected) bytes, got \(actual) bytes"
+        case .downloadFailed(let underlying):
+            return "Failed to download GEC model: \(underlying.localizedDescription)"
+        case .httpError(let statusCode):
+            return "GEC model download failed with HTTP \(statusCode)"
+        case .unsafeDestination(let detail):
+            return "Refusing unsafe GEC model destination: \(detail)"
+        }
+    }
+}
+
+// Base weights: Qwen3.5-0.8B vanilla (NOT Instruct, NOT -Base) Q6_K.
+let GEC_MODEL_REPOSITORY = "bartowski/Qwen_Qwen3.5-0.8B-GGUF"
+let GEC_MODEL_REVISION = "f36b1ea49a332ede8fe5f389bbf5b3575ef71f48"
+let GEC_MODEL_FILENAME = "Qwen_Qwen3.5-0.8B-Q6_K.gguf"
+private let GEC_MODEL_URL = URL(
+    string: "https://huggingface.co/\(GEC_MODEL_REPOSITORY)/resolve/\(GEC_MODEL_REVISION)/\(GEC_MODEL_FILENAME)"
+)!
+// Verified against the actual downloaded bytes (not copied from HF API
+// metadata) — same policy as every other pin in this file.
+let GEC_MODEL_SHA256 = "976220309a81b4eb26462657a77570bc6e7d936e8425161c54d6d85488567f95"
+let GEC_MODEL_SIZE_BYTES: Int64 = 691_461_216
+
+// LoRA adapter GGUF: converted from VoiceScribe/qwen3-5-0.8b-dictation-
+// corrector-lora-adapter @ HF revision 754d90dc5045eb16ff3d95f6e735909daeb4d7c6
+// (safetensors SHA256 46285eb28877df9078c053fb8bfd8c9eb66fa153c0fe47e902188b9aee93bee1)
+// via llama.cpp's convert_lora_to_gguf.py --outtype f32; the conversion
+// output is what's checksum-pinned here. Committed at models/gec-lora-
+// adapter.gguf in this repository and fetched from its raw GitHub URL so
+// there is no third-party host that could 404 or serve different bytes.
+let GEC_LORA_FILENAME = "qwen3.5-0.8b-dictation-corrector-lora.gguf"
+let GEC_LORA_URL = URL(
+    string: "https://github.com/shohart/SuperDictate-Next/raw/feat/llm-postproc-gec/models/gec-lora-adapter.gguf"
+)!
+let GEC_LORA_SHA256 = "7d4b10e098ff38306f13a561d26fc2f945fd9d13bfde7a0c67f4c91bff26617f"
+let GEC_LORA_SIZE_BYTES: Int64 = 2_886_048
+
+/// rsLoRA compensation: llama.cpp applies `adapter_scale * alpha / rank`
+/// (llama-adapter.h get_scale); this adapter was trained with
+/// use_rslora=true, i.e. effective scale `alpha / sqrt(rank)`. For rank 16
+/// the compensating adapter_scale is sqrt(16) = 4.0. Verified empirically:
+/// with the default 1.0 the adapter barely activates (термин-нормализация
+/// отсутствует), with 4.0 the model card's reference behavior reproduces.
+let GEC_LORA_SCALE: Double = 4.0
+
+/// `~/Library/Application Support/SuperDictate/Models/LLM/` — a sibling of
+/// the Parakeet ASR model directory, not inside it: this holds
+/// text-generation GGUF weights for SuperDictateLLMHost, a completely
+/// different runtime (llama_cpp_host) from parakeet_cpp.
+func llmModelCacheDirectory() -> URL {
+    resolvedParakeetSupportDirectory(nil)!
+        .appendingPathComponent("Models", isDirectory: true)
+        .appendingPathComponent("LLM", isDirectory: true)
+}
+
+func gecModelPath() -> URL {
+    llmModelCacheDirectory().appendingPathComponent(GEC_MODEL_FILENAME, isDirectory: false)
+}
+
+func gecLoraPath() -> URL {
+    llmModelCacheDirectory().appendingPathComponent(GEC_LORA_FILENAME, isDirectory: false)
+}
+
+func gecModelCacheExists() -> Bool {
+    func verified(_ path: URL, expectedSize: Int64) -> Bool {
+        guard isPlainRegularFile(path.path) else { return false }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path.path)
+        return (attributes?[.size] as? Int64) == expectedSize
+    }
+    return verified(gecModelPath(), expectedSize: GEC_MODEL_SIZE_BYTES)
+        && verified(gecLoraPath(), expectedSize: GEC_LORA_SIZE_BYTES)
+}
+
+func assertSufficientDiskSpaceForGECModelDownload() throws {
+    let requiredBytes = GEC_MODEL_SIZE_BYTES + GEC_LORA_SIZE_BYTES + MODEL_DOWNLOAD_HEADROOM_BYTES
+    let availableBytes = availableImportantDiskSpaceBytes(containing: llmModelCacheDirectory())
+    guard let availableBytes, availableBytes >= 0, availableBytes < requiredBytes else {
+        return
+    }
+    let detail = """
+    Parakey needs about \(formattedByteCount(UInt64(GEC_MODEL_SIZE_BYTES + GEC_LORA_SIZE_BYTES))) of free disk space to download the correction model.
+
+    Available: \(formattedByteCount(UInt64(availableBytes)))
+    Needed: \(formattedByteCount(UInt64(requiredBytes)))
+
+    Free some disk space, then retry.
+    """
+    throw NSError(domain: "Parakey", code: -9, userInfo: [NSLocalizedDescriptionKey: detail])
+}
+
+/// Shared download/verify/atomic-rename body for both correction-model
+/// files — the exact shape the old single-file downloadGECModelIfNeeded
+/// used, parameterized.
+@discardableResult
+private func downloadGECFileIfNeeded(existingDescription: String,
+                                     destination: URL,
+                                     remoteURL: URL,
+                                     expectedSize: Int64,
+                                     expectedSHA256: String) async throws -> URL {
+    if FileManager.default.fileExists(atPath: destination.path) {
+        guard isPlainRegularFile(destination.path) else {
+            throw GECModelDownloadError.unsafeDestination(
+                "existing cache path is not a plain regular file: \(destination.path)"
+            )
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+        let actualSize = (attributes?[.size] as? Int64) ?? -1
+        if actualSize == expectedSize {
+            let actualHash = try sha256Hex(ofFileAt: destination)
+            if actualHash == expectedSHA256 {
+                return destination
+            }
+        }
+        log("LLM: cached \(existingDescription) failed size/checksum verification; redownloading")
+        try? FileManager.default.removeItem(at: destination)
+    }
+
+    let destinationDirectory = destination.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+
+    let (systemTempURL, response) = try await URLSession.shared.download(from: remoteURL)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        try? FileManager.default.removeItem(at: systemTempURL)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+        throw GECModelDownloadError.httpError(statusCode: code)
+    }
+
+    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
+        ".\(destination.lastPathComponent).download-\(UUID().uuidString)", isDirectory: false
+    )
+    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
+
+    func cleanupTemp() {
+        try? FileManager.default.removeItem(at: sameVolumeTempURL)
+    }
+
+    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
+    let actualSize = (attributes?[.size] as? Int64) ?? -1
+    guard actualSize == expectedSize else {
+        cleanupTemp()
+        throw GECModelDownloadError.sizeMismatch(expected: expectedSize, actual: actualSize)
+    }
+
+    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
+    guard actualHash == expectedSHA256 else {
+        cleanupTemp()
+        throw GECModelDownloadError.checksumMismatch(expected: expectedSHA256, actual: actualHash)
+    }
+
+    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
+    return destination
+}
+
+@discardableResult
+func downloadGECModelIfNeeded() async throws -> URL {
+    try assertSufficientDiskSpaceForGECModelDownload()
+    let base = try await downloadGECFileIfNeeded(
+        existingDescription: "GEC base model",
+        destination: gecModelPath(),
+        remoteURL: GEC_MODEL_URL,
+        expectedSize: GEC_MODEL_SIZE_BYTES,
+        expectedSHA256: GEC_MODEL_SHA256
+    )
+    _ = try await downloadGECFileIfNeeded(
+        existingDescription: "GEC LoRA adapter",
+        destination: gecLoraPath(),
+        remoteURL: GEC_LORA_URL,
+        expectedSize: GEC_LORA_SIZE_BYTES,
+        expectedSHA256: GEC_LORA_SHA256
+    )
+    return base
+}
+
 private func resolvedParakeetSupportDirectory(_ override: URL?) -> URL? {
     override
         ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
@@ -486,6 +724,8 @@ func recordingHUDPhaseSpeed(mode: RecordingHUDMode, level: Float) -> CGFloat {
             + (voiceLevel * RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED)
     case .transcribing:
         return RECORDING_HUD_TRANSCRIBING_PHASE_SPEED
+    case .correcting:
+        return RECORDING_HUD_CORRECTING_PHASE_SPEED
     case .error:
         return 0
     }

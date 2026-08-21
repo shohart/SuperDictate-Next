@@ -178,6 +178,14 @@ enum ParakeySelfTest {
             return runSuite("disabled-custom-filler-words", testDisabledCustomFillerWords)
         case "recording-hud-accent-color-resolved":
             return runSuite("recording-hud-accent-color-resolved", testRecordingHUDAccentColorResolvedColor)
+        case "llm-unload-delay":
+            return runSuite("llm-unload-delay", testLLMPostprocessingDelayedUnload)
+        case "llm-guardrail":
+            return runSuite("llm-guardrail", testLLMCorrectionGuardrail)
+        case "llm-gec":
+            return runSuite("llm-gec", testLLMGECIntegration)
+        case "full-pipeline":
+            return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -241,6 +249,8 @@ enum ParakeySelfTest {
         try testPIDDebouncer()
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
+        try testLLMPostprocessingDelayedUnload()
+        try testLLMCorrectionGuardrail()
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
@@ -829,6 +839,7 @@ enum ParakeySelfTest {
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testHistoryChordShowsOverlay()
         try testConfigurableHistoryShortcut()
+        try testConfigurableCorrectionShortcut()
         try testOptionCommandEnterChordStopsWithEnter()
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
@@ -2921,6 +2932,349 @@ enum ParakeySelfTest {
             equals: true,
             "merge cap warning should state how many corrections a merge would drop"
         )
+    }
+
+    /// Covers LLMPostprocessingCoordinator's scheduleDelayedUnload/
+    /// cancelScheduledUnload (the "unload the correction model 10 minutes
+    /// after it's disabled" feature, ParakeyApp.toggleTextCorrectionMode's
+    /// hotkey path). No real model/host subprocess needed -- LLMHostProcess.
+    /// stop() is a safe no-op when nothing was ever started, so this
+    /// exercises the actor's own scheduling/cancellation/generation logic
+    /// in isolation, using a short overridden delay instead of the real
+    /// 10-minute default. Hermetic and fast enough for `all`.
+    private static func testLLMPostprocessingDelayedUnload() throws {
+        try runParakeetEngineSynchronously {
+            let coordinator = LLMPostprocessingCoordinator()
+
+            // Scheduling sets the pending flag.
+            await coordinator.scheduleDelayedUnload(after: 3600)
+            let scheduled = await coordinator.hasPendingUnloadForTest
+            try expect(scheduled, equals: true, "scheduling an unload should mark one as pending")
+
+            // Cancelling clears it immediately, before the delay elapses.
+            await coordinator.cancelScheduledUnload()
+            let cancelled = await coordinator.hasPendingUnloadForTest
+            try expect(cancelled, equals: false, "cancelling should clear the pending unload")
+
+            // Re-scheduling while a previous one is still pending ("rapid
+            // off/off") must restart the clock, not accumulate a second
+            // in-flight unload racing the first.
+            await coordinator.scheduleDelayedUnload(after: 3600)
+            await coordinator.scheduleDelayedUnload(after: 1)
+            let rescheduled = await coordinator.hasPendingUnloadForTest
+            try expect(rescheduled, equals: true, "re-scheduling should still report a pending unload")
+
+            // Let the short-delayed one actually fire and clear itself.
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            let firedAndCleared = await coordinator.hasPendingUnloadForTest
+            try expect(firedAndCleared, equals: false, "a fired unload should clear the pending flag on its own")
+            let hostRunning = await coordinator.isHostProcessRunningForTest()
+            try expect(hostRunning, equals: false, "stop() on a never-started host process should be a safe no-op")
+
+            await coordinator.stop()
+        }
+    }
+
+    /// Hermetic unit tests for LLMCorrectionGuardrail — the safety net
+    /// against the dictation-corrector model's empirically-observed
+    /// failure modes (dropping the input's leading word, hallucinating
+    /// unfamiliar terms). No model, no network; part of `all`.
+    private static func testLLMCorrectionGuardrail() throws {
+        // editDistance primitive.
+        try expect(LLMCorrectionGuardrail.editDistance("гитхаб", "гитхуб"), equals: 1,
+                   "single substitution should have distance 1")
+        try expect(LLMCorrectionGuardrail.editDistance("abc", "abc"), equals: 0,
+                   "identical strings should have distance 0")
+
+        // Legitimate corrections MUST pass.
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "залей изменения на гит хаб через пул реквест",
+            output: "Залей изменения на GitHub через pull request"), equals: true,
+                   "verbatim leading word (just capitalized) must pass")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "модель скачал с хаггинг фейс",
+            output: "Модель скачал с Hugging Face"), equals: true,
+                   "preserved leading word with later term replacement must pass")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "я завтра пойду в магазин",
+            output: "Я завтра пойду в магазин"), equals: true,
+                   "single-character leading word preserved as a standalone word must pass")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "please send me the report",
+            output: "Please send me the report"), equals: true,
+                   "Latin leading word must pass")
+
+        // Cross-script term replacement of the FIRST word must pass
+        // (fuzzy transliteration: гитхаб vs github→гитхуб, distance 1).
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "гитхаб релиз готов",
+            output: "GitHub релиз готов"), equals: true,
+                   "leading-word term replacement (same word, other script) must pass")
+
+        // Corruptions MUST be rejected.
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "я скачал модель с хаггинг фейс",
+            output: "Скачал модель с Hugging Face"), equals: false,
+                   "dropped single-character leading pronoun must be rejected")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "расскажи как дела",
+            output: "Как дела"), equals: false,
+                   "dropped leading verb must be rejected")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "я задеплоил сервис на кубернейтс",
+            output: "Задеплоил сервис на Cerebral"), equals: false,
+                   "dropped leading word AND hallucinated term must be rejected")
+        // Word-form hallucinations the dictation-corrector model was
+        // observed producing when a repair-inviting few-shot pair was
+        // tried (see LLMPostprocessingPrompts.swift finding 6): the model
+        // invents a form ("Золер", "Золить") instead of repairing
+        // "золей"/"золи". Both are edit-distance 2 from the leading word
+        // (threshold 1) — must be rejected, falling back to the input.
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "золей релизную ветку в мастер",
+            output: "Золер релизную ветку в мастер"), equals: false,
+                   "hallucinated word form (золей → Золер) must be rejected")
+        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
+            input: "золи правки в мастер ветку",
+            output: "Золить правки в мастер ветку"), equals: false,
+                   "hallucinated word form (золи → Золить) must be rejected")
+
+        // sanitizedCorrection behavior on both sides.
+        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
+            input: "расскажи как дела",
+            output: "  Как дела\n"), equals: "расскажи как дела",
+                   "guardrail must revert to the input when the leading word is lost")
+        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
+            input: "залей изменения",
+            output: "  Залей изменения  \n"), equals: "Залей изменения",
+                   "guardrail must return the trimmed correction when it passes")
+        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
+            input: "текст",
+            output: "   "), equals: "текст",
+                   "whitespace-only output must fall back to the input")
+    }
+
+    /// Full pipeline through a REAL downloaded GEC model and a REAL
+    /// SuperDictateLLMHost subprocess (llama_cpp_host) — needs
+    /// SUPERDICTATE_GEC_MODEL set to a local base-model .gguf path (plus
+    /// optionally SUPERDICTATE_GEC_LORA for the LoRA adapter; when unset,
+    /// an adapter already staged in the app's LLM cache directory is used),
+    /// same convention as SUPERDICTATE_PARAKEET_MODEL
+    /// (testParakeetCPUIntegration). NOT part of `all`: downloads/network
+    /// and a multi-second model load are not appropriate for the
+    /// always-on suite.
+    ///
+    /// Exercises the FULL, real pipeline shape (matching ParakeyApp.swift's
+    /// three call sites): processedDictationText (the app's existing
+    /// machine-learned-correction step -- TranscriptCorrector applied
+    /// against a vocabulary entry seeded here to stand in for "the user
+    /// already taught the app this term") THEN
+    /// LLMPostprocessingCoordinator.finalizedText on its output. Foreign-
+    /// term normalization is asserted at THAT layer (the vocabulary), not
+    /// inside the LLM prompt -- see LLMPostprocessingPrompts.swift's own
+    /// doc comment for why a hardcoded dictionary fed to the model was
+    /// tried and rejected. This test only asserts what the model layer
+    /// itself demonstrably does reliably: term/casing correction, and not
+    /// corrupting an already-correct term it's handed.
+    private static func testLLMGECIntegration() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP llm-gec: SUPERDICTATE_GEC_MODEL not set to an existing file")
+            return
+        }
+
+        let coordinator = LLMPostprocessingCoordinator()
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-gec")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.textPostprocessingMode = .correction
+        settings.llmEngineBackend = .bundledLocal
+        // Exercise the SAME Vulkan backend Parakeet uses (atom hardware
+        // target + explicit product requirement: one GPU toggle governs
+        // both models). If no Vulkan device is present this falls back to
+        // CPU inside SuperDictateLLMHost's own backend registry the same
+        // way Parakeet does -- not a hard requirement for this test to
+        // still pass, just the realistic runtime configuration.
+        settings.useGPU = true
+        // Stands in for "the user already corrected this once" -- the
+        // app's real, general normalization mechanism (VocabularyStore
+        // learns from actual user edits; this seeds one entry directly
+        // instead of simulating that UI flow).
+        _ = try settings.vocabularyStore.upsert(source: "дебиан", replacement: "Debian", origin: .manual)
+
+        // finalizedText resolves the model path via gecModelPath()
+        // (Application Support), not an arbitrary path -- point that at
+        // the env-provided fixture for this test run only by staging it
+        // there if not already present, mirroring the on-demand-download
+        // contract without hitting the network. Same for the LoRA adapter
+        // (gecLoraPath): SUPERDICTATE_GEC_LORA overrides, otherwise an
+        // adapter already in the cache is reused.
+        let staged = gecModelPath()
+        if !gecModelCacheExists() {
+            try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: staged.path) {
+                try FileManager.default.removeItem(at: staged)
+            }
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: modelPath), to: staged)
+            if let loraFixture = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_LORA"],
+               FileManager.default.fileExists(atPath: loraFixture) {
+                let stagedLora = gecLoraPath()
+                if FileManager.default.fileExists(atPath: stagedLora.path) {
+                    try FileManager.default.removeItem(at: stagedLora)
+                }
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: loraFixture), to: stagedLora)
+            }
+        }
+        try expect(gecModelCacheExists(), equals: true,
+                   "staged GEC model fixtures should pass the cache size check before use")
+
+        // Step 1: the app's existing deterministic pass (same call
+        // ParakeyApp.swift makes before ever reaching LLM postprocessing).
+        let deterministic = processedDictationText(rawTranscript: "я развернул дебиан сервер",
+                                                    corrections: settings.transcriptCorrections,
+                                                    removeFillerWords: false)
+        try expect(deterministic.text, equals: "я развернул Debian сервер",
+                   "the app's existing vocabulary mechanism should already have normalized дебиан → Debian before the LLM ever sees the text")
+
+        // Step 2: the LLM correction pass on top of that. Note: if the
+        // model drops the leading "я" here, LLMCorrectionGuardrail inside
+        // finalizedText reverts to the input — which still contains the
+        // vocabulary-normalized "Debian", so the assertions below hold
+        // either way (that is the guardrail working as designed, not a
+        // test bypass).
+        let loadStarted = ProcessInfo.processInfo.systemUptime
+        let result1 = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText(deterministic.text, settings: settings)
+        }
+        let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
+        print("LLM GEC: first request (incl. model load) \(String(format: "%.2f", loadSeconds))s, result=\"\(result1)\"")
+        try expect(result1.contains("Debian"), equals: true,
+                   "the LLM pass must not corrupt a term the vocabulary layer already normalized")
+        try expect(result1.isEmpty, equals: false, "correction must never return empty text")
+
+        // Second request on the SAME running host process (load-once
+        // contract, same as ParakeetEngine) -- must not corrupt an
+        // already-Latin term back to Cyrillic.
+        let requestStarted = ProcessInfo.processInfo.systemUptime
+        let result2 = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("Я развернул Debian сервер.", settings: settings)
+        }
+        let requestSeconds = ProcessInfo.processInfo.systemUptime - requestStarted
+        print("LLM GEC: second request \(String(format: "%.2f", requestSeconds))s, result=\"\(result2)\"")
+        try expect(result2.contains("Debian"), equals: true,
+                   "an already-correct Debian must survive the LLM pass unchanged")
+        try expect(result2.contains("дебиан"), equals: false,
+                   "the model must never revert an already-Latin term back to Cyrillic")
+
+        try runParakeetEngineSynchronously { await coordinator.stop() }
+    }
+
+    /// Full end-to-end pipeline through REAL audio, REAL Parakeet ASR, the
+    /// app's REAL deterministic postprocessing (with a fresh, auto-seeded
+    /// vocabulary — a genuinely new install, not a hand-seeded fixture),
+    /// and a REAL LLM correction pass — the exact sequence
+    /// ParakeyApp.swift's own call sites run, exercised without a human
+    /// dictating into a live microphone. Written specifically to catch
+    /// integration bugs BEFORE a build ships for manual testing (this
+    /// project's own standing feedback: don't wait for live human dictation
+    /// to catch mistakes a WAV fixture would have caught first).
+    ///
+    /// Needs SUPERDICTATE_PARAKEET_MODEL (real ASR model), SUPERDICTATE_GEC_MODEL
+    /// (real correction model), and SUPERDICTATE_FULL_PIPELINE_TEST_WAV (a
+    /// 16 kHz mono 16-bit PCM WAV). Regenerate the fixture with:
+    ///   say -v Milena -r 145 "Открой докер и залей изменения на гитхаб." \
+    ///       -o x.aiff && afconvert -f WAVE -d LEI16@16000 -c 1 x.aiff x.wav
+    /// "докер"/"гитхаб" were picked deliberately: the macOS `say` voice's
+    /// pronunciation of "дебиан" was tried first and Parakeet consistently
+    /// mis-transcribed it ("Дебин", "DBN") regardless of sentence context —
+    /// a synthetic-voice artifact confirmed by testing the word in
+    /// isolation, not a pipeline bug (a real human voice says it
+    /// differently; this is a test-fixture limitation, not a product one).
+    /// NOT part of `all` for the same reason the other real-model suites
+    /// aren't: real model loads and real inference, not appropriate for
+    /// the always-on headless suite.
+    private static func testFullDictationPipelineWithLLMCorrection() throws {
+        guard let asrModelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+              FileManager.default.fileExists(atPath: asrModelPath),
+              let gecModelFixturePath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
+              FileManager.default.fileExists(atPath: gecModelFixturePath),
+              let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_FULL_PIPELINE_TEST_WAV"],
+              FileManager.default.fileExists(atPath: wavPath) else {
+            print("SKIP full-pipeline: needs SUPERDICTATE_PARAKEET_MODEL + SUPERDICTATE_GEC_MODEL + SUPERDICTATE_FULL_PIPELINE_TEST_WAV")
+            return
+        }
+
+        let (wavSamples, wavRate) = try loadWavMonoFloat32(path: wavPath)
+        guard wavRate == UInt32(SAMPLE_RATE) else {
+            throw SelfTestFailure.failed("full-pipeline needs a 16 kHz WAV, got \(wavRate) Hz")
+        }
+
+        // Step 1: real ASR, exactly as TranscriptionWorker drives it.
+        let asrEngine = try ParakeetEngine(modelPath: asrModelPath, device: .cpu,
+                                          threadCount: TranscriptionWorker.resolvedParakeetThreadCount())
+        defer { _ = try? runParakeetEngineSynchronously { await asrEngine.shutdown() } }
+        try runParakeetEngineSynchronously { try await asrEngine.warmUp() }
+        let asrStarted = ProcessInfo.processInfo.systemUptime
+        let transcription = try runParakeetEngineSynchronously {
+            try await asrEngine.transcribe(samples: wavSamples)
+        }
+        let asrSeconds = ProcessInfo.processInfo.systemUptime - asrStarted
+        print("FULL PIPELINE: ASR (\(String(format: "%.1f", asrSeconds))s) raw=\"\(transcription.text)\"")
+        try expect(transcription.text.isEmpty, equals: false, "ASR must produce non-empty text for real speech audio")
+
+        // Step 2: the app's REAL deterministic pass, against a FRESH,
+        // empty, on-disk (non-ephemeral) vocabulary store -- a genuinely
+        // new install with zero learned corrections. Deliberately no
+        // seeding: normalizing "докер"/"гитхаб" below with an empty
+        // vocabulary is exactly what proves the LLM layer's own
+        // generalization (not a hardcoded list) is what's actually doing
+        // the normalization work — see LLMPostprocessingPrompts.swift.
+        let tempDBURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("full-pipeline-selftest-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempDBURL) }
+        let vocabularyStore = try VocabularyStore(fileURL: tempDBURL)
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.full-pipeline-\(UUID().uuidString)")!,
+                                vocabularyStore: vocabularyStore)
+        settings.textPostprocessingMode = .correction
+        settings.llmEngineBackend = .bundledLocal
+        settings.useGPU = true
+
+        let deterministic = processedDictationText(rawTranscript: transcription.text,
+                                                    corrections: settings.transcriptCorrections,
+                                                    removeFillerWords: false)
+        print("FULL PIPELINE: deterministic=\"\(deterministic.text)\"")
+
+        // Step 3: stage the GEC model where finalizedText expects it (same
+        // on-demand-download contract as testLLMGECIntegration).
+        let staged = gecModelPath()
+        if !gecModelCacheExists() {
+            try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: staged.path) {
+                try FileManager.default.removeItem(at: staged)
+            }
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: gecModelFixturePath), to: staged)
+        }
+
+        let coordinator = LLMPostprocessingCoordinator()
+        let llmStarted = ProcessInfo.processInfo.systemUptime
+        let final = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText(deterministic.text, settings: settings)
+        }
+        let llmSeconds = ProcessInfo.processInfo.systemUptime - llmStarted
+        print("FULL PIPELINE: LLM (\(String(format: "%.1f", llmSeconds))s) final=\"\(final)\"")
+        try runParakeetEngineSynchronously { await coordinator.stop() }
+
+        try expect(final.isEmpty, equals: false, "the final pipeline output must never be empty for real speech audio")
+        // The fixture WAV dictates a sentence naming Docker and GitHub (see
+        // this test's own doc comment for how to regenerate it). The
+        // vocabulary store is empty, so the deterministic pass leaves both
+        // terms in phonetic Cyrillic -- normalizing them to canonical Latin
+        // form here is entirely the LLM layer's own generalization.
+        for term in ["Docker", "GitHub"] {
+            try expect(final.contains(term), equals: true,
+                       "expected '\(term)' in the final pipeline output, got: \"\(final)\"")
+        }
     }
 
     private static func testVocabularyStore() throws {
@@ -7090,6 +7444,14 @@ enum ParakeySelfTest {
         let enterChord = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                       modifiers: [.maskControl])
         let controlCommand = CGEventFlags.maskControl.rawValue | CGEventFlags.maskCommand.rawValue
+        // This test's own enterChord happens to be built on the same
+        // Right-Command-plus-Control combination as the correction
+        // hotkey's default (see HotkeyListener.correctionHotkey) -- pass a
+        // deliberately distinct one so the two shortcuts' shared
+        // "adopt the held primary modifier" mechanism doesn't race for
+        // this event. Unrelated to what this test actually verifies.
+        let unrelatedCorrectionHotkey = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                     modifiers: [.maskShift, .maskAlternate])
 
         var state = HotkeyTransitionState()
         try expect(
@@ -7098,6 +7460,7 @@ enum ParakeySelfTest {
                                         flags: CGEventFlags.maskCommand.rawValue),
                              hotkey: rightCommand,
                              enterHotkey: enterChord,
+                             correctionHotkey: unrelatedCorrectionHotkey,
                              triggerMode: .hold,
                              isRecording: false),
             equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
@@ -7112,6 +7475,7 @@ enum ParakeySelfTest {
                                         flags: controlCommand),
                              hotkey: rightCommand,
                              enterHotkey: enterChord,
+                             correctionHotkey: unrelatedCorrectionHotkey,
                              triggerMode: .hold,
                              isRecording: true),
             equals: HotkeyTransitionResult(suppress: false, actions: [.releaseAlternate]),
@@ -7334,6 +7698,13 @@ enum ParakeySelfTest {
                            keycode: LEFT_COMMAND_KEYCODE,
                            flags: CGEventFlags.maskCommand.rawValue),
                 hotkey: rightCommand,
+                // This assertion is about history-chord state leakage, not
+                // about the correction hotkey -- which now legitimately
+                // defaults to bare Left Command (HotkeyListener.
+                // correctionHotkey). Point it at an unrelated combination
+                // so it doesn't fire here and mask what this test actually
+                // checks.
+                correctionHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskControl]),
                 triggerMode: .toggle,
                 isRecording: false
             ),
@@ -7432,6 +7803,55 @@ enum ParakeySelfTest {
                              isRecording: true),
             equals: .suppressOnly,
             "a configurable history shortcut should suppress its paired release"
+        )
+    }
+
+    /// Covers the correction-toggle hotkey added alongside
+    /// LLMPostprocessingCoordinator's delayed-unload feature. Its default
+    /// (bare Left Command, HotkeyListener.correctionHotkey) is deliberately
+    /// built on a DIFFERENT physical key than dictation/enter/history (all
+    /// Right Command-based) -- see that default's own doc comment for why
+    /// sharing Right Command caused it to spuriously fire during an
+    /// unrelated custom enter-chord's modifier press during development.
+    private static func testConfigurableCorrectionShortcut() throws {
+        let standard = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        var state = HotkeyTransitionState()
+
+        // Deliberately unrelated to dictation -- fires even mid-recording,
+        // and must not disturb it (no reset of the recording/enter state).
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: LEFT_COMMAND_KEYCODE,
+                                        flags: CGEventFlags.maskCommand.rawValue),
+                             hotkey: standard,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.toggleCorrection]),
+            "the default correction hotkey (bare Left Command) should fire even mid-recording"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: LEFT_COMMAND_KEYCODE,
+                                        flags: 0),
+                             hotkey: standard,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: .suppressOnly,
+            "the correction hotkey's release should be suppressed, not passed through"
+        )
+
+        // A user-configured (non-default, non-modifier) correction
+        // shortcut also works, independent of the dictation hotkey.
+        var customState = HotkeyTransitionState()
+        let customCorrection = hotkeyChoice(forKeycode: 96)
+        try expect(
+            customState.transition(for: event(.keyDown, keycode: 96),
+                                   hotkey: standard,
+                                   correctionHotkey: customCorrection,
+                                   triggerMode: .hold,
+                                   isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.toggleCorrection]),
+            "a user-configured correction shortcut should fire"
         )
     }
 

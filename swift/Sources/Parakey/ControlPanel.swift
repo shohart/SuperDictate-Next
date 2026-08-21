@@ -49,12 +49,14 @@ enum ControlPanelShortcutKind: Int {
     case dictation = 0
     case alternateCompletion = 1
     case history = 2
+    case correction = 3
 }
 
 struct ControlPanelSettingsDraft: Equatable {
     var dictationHotkey: HotkeyChoice
     var alternateCompletionHotkey: HotkeyChoice
     var historyHotkey: HotkeyChoice
+    var correctionHotkey: HotkeyChoice
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
     var enterDelayMilliseconds: Int
@@ -74,11 +76,17 @@ struct ControlPanelSettingsDraft: Equatable {
     var autoStopSilenceSeconds: Int
     var muteWhileRecording: Bool
     var autoLearnVocabularyEnabled: Bool
+    var textPostprocessingMode: TextPostprocessingMode
+    var llmEngineBackend: LLMEngineBackend
+    var llmCustomBaseURL: String
+    var llmCustomAPIKey: String
+    var llmCustomModelName: String
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
         alternateCompletionHotkey = settings.configuredEnterHotkey
         historyHotkey = settings.configuredHistoryHotkey
+        correctionHotkey = settings.configuredCorrectionHotkey
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
@@ -99,6 +107,11 @@ struct ControlPanelSettingsDraft: Equatable {
         autoStopSilenceSeconds = settings.autoStopSilenceSeconds
         muteWhileRecording = settings.muteWhileRecording
         autoLearnVocabularyEnabled = settings.autoLearnVocabularyEnabled
+        textPostprocessingMode = settings.textPostprocessingMode
+        llmEngineBackend = settings.llmEngineBackend
+        llmCustomBaseURL = settings.llmCustomBaseURL
+        llmCustomAPIKey = settings.llmCustomAPIKey
+        llmCustomModelName = settings.llmCustomModelName
     }
 }
 
@@ -125,16 +138,26 @@ enum ControlPanelUpdateState: Equatable, Sendable {
     case failed(String)
 }
 
+/// Transient, window-local download progress for the bundled GEC model —
+/// deliberately not part of `ControlPanelSettingsDraft` (not a setting,
+/// never persisted, never compared for unsaved-changes).
+enum LLMModelDownloadState: Equatable {
+    case idle
+    case downloading
+    case failed(String)
+}
+
 private enum SettingsTab: Int, CaseIterable {
     case dictation
     case text
+    case correction
     case audio
     case appearance
     case system
 }
 
 @MainActor
-final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
     private lazy var vocabularyManagerWindowController = VocabularyManagerWindowController(store: Settings.shared.vocabularyStore)
@@ -151,6 +174,11 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private weak var settingsSaveButton: NSButton?
     private weak var settingsDiscardButton: NSButton?
     private weak var settingsStatusLabel: NSTextField?
+    private var llmModelDownloadState: LLMModelDownloadState = .idle
+    private var llmModelDownloadTask: Task<Void, Never>?
+    static let llmCustomBaseURLFieldTag = 9001
+    static let llmCustomAPIKeyFieldTag = 9002
+    static let llmCustomModelNameFieldTag = 9003
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -596,6 +624,25 @@ case .text:
             content.addArrangedSubview(correctionsInfoRow())
             content.addArrangedSubview(autoLearnVocabularyRow(draft))
 
+        case .correction:
+            content.addArrangedSubview(llmCorrectionModeRow(draft))
+            content.addArrangedSubview(hotkeyRow(
+                title: t("Переключить коррекцию", "Toggle correction"),
+                shortcut: draft.correctionHotkey,
+                kind: .correction,
+                toolTip: t("Включить или выключить коррекцию без открытия настроек.",
+                           "Turn correction on or off without opening Settings.")
+            ))
+            if draft.textPostprocessingMode == .correction {
+                content.addArrangedSubview(llmEngineBackendRow(draft))
+                switch draft.llmEngineBackend {
+                case .bundledLocal:
+                    content.addArrangedSubview(llmBundledModelStatusRow())
+                case .customEndpoint:
+                    content.addArrangedSubview(llmCustomEndpointRows(draft))
+                }
+            }
+
         case .audio:
             content.addArrangedSubview(microphoneSettingsRow(draft))
             content.addArrangedSubview(muteWhileRecordingRow(draft))
@@ -669,6 +716,7 @@ case .text:
         switch tab {
         case .dictation: return t("Диктовка", "Dictation")
         case .text: return t("Текст", "Text")
+        case .correction: return t("Коррекция", "Correction")
         case .audio: return t("Аудио", "Audio")
         case .appearance: return t("Внешний вид", "Appearance")
         case .system: return t("Система", "System")
@@ -1834,6 +1882,242 @@ header.addArrangedSubview(panelLabel(
         vocabularyManagerWindowController.show()
     }
 
+    // MARK: - LLM correction (Correction tab)
+    //
+    // Local memory atom a81da166-460a-467e-ae78-f53667069cb0: a small
+    // local (or user-supplied OpenAI-compatible) model corrects
+    // spelling/punctuation/casing/foreign-term script after ASR, without
+    // rewriting style. This UI only edits settings (persisted on Save &
+    // Restart, like every other tab) plus drives the model download
+    // directly in THIS process — downloading a file needs no background
+    // dictation service. `llmModelDownloadState` is separate from
+    // `settingsDraft` on purpose: it's this window's own transient
+    // progress, never persisted, never part of the has-unsaved-changes
+    // comparison.
+
+    private func llmCorrectionModeRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Исправлять ошибки распознавания", "Correct recognition errors"),
+            size: 13,
+            weight: .semibold
+        ))
+        let modeDescription = panelLabel(
+            t("Локальная модель поверх обычных исправлений: орфография, пунктуация, регистр и написание иностранных терминов. Стиль и смысл текста не меняются.",
+              "A local model layered on top of the regular corrections: spelling, punctuation, casing, and foreign-term spelling. Style and meaning are never changed."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        modeDescription.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(modeDescription)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleLLMCorrectionMode(_:))
+        toggle.state = draft.textPostprocessingMode == .correction ? .on : .off
+        toggle.toolTip = t("Включить коррекцию текста локальной моделью.",
+                           "Enable text correction by a local model.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func llmEngineBackendRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Движок", "Engine"),
+            detail: t("Встроенная модель работает полностью локально. Свой сервер — любой OpenAI-совместимый эндпоинт (например llama-server).",
+                      "The built-in model runs fully locally. A custom server is any OpenAI-compatible endpoint (e.g. llama-server)."),
+            selectedValue: draft.llmEngineBackend.rawValue,
+            options: [
+                (t("Встроенная (локально)", "Built-in (local)"), LLMEngineBackend.bundledLocal.rawValue),
+                (t("Свой сервер", "Custom server"), LLMEngineBackend.customEndpoint.rawValue),
+            ],
+            action: #selector(selectLLMEngineBackend(_:)),
+            toolTip: t("Выбрать, где выполняется коррекция текста.", "Choose where text correction runs.")
+        )
+    }
+
+    private func llmBundledModelStatusRow() -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Модель коррекции", "Correction model"),
+            size: 13,
+            weight: .semibold
+        ))
+
+        let modelReady = gecModelCacheExists()
+        let statusText: String
+        let statusColor: NSColor
+        switch llmModelDownloadState {
+        case .downloading:
+            statusText = t("Скачивание…", "Downloading…")
+            statusColor = .systemBlue
+        case .failed(let message):
+            statusText = message
+            statusColor = .systemRed
+        case .idle:
+            statusText = modelReady
+                ? t("Готова (Qwen3.5 0.8B Q6_K + корректор LoRA, ~0,7 ГБ)",
+                    "Ready (Qwen3.5 0.8B Q6_K + corrector LoRA, ~0.7 GB)")
+                : t("Не скачана (~0,7 ГБ)", "Not downloaded (~0.7 GB)")
+            statusColor = modelReady ? .systemGreen : .secondaryLabelColor
+        }
+        let statusLabel = panelLabel(statusText, size: 12, color: statusColor)
+        text.addArrangedSubview(statusLabel)
+
+        let button: NSButton
+        switch llmModelDownloadState {
+        case .downloading:
+            button = panelButton(t("Отменить", "Cancel"), action: #selector(cancelLLMModelDownload(_:)))
+        case .failed, .idle:
+            button = panelButton(
+                modelReady ? t("Скачать заново", "Re-download") : t("Скачать", "Download"),
+                action: #selector(startLLMModelDownload(_:))
+            )
+        }
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(button)
+        container.addArrangedSubview(row)
+
+        if case .downloading = llmModelDownloadState {
+            let progressBar = NSProgressIndicator()
+            progressBar.style = .bar
+            progressBar.controlSize = .small
+            progressBar.isIndeterminate = true
+            progressBar.startAnimation(nil)
+            progressBar.translatesAutoresizingMaskIntoConstraints = false
+            progressBar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+            container.addArrangedSubview(progressBar)
+            progressBar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        }
+
+        return container
+    }
+
+    private func llmCustomEndpointRows(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        func fieldRow(title: String, placeholder: String, value: String, tag: Int, secure: Bool) -> NSView {
+            let row = NSStackView()
+            row.orientation = .vertical
+            row.alignment = .leading
+            row.spacing = 3
+            row.addArrangedSubview(panelLabel(title, size: 12, weight: .medium, color: .secondaryLabelColor))
+
+            let field: NSTextField = secure ? NSSecureTextField() : NSTextField()
+            field.placeholderString = placeholder
+            field.stringValue = value
+            field.tag = tag
+            field.delegate = self
+            field.translatesAutoresizingMaskIntoConstraints = false
+            row.addArrangedSubview(field)
+            field.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+            return row
+        }
+
+        container.addArrangedSubview(fieldRow(
+            title: t("Базовый URL (OpenAI-совместимый)", "Base URL (OpenAI-compatible)"),
+            placeholder: "http://127.0.0.1:8080",
+            value: draft.llmCustomBaseURL,
+            tag: Self.llmCustomBaseURLFieldTag,
+            secure: false
+        ))
+        container.addArrangedSubview(fieldRow(
+            title: t("API-ключ (необязательно)", "API key (optional)"),
+            placeholder: "",
+            value: draft.llmCustomAPIKey,
+            tag: Self.llmCustomAPIKeyFieldTag,
+            secure: true
+        ))
+        container.addArrangedSubview(fieldRow(
+            title: t("Имя модели", "Model name"),
+            placeholder: "gpt-4o-mini",
+            value: draft.llmCustomModelName,
+            tag: Self.llmCustomModelNameFieldTag,
+            secure: false
+        ))
+
+        NSLayoutConstraint.activate(container.arrangedSubviews.map {
+            $0.widthAnchor.constraint(equalTo: container.widthAnchor)
+        })
+        return container
+    }
+
+    @objc private func toggleLLMCorrectionMode(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.textPostprocessingMode = sender.state == .on ? .correction : .off
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectLLMEngineBackend(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let backend = LLMEngineBackend(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.llmEngineBackend = backend
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func startLLMModelDownload(_ sender: NSButton) {
+        guard llmModelDownloadTask == nil else { return }
+        llmModelDownloadState = .downloading
+        refreshSettingsWindow()
+        llmModelDownloadTask = Task { [weak self] in
+            do {
+                _ = try await downloadGECModelIfNeeded()
+                guard let self, !Task.isCancelled else { return }
+                self.llmModelDownloadState = .idle
+            } catch is CancellationError {
+            } catch {
+                guard let self else { return }
+                self.llmModelDownloadState = .failed(
+                    self.t("Не удалось скачать модель: \(error.localizedDescription)",
+                          "Couldn't download the model: \(error.localizedDescription)")
+                )
+            }
+            guard let self else { return }
+            self.llmModelDownloadTask = nil
+            self.refreshSettingsWindow()
+        }
+    }
+
+    @objc private func cancelLLMModelDownload(_ sender: NSButton) {
+        llmModelDownloadTask?.cancel()
+        llmModelDownloadTask = nil
+        llmModelDownloadState = .idle
+        refreshSettingsWindow()
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -1952,7 +2236,9 @@ header.addArrangedSubview(panelLabel(
         text.alignment = .leading
         text.spacing = 3
         text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
-        text.addArrangedSubview(panelLabel(detail, size: 12, color: .secondaryLabelColor))
+        let detailLabel = panelLabel(detail, size: 12, color: .secondaryLabelColor)
+        detailLabel.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detailLabel)
 
         let popup = NSPopUpButton()
         popup.target = self
@@ -2046,18 +2332,21 @@ header.addArrangedSubview(panelLabel(
         let shortcutPairs: [(HotkeyChoice, HotkeyChoice, Bool)] = {
             var pairs: [(HotkeyChoice, HotkeyChoice, Bool)] = [
                 (draft.dictationHotkey, draft.historyHotkey, true),
+                (draft.dictationHotkey, draft.correctionHotkey, true),
+                (draft.correctionHotkey, draft.historyHotkey, true),
             ]
             if draft.alternateCompletionEnabled {
                 pairs.append((draft.dictationHotkey, draft.alternateCompletionHotkey, false))
                 pairs.append((draft.alternateCompletionHotkey, draft.historyHotkey, true))
+                pairs.append((draft.correctionHotkey, draft.alternateCompletionHotkey, true))
             }
             return pairs
         }()
 
         for (first, second, allowModifierPrefix) in shortcutPairs {
                 if hotkeysConflict(first, second) {
-                    return t("Сочетания для диктовки, завершения и истории должны отличаться.",
-                             "Dictation, finish, and history shortcuts must be different.")
+                    return t("Сочетания для диктовки, завершения, истории и коррекции должны отличаться.",
+                             "Dictation, finish, history, and correction shortcuts must be different.")
                 }
                 if allowModifierPrefix == false,
                    (hotkeyIsModifierPrefix(first, of: second)
@@ -2481,6 +2770,8 @@ header.addArrangedSubview(panelLabel(
             recorderTitle = t("Дополнительное сочетание завершения", "Alternative Finish Shortcut")
         case .history:
             recorderTitle = t("Новое сочетание для истории", "New History Shortcut")
+        case .correction:
+            recorderTitle = t("Новое сочетание для коррекции", "New Correction Shortcut")
         }
         let recorder = HotkeyRecorderController(language: language,
                                                 titleOverride: recorderTitle) { [weak self] selected in
@@ -2498,6 +2789,7 @@ header.addArrangedSubview(panelLabel(
             case .dictation: draft.dictationHotkey = selected
             case .alternateCompletion: draft.alternateCompletionHotkey = selected
             case .history: draft.historyHotkey = selected
+            case .correction: draft.correctionHotkey = selected
             }
             self.settingsDraft = draft
             self.refreshSettingsWindow()
@@ -2728,12 +3020,36 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
+    /// Live-updates the draft as the user types in the custom-endpoint
+    /// fields (llmCustomEndpointRows). Deliberately does NOT call
+    /// `refreshSettingsWindow()` -- that rebuilds the whole tab content
+    /// view and would drop keyboard focus on every keystroke. Only the
+    /// Save/Discard button state needs to react live, and
+    /// `updateSettingsSaveState()` already does that without a rebuild.
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        switch field.tag {
+        case Self.llmCustomBaseURLFieldTag:
+            draft.llmCustomBaseURL = field.stringValue
+        case Self.llmCustomAPIKeyFieldTag:
+            draft.llmCustomAPIKey = field.stringValue
+        case Self.llmCustomModelNameFieldTag:
+            draft.llmCustomModelName = field.stringValue
+        default:
+            return
+        }
+        settingsDraft = draft
+        updateSettingsSaveState()
+    }
+
     @objc private func saveSettingsClicked(_ sender: NSButton) {
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
         settings.setConfiguredHotkey(draft.dictationHotkey)
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
+        settings.setConfiguredCorrectionHotkey(draft.correctionHotkey)
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
@@ -2752,6 +3068,11 @@ header.addArrangedSubview(panelLabel(
         settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
         settings.muteWhileRecording = draft.muteWhileRecording
         settings.autoLearnVocabularyEnabled = draft.autoLearnVocabularyEnabled
+        settings.textPostprocessingMode = draft.textPostprocessingMode
+        settings.llmEngineBackend = draft.llmEngineBackend
+        settings.llmCustomBaseURL = draft.llmCustomBaseURL
+        settings.llmCustomAPIKey = draft.llmCustomAPIKey
+        settings.llmCustomModelName = draft.llmCustomModelName
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
