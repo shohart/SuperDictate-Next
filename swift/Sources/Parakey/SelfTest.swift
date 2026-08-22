@@ -182,8 +182,12 @@ enum ParakeySelfTest {
             return runSuite("llm-unload-delay", testLLMPostprocessingDelayedUnload)
         case "llm-guardrail":
             return runSuite("llm-guardrail", testLLMCorrectionGuardrail)
+        case "llm-rewrite-settings":
+            return runSuite("llm-rewrite-settings", testRewriteAndTierSettings)
         case "llm-gec":
             return runSuite("llm-gec", testLLMGECIntegration)
+        case "llm-rewrite":
+            return runSuite("llm-rewrite", testLLMRewriteIntegration)
         case "full-pipeline":
             return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
         case "all":
@@ -251,6 +255,7 @@ enum ParakeySelfTest {
         try testParakeetTranscriptRepair()
         try testLLMPostprocessingDelayedUnload()
         try testLLMCorrectionGuardrail()
+        try testRewriteAndTierSettings()
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
@@ -2943,11 +2948,15 @@ enum ParakeySelfTest {
     /// in isolation, using a short overridden delay instead of the real
     /// 10-minute default. Hermetic and fast enough for `all`.
     private static func testLLMPostprocessingDelayedUnload() throws {
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-unload-delay")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.textPostprocessingMode = .off
+        settings.rewriteEnabled = false
         try runParakeetEngineSynchronously {
             let coordinator = LLMPostprocessingCoordinator()
 
             // Scheduling sets the pending flag.
-            await coordinator.scheduleDelayedUnload(after: 3600)
+            await coordinator.scheduleDelayedUnload(after: 3600, settings: settings)
             let scheduled = await coordinator.hasPendingUnloadForTest
             try expect(scheduled, equals: true, "scheduling an unload should mark one as pending")
 
@@ -2959,8 +2968,8 @@ enum ParakeySelfTest {
             // Re-scheduling while a previous one is still pending ("rapid
             // off/off") must restart the clock, not accumulate a second
             // in-flight unload racing the first.
-            await coordinator.scheduleDelayedUnload(after: 3600)
-            await coordinator.scheduleDelayedUnload(after: 1)
+            await coordinator.scheduleDelayedUnload(after: 3600, settings: settings)
+            await coordinator.scheduleDelayedUnload(after: 1, settings: settings)
             let rescheduled = await coordinator.hasPendingUnloadForTest
             try expect(rescheduled, equals: true, "re-scheduling should still report a pending unload")
 
@@ -3275,6 +3284,232 @@ enum ParakeySelfTest {
             try expect(final.contains(term), equals: true,
                        "expected '\(term)' in the final pipeline output, got: \"\(final)\"")
         }
+    }
+
+    /// Hermetic coverage for the tiered-correction + rewrite settings and
+    /// pipeline plumbing (docs/specs/rewrite-tiered-correction-spec.md):
+    /// defaults, corruption-tolerant normalization, correction/rewrite
+    /// toggle independence, host-identity sharing between the quality tier
+    /// and bundled rewrite, neededHostIdentities (the delayed-unload
+    /// keep-set), and per-tier/per-style prompt selection. No model, no
+    /// network; part of `all`.
+    private static func testRewriteAndTierSettings() throws {
+        func freshSettings() -> Settings {
+            Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-\(UUID().uuidString)")!,
+                     vocabularyStore: .inMemoryFallback())
+        }
+
+        // Defaults: fast tier (the branch's fixed VoiceScribe choice),
+        // rewrite off, polish style, bundled rewrite backend, empty custom
+        // endpoint fields.
+        do {
+            let settings = freshSettings()
+            try expect(settings.correctionModelTier, equals: .fast,
+                       "fresh install must default to the fast (VoiceScribe) correction tier")
+            try expect(settings.rewriteEnabled, equals: false,
+                       "rewrite must be off by default")
+            try expect(settings.rewriteStyle, equals: .polish,
+                       "polish must be the default rewrite style")
+            try expect(settings.rewriteEngineBackend, equals: .bundledLocal,
+                       "bundled local must be the default rewrite backend")
+            try expect(settings.rewriteCustomBaseURL.isEmpty && settings.rewriteCustomAPIKey.isEmpty && settings.rewriteCustomModelName.isEmpty,
+                       equals: true,
+                       "rewrite custom endpoint fields must start empty")
+        }
+
+        // Corruption tolerance: unknown stored values fall back to defaults.
+        do {
+            let defaults = UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-corrupt-\(UUID().uuidString)")!
+            defaults.set("yolo", forKey: "correction_model_tier_v1")
+            defaults.set("ultra", forKey: "rewrite_style_v1")
+            defaults.set("quantum", forKey: "rewrite_engine_backend_v1")
+            let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
+            try expect(settings.correctionModelTier, equals: .fast, "unknown tier raw value must normalize to .fast")
+            try expect(settings.rewriteStyle, equals: .polish, "unknown style raw value must normalize to .polish")
+            try expect(settings.rewriteEngineBackend, equals: .bundledLocal, "unknown backend raw value must normalize to .bundledLocal")
+        }
+
+        // Toggle independence: flipping rewrite never touches correction
+        // and vice versa — the decoupling the spec mandates (§1.4).
+        do {
+            let settings = freshSettings()
+            settings.rewriteEnabled = true
+            try expect(settings.textPostprocessingMode, equals: .off,
+                       "enabling rewrite must NOT enable correction")
+            settings.textPostprocessingMode = .correction
+            try expect(settings.rewriteEnabled, equals: true,
+                       "enabling correction must NOT disable rewrite")
+            settings.textPostprocessingMode = .off
+            try expect(settings.rewriteEnabled, equals: true,
+                       "disabling correction must NOT disable rewrite")
+            // Endpoint independence: correction and rewrite endpoint fields
+            // hold separate values.
+            settings.llmCustomBaseURL = "http://correction.local:8080"
+            settings.rewriteCustomBaseURL = "http://rewrite.local:8081"
+            settings.llmCustomModelName = "correction-model"
+            settings.rewriteCustomModelName = "rewrite-model"
+            try expect(settings.llmCustomBaseURL, equals: "http://correction.local:8080",
+                       "correction endpoint URL must be independent from rewrite's")
+            try expect(settings.rewriteCustomBaseURL, equals: "http://rewrite.local:8081",
+                       "rewrite endpoint URL must be independent from correction's")
+            try expect(settings.llmCustomModelName != settings.rewriteCustomModelName, equals: true,
+                       "the two endpoint model names must stay separate values")
+        }
+
+        // Host identities: the quality correction tier and bundled rewrite
+        // SHARE one YandexGPT host; the fast tier is a distinct host.
+        do {
+            let fast = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .fast)
+            let quality = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .quality)
+            let rewrite = LLMPostprocessingCoordinator.rewriteHostIdentity()
+            try expect(fast != quality, equals: true,
+                       "fast and quality correction tiers must map to different host identities")
+            try expect(quality == rewrite, equals: true,
+                       "quality correction and bundled rewrite must share one YandexGPT host identity")
+        }
+
+        // neededHostIdentities (the delayed-unload keep-set) across the
+        // enabled-function matrix.
+        do {
+            let settings = freshSettings()
+
+            settings.textPostprocessingMode = .off
+            settings.rewriteEnabled = false
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).isEmpty, equals: true,
+                       "nothing enabled → no bundled hosts needed")
+
+            settings.textPostprocessingMode = .correction
+            settings.llmEngineBackend = .bundledLocal
+            settings.correctionModelTier = .fast
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
+                       "fast correction alone needs exactly its own host")
+
+            settings.rewriteEnabled = true
+            settings.rewriteEngineBackend = .bundledLocal
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 2,
+                       "fast correction + bundled rewrite need two hosts")
+
+            settings.correctionModelTier = .quality
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
+                       "quality correction + bundled rewrite share ONE YandexGPT host")
+
+            settings.textPostprocessingMode = .off
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
+                       "rewrite alone keeps the shared YandexGPT host (correction toggle-off must not unload it)")
+
+            settings.rewriteEngineBackend = .customEndpoint
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).isEmpty, equals: true,
+                       "custom-endpoint rewrite needs no bundled host")
+
+            settings.textPostprocessingMode = .correction
+            settings.llmEngineBackend = .customEndpoint
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).isEmpty, equals: true,
+                       "custom-endpoint correction needs no bundled host")
+        }
+
+        // Prompt selection: fast tier keeps the VoiceScribe-tuned few-shot
+        // prompt; quality tier gets the benchmark zero-shot prompt; rewrite
+        // prompts carry their mode instructions and «Режим:» user suffix.
+        do {
+            let fastPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], tier: .fast)
+            let qualityPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], tier: .quality)
+            try expect(fastPrompt.contains("Корректор русской диктовки"), equals: true,
+                       "fast tier must keep the VoiceScribe-tuned correction prompt")
+            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], tier: .fast).count, equals: 8,
+                       "fast tier must keep its 4 few-shot pairs (8 user+assistant messages)")
+            try expect(qualityPrompt.contains("минимальный корректор"), equals: true,
+                       "quality tier must use the benchmark-validated zero-shot prompt")
+            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], tier: .quality).isEmpty, equals: true,
+                       "quality tier must be zero-shot (benchmark configuration)")
+
+            let polish = LLMRewritePrompt.systemPrompt(style: .polish)
+            try expect(polish.contains("повторы"), equals: true, "polish prompt must instruct repeat removal")
+            let task = LLMRewritePrompt.systemPrompt(style: .structuredTask)
+            try expect(task.contains("структурированную"), equals: true, "task prompt must instruct structuring")
+            let official = LLMRewritePrompt.systemPrompt(style: .official)
+            try expect(official.contains("формальным"), equals: true, "official prompt must instruct formal register")
+            for (style, token) in [(RewriteStyle.polish, "POLISH"),
+                                   (RewriteStyle.structuredTask, "AGENT_TASK"),
+                                   (RewriteStyle.official, "FORMAL")] {
+                let user = LLMRewritePrompt.userText(for: "текст", style: style)
+                try expect(user.hasSuffix("\n\nРежим: \(token)"), equals: true,
+                           "rewrite user turn must carry the benchmark «Режим: \(token)» suffix")
+            }
+            // Every style shares the fact-preservation base.
+            for style in RewriteStyle.allCases {
+                try expect(LLMRewritePrompt.systemPrompt(style: style).contains("Не добавляй новых фактов"), equals: true,
+                           "every rewrite style must keep the fact-preservation base")
+            }
+        }
+    }
+
+    /// Rewrite integration through the REAL YandexGPT-5-Lite-8B model and
+    /// a REAL SuperDictateLLMHost subprocess — needs
+    /// SUPERDICTATE_YANDEXGPT_MODEL set to a local copy of
+    /// YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf (the benchmark copy at
+    /// benchmark/models/ works), same convention as llm-gec's
+    /// SUPERDICTATE_GEC_MODEL. NOT part of `all`: a multi-second 4.9 GB
+    /// model load is not appropriate for the always-on suite.
+    private static func testLLMRewriteIntegration() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_YANDEXGPT_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP llm-rewrite: SUPERDICTATE_YANDEXGPT_MODEL not set to an existing file")
+            return
+        }
+
+        let coordinator = LLMPostprocessingCoordinator()
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-rewrite")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.rewriteEnabled = true
+        settings.rewriteEngineBackend = .bundledLocal
+        settings.useGPU = true
+
+        // finalizedText resolves the rewrite model path via
+        // yandexGPTModelPath() (Application Support) — stage the env
+        // fixture there if not already present, mirroring the on-demand
+        // download contract without hitting the network.
+        let staged = yandexGPTModelPath()
+        if !yandexGPTModelCacheExists() {
+            try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: staged.path) {
+                try FileManager.default.removeItem(at: staged)
+            }
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: modelPath), to: staged)
+        }
+        try expect(yandexGPTModelCacheExists(), equals: true,
+                   "staged YandexGPT fixture should pass the cache size check before use")
+
+        // One representative input per style, shaped like the benchmark's
+        // rewrite corpus (free-flowing dictated Russian with repeats,
+        // filler segments, buried facts).
+        let cases: [(style: RewriteStyle, input: String)] = [
+            (.polish,
+             "я вчера ездил к бабушке она попросила помочь с телефоном там ватсап не открывался я переустановил ватсап и все заработало"),
+            (.structuredTask,
+             "напиши скрипт на пайтон который проходит по папке загрузки и раскидывает файлы по расширениям картинки в папку пикчерз документы в докс остальное в миск лог действий в консоль"),
+            (.official,
+             "ну слушай скажи клиенту что договор мы подпишем не раньше двадцать пятого мая потому что бухгалтерия не закрыла акты за апрель"),
+        ]
+
+        let totalStarted = ProcessInfo.processInfo.systemUptime
+        for testCase in cases {
+            settings.rewriteStyle = testCase.style
+            let started = ProcessInfo.processInfo.systemUptime
+            let result = try runParakeetEngineSynchronously {
+                await coordinator.finalizedText(testCase.input, settings: settings)
+            }
+            let seconds = ProcessInfo.processInfo.systemUptime - started
+            print("LLM REWRITE [\(testCase.style.rawValue)] \(String(format: "%.2f", seconds))s in=\"\(testCase.input.prefix(60))…\" out=\"\(result)\"")
+            try expect(result.isEmpty, equals: false,
+                       "rewrite [\(testCase.style.rawValue)] must never return empty text")
+            try expect(result.contains("Режим:"), equals: false,
+                       "rewrite [\(testCase.style.rawValue)] must not echo the mode suffix back")
+        }
+        let totalSeconds = ProcessInfo.processInfo.systemUptime - totalStarted
+        print("LLM REWRITE: 3 styles total \(String(format: "%.2f", totalSeconds))s (first request includes model load)")
+
+        try runParakeetEngineSynchronously { await coordinator.stop() }
     }
 
     private static func testVocabularyStore() throws {

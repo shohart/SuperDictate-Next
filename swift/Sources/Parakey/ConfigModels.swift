@@ -429,6 +429,51 @@ enum LLMEngineBackend: String, CaseIterable, Codable {
     case customEndpoint
 }
 
+/// Which bundled correction model tier the correction pass uses
+/// (docs/specs/rewrite-tiered-correction-spec.md §2). `.fast` is the
+/// already-shipped VoiceScribe V15 R-3 pair (Qwen3.5-0.8B Q6_K + the
+/// dictation-corrector LoRA, benchmark/REPORT.md: p50 189 ms, Identity
+/// 1.000, 0.7 GB) and is deliberately the default — this branch fixes it
+/// as THE fast correction model. `.quality` is YandexGPT-5-Lite-8B
+/// Q4_K_M (same report: EM 0.892, Levenshtein 0.985, ~4.9 GB, on-demand
+/// download), which also doubles as the bundled rewrite model — see
+/// LLMPostprocessingPrompts/ModelDownload for the shared file pin.
+enum CorrectionModelTier: String, CaseIterable, Codable {
+    case fast
+    case quality
+
+    var displayName: String {
+        switch self {
+        case .fast: return "Fast"
+        case .quality: return "Quality"
+        }
+    }
+}
+
+/// Rewrite style — the second, independent post-processing function
+/// (docs/specs/rewrite-tiered-correction-spec.md §3). Runs AFTER the
+/// correction pass when both are enabled; unlike correction it is allowed
+/// to restructure text (repeats, filler segments, task structure, register).
+enum RewriteStyle: String, CaseIterable, Codable {
+    /// Убрать повторы, несогласование падежей и бессмысленные отрезки;
+    /// стиль и порядок мыслей близки к оригиналу.
+    case polish
+    /// Вольный текст → максимально структурированная задача: суть,
+    /// главное, второстепенное, шаги; повторы и логические ошибки отсечь.
+    case structuredTask = "structured_task"
+    /// Casual-речь → сухой официальный стиль; факты/числа/даты/отрицания
+    /// сохранены дословно.
+    case official
+
+    var displayName: String {
+        switch self {
+        case .polish: return "Polish"
+        case .structuredTask: return "Structured task"
+        case .official: return "Official"
+        }
+    }
+}
+
 func normalizedTextPostprocessingMode(rawValue: String?) -> TextPostprocessingMode {
     guard let rawValue, let mode = TextPostprocessingMode(rawValue: rawValue) else {
         return .off
@@ -441,6 +486,20 @@ func normalizedLLMEngineBackend(rawValue: String?) -> LLMEngineBackend {
         return .bundledLocal
     }
     return backend
+}
+
+func normalizedCorrectionModelTier(rawValue: String?) -> CorrectionModelTier {
+    guard let rawValue, let tier = CorrectionModelTier(rawValue: rawValue) else {
+        return .fast
+    }
+    return tier
+}
+
+func normalizedRewriteStyle(rawValue: String?) -> RewriteStyle {
+    guard let rawValue, let style = RewriteStyle(rawValue: rawValue) else {
+        return .polish
+    }
+    return style
 }
 
 enum RecentTranscriptLimit: String, CaseIterable {

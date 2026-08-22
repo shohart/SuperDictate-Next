@@ -94,6 +94,18 @@ final class Settings: @unchecked Sendable {
     private static let keyLLMCustomBaseURL = "llm_custom_base_url_v1"
     private static let keyLLMCustomAPIKey = "llm_custom_api_key_v1"
     private static let keyLLMCustomModelName = "llm_custom_model_name_v1"
+    // Tiered correction + rewrite (docs/specs/rewrite-tiered-correction-
+    // spec.md §4). Rewrite keys are fully independent from the
+    // llm_* correction keys above on purpose: correction and rewrite are
+    // two separately-toggleable functions, each able to point at its own
+    // OpenAI-compatible endpoint.
+    private static let keyCorrectionModelTier = "correction_model_tier_v1"
+    private static let keyRewriteEnabled = "rewrite_enabled_v1"
+    private static let keyRewriteStyle = "rewrite_style_v1"
+    private static let keyRewriteEngineBackend = "rewrite_engine_backend_v1"
+    private static let keyRewriteCustomBaseURL = "rewrite_custom_base_url_v1"
+    private static let keyRewriteCustomAPIKey = "rewrite_custom_api_key_v1"
+    private static let keyRewriteCustomModelName = "rewrite_custom_model_name_v1"
 
     private let defaults: UserDefaults
     let vocabularyStore: VocabularyStore
@@ -931,6 +943,56 @@ final class Settings: @unchecked Sendable {
     var llmCustomModelName: String {
         get { defaults.string(forKey: Self.keyLLMCustomModelName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
         set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyLLMCustomModelName) }
+    }
+
+    /// Which bundled correction model the correction pass uses when its
+    /// backend is `.bundledLocal` — `.fast` (VoiceScribe, default; this
+    /// branch's fixed choice for fast correction) or `.quality`
+    /// (YandexGPT-5-Lite-8B, on-demand ~4.9 GB download). Stored
+    /// independently of the rewrite keys below.
+    var correctionModelTier: CorrectionModelTier {
+        get { normalizedCorrectionModelTier(rawValue: defaults.string(forKey: Self.keyCorrectionModelTier)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyCorrectionModelTier) }
+    }
+
+    /// Rewrite on/off — deliberately a SEPARATE toggle from
+    /// textPostprocessingMode (correction): the user may enable both at
+    /// once (docs/specs/rewrite-tiered-correction-spec.md §1.4), in which
+    /// case the pipeline runs correction first, then rewrite.
+    var rewriteEnabled: Bool {
+        get { defaults.bool(forKey: Self.keyRewriteEnabled) }
+        set { defaults.set(newValue, forKey: Self.keyRewriteEnabled) }
+    }
+
+    var rewriteStyle: RewriteStyle {
+        get { normalizedRewriteStyle(rawValue: defaults.string(forKey: Self.keyRewriteStyle)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteStyle) }
+    }
+
+    /// Backend for the rewrite pass — its own selector, independent from
+    /// the correction pass's llmEngineBackend, so correction and rewrite
+    /// can each point at a different OpenAI-compatible endpoint.
+    var rewriteEngineBackend: LLMEngineBackend {
+        get { normalizedLLMEngineBackend(rawValue: defaults.string(forKey: Self.keyRewriteEngineBackend)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteEngineBackend) }
+    }
+
+    /// Base URL for the rewrite `.customEndpoint` — independent from the
+    /// correction llmCustomBaseURL. Same verbatim-store, validate-at-use
+    /// policy as that key.
+    var rewriteCustomBaseURL: String {
+        get { defaults.string(forKey: Self.keyRewriteCustomBaseURL)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyRewriteCustomBaseURL) }
+    }
+
+    var rewriteCustomAPIKey: String {
+        get { defaults.string(forKey: Self.keyRewriteCustomAPIKey) ?? "" }
+        set { defaults.set(newValue, forKey: Self.keyRewriteCustomAPIKey) }
+    }
+
+    var rewriteCustomModelName: String {
+        get { defaults.string(forKey: Self.keyRewriteCustomModelName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyRewriteCustomModelName) }
     }
 
     var hasActiveRunMarker: Bool {

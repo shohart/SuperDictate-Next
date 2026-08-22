@@ -81,6 +81,13 @@ struct ControlPanelSettingsDraft: Equatable {
     var llmCustomBaseURL: String
     var llmCustomAPIKey: String
     var llmCustomModelName: String
+    var correctionModelTier: CorrectionModelTier
+    var rewriteEnabled: Bool
+    var rewriteStyle: RewriteStyle
+    var rewriteEngineBackend: LLMEngineBackend
+    var rewriteCustomBaseURL: String
+    var rewriteCustomAPIKey: String
+    var rewriteCustomModelName: String
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -112,6 +119,13 @@ struct ControlPanelSettingsDraft: Equatable {
         llmCustomBaseURL = settings.llmCustomBaseURL
         llmCustomAPIKey = settings.llmCustomAPIKey
         llmCustomModelName = settings.llmCustomModelName
+        correctionModelTier = settings.correctionModelTier
+        rewriteEnabled = settings.rewriteEnabled
+        rewriteStyle = settings.rewriteStyle
+        rewriteEngineBackend = settings.rewriteEngineBackend
+        rewriteCustomBaseURL = settings.rewriteCustomBaseURL
+        rewriteCustomAPIKey = settings.rewriteCustomAPIKey
+        rewriteCustomModelName = settings.rewriteCustomModelName
     }
 }
 
@@ -147,6 +161,15 @@ enum LLMModelDownloadState: Equatable {
     case failed(String)
 }
 
+/// Which bundled LLM model a Settings download button refers to
+/// (docs/specs/rewrite-tiered-correction-spec.md §2): the fast VoiceScribe
+/// correction pair (~0.7 GB) or YandexGPT 5 Light (~4.9 GB, one file
+/// serving both the quality correction tier and bundled rewrite).
+enum LLMBundledModelKind: Equatable {
+    case fastCorrection
+    case yandex
+}
+
 private enum SettingsTab: Int, CaseIterable {
     case dictation
     case text
@@ -176,9 +199,16 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private weak var settingsStatusLabel: NSTextField?
     private var llmModelDownloadState: LLMModelDownloadState = .idle
     private var llmModelDownloadTask: Task<Void, Never>?
+    /// Which bundled LLM model an in-flight download is for (the Settings
+    /// UI offers two independently downloadable files: the fast VoiceScribe
+    /// pair and the YandexGPT 5 Light shared by quality correction + rewrite).
+    private var llmModelDownloadKind: LLMBundledModelKind = .fastCorrection
     static let llmCustomBaseURLFieldTag = 9001
     static let llmCustomAPIKeyFieldTag = 9002
     static let llmCustomModelNameFieldTag = 9003
+    static let rewriteCustomBaseURLFieldTag = 9004
+    static let rewriteCustomAPIKeyFieldTag = 9005
+    static let rewriteCustomModelNameFieldTag = 9006
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -625,6 +655,8 @@ case .text:
             content.addArrangedSubview(autoLearnVocabularyRow(draft))
 
         case .correction:
+            // Correction section (tier, engine, endpoint/model) — gated on
+            // its own toggle, independent of the rewrite section below.
             content.addArrangedSubview(llmCorrectionModeRow(draft))
             content.addArrangedSubview(hotkeyRow(
                 title: t("Переключить коррекцию", "Toggle correction"),
@@ -634,12 +666,31 @@ case .text:
                            "Turn correction on or off without opening Settings.")
             ))
             if draft.textPostprocessingMode == .correction {
+                content.addArrangedSubview(correctionModelTierRow(draft))
                 content.addArrangedSubview(llmEngineBackendRow(draft))
                 switch draft.llmEngineBackend {
                 case .bundledLocal:
-                    content.addArrangedSubview(llmBundledModelStatusRow())
+                    switch draft.correctionModelTier {
+                    case .fast:
+                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .fastCorrection))
+                    case .quality:
+                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
+                    }
                 case .customEndpoint:
                     content.addArrangedSubview(llmCustomEndpointRows(draft))
+                }
+            }
+            // Rewrite section — fully independent toggles/endpoint from
+            // correction (docs/specs/rewrite-tiered-correction-spec.md §1).
+            content.addArrangedSubview(rewriteModeRow(draft))
+            if draft.rewriteEnabled {
+                content.addArrangedSubview(rewriteStyleRow(draft))
+                content.addArrangedSubview(rewriteEngineBackendRow(draft))
+                switch draft.rewriteEngineBackend {
+                case .bundledLocal:
+                    content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
+                case .customEndpoint:
+                    content.addArrangedSubview(rewriteCustomEndpointRows(draft))
                 }
             }
 
@@ -1948,7 +1999,11 @@ header.addArrangedSubview(panelLabel(
         )
     }
 
-    private func llmBundledModelStatusRow() -> NSView {
+    /// Status + download row for a bundled LLM model file. `kind` picks
+    /// which: `.fastCorrection` = the VoiceScribe pair (Qwen3.5 0.8B Q6_K +
+    /// corrector LoRA, ~0.7 GB); `.yandex` = YandexGPT 5 Light (~4.9 GB,
+    /// shared by the quality correction tier and bundled rewrite).
+    private func llmBundledModelStatusRow(kind: LLMBundledModelKind) -> NSView {
         let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
@@ -1963,40 +2018,57 @@ header.addArrangedSubview(panelLabel(
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 3
-        text.addArrangedSubview(panelLabel(
-            t("Модель коррекции", "Correction model"),
-            size: 13,
-            weight: .semibold
-        ))
+        let title: String
+        switch kind {
+        case .fastCorrection:
+            title = t("Модель быстрой коррекции", "Fast correction model")
+        case .yandex:
+            title = t("YandexGPT 5 Light", "YandexGPT 5 Light")
+        }
+        text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
 
-        let modelReady = gecModelCacheExists()
+        let modelReady: Bool
+        let readyText: String
+        let missingText: String
+        switch kind {
+        case .fastCorrection:
+            modelReady = gecModelCacheExists()
+            readyText = t("Готова (VoiceScribe: Qwen3.5 0.8B Q6_K + корректор LoRA, ~0,7 ГБ)",
+                          "Ready (VoiceScribe: Qwen3.5 0.8B Q6_K + corrector LoRA, ~0.7 GB)")
+            missingText = t("Не скачана (~0,7 ГБ, ~0,2 с на фразу)", "Not downloaded (~0.7 GB, ~0.2 s per phrase)")
+        case .yandex:
+            modelReady = yandexGPTModelCacheExists()
+            readyText = t("Готова (YandexGPT-5-Lite-8B Q4_K_M, ~4,9 ГБ)", "Ready (YandexGPT-5-Lite-8B Q4_K_M, ~4.9 GB)")
+            missingText = t("Не скачана (~4,9 ГБ) — качественная коррекция и реврайтинг", "Not downloaded (~4.9 GB) — quality correction and rewrite")
+        }
+
         let statusText: String
         let statusColor: NSColor
-        switch llmModelDownloadState {
-        case .downloading:
+        // A download in flight is only shown by the row(s) for THAT model;
+        // the other model's row keeps its plain ready/missing status.
+        let downloadInFlight = llmModelDownloadTask != nil && llmModelDownloadKind == kind
+        if downloadInFlight, case .downloading = llmModelDownloadState {
             statusText = t("Скачивание…", "Downloading…")
             statusColor = .systemBlue
-        case .failed(let message):
+        } else if downloadInFlight, case .failed(let message) = llmModelDownloadState {
             statusText = message
             statusColor = .systemRed
-        case .idle:
-            statusText = modelReady
-                ? t("Готова (Qwen3.5 0.8B Q6_K + корректор LoRA, ~0,7 ГБ)",
-                    "Ready (Qwen3.5 0.8B Q6_K + corrector LoRA, ~0.7 GB)")
-                : t("Не скачана (~0,7 ГБ)", "Not downloaded (~0.7 GB)")
+        } else {
+            statusText = modelReady ? readyText : missingText
             statusColor = modelReady ? .systemGreen : .secondaryLabelColor
         }
         let statusLabel = panelLabel(statusText, size: 12, color: statusColor)
         text.addArrangedSubview(statusLabel)
 
         let button: NSButton
-        switch llmModelDownloadState {
-        case .downloading:
+        if downloadInFlight, case .downloading = llmModelDownloadState {
             button = panelButton(t("Отменить", "Cancel"), action: #selector(cancelLLMModelDownload(_:)))
-        case .failed, .idle:
+        } else {
             button = panelButton(
                 modelReady ? t("Скачать заново", "Re-download") : t("Скачать", "Download"),
-                action: #selector(startLLMModelDownload(_:))
+                action: kind == .fastCorrection
+                    ? #selector(startFastCorrectionModelDownload(_:))
+                    : #selector(startYandexModelDownload(_:))
             )
         }
 
@@ -2005,7 +2077,7 @@ header.addArrangedSubview(panelLabel(
         row.addArrangedSubview(button)
         container.addArrangedSubview(row)
 
-        if case .downloading = llmModelDownloadState {
+        if downloadInFlight, case .downloading = llmModelDownloadState {
             let progressBar = NSProgressIndicator()
             progressBar.style = .bar
             progressBar.controlSize = .small
@@ -2072,6 +2144,151 @@ header.addArrangedSubview(panelLabel(
         return container
     }
 
+    /// Same three-field block as llmCustomEndpointRows, but for the
+    /// rewrite pass's OWN endpoint (tags 9004-9006) — correction and
+    /// rewrite custom endpoints are fully independent
+    /// (docs/specs/rewrite-tiered-correction-spec.md §1.5).
+    private func rewriteCustomEndpointRows(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        func fieldRow(title: String, placeholder: String, value: String, tag: Int, secure: Bool) -> NSView {
+            let row = NSStackView()
+            row.orientation = .vertical
+            row.alignment = .leading
+            row.spacing = 3
+            row.addArrangedSubview(panelLabel(title, size: 12, weight: .medium, color: .secondaryLabelColor))
+
+            let field: NSTextField = secure ? NSSecureTextField() : NSTextField()
+            field.placeholderString = placeholder
+            field.stringValue = value
+            field.tag = tag
+            field.delegate = self
+            field.translatesAutoresizingMaskIntoConstraints = false
+            row.addArrangedSubview(field)
+            field.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+            return row
+        }
+
+        container.addArrangedSubview(fieldRow(
+            title: t("Базовый URL реврайта (OpenAI-совместимый)", "Rewrite base URL (OpenAI-compatible)"),
+            placeholder: "http://127.0.0.1:8080",
+            value: draft.rewriteCustomBaseURL,
+            tag: Self.rewriteCustomBaseURLFieldTag,
+            secure: false
+        ))
+        container.addArrangedSubview(fieldRow(
+            title: t("API-ключ (необязательно)", "API key (optional)"),
+            placeholder: "",
+            value: draft.rewriteCustomAPIKey,
+            tag: Self.rewriteCustomAPIKeyFieldTag,
+            secure: true
+        ))
+        container.addArrangedSubview(fieldRow(
+            title: t("Имя модели реврайта", "Rewrite model name"),
+            placeholder: "gpt-4o-mini",
+            value: draft.rewriteCustomModelName,
+            tag: Self.rewriteCustomModelNameFieldTag,
+            secure: false
+        ))
+
+        NSLayoutConstraint.activate(container.arrangedSubviews.map {
+            $0.widthAnchor.constraint(equalTo: container.widthAnchor)
+        })
+        return container
+    }
+
+    /// Fast vs quality bundled correction model picker
+    /// (docs/specs/rewrite-tiered-correction-spec.md §2). Benchmark
+    /// numbers in the detail line come from benchmark/REPORT.md.
+    private func correctionModelTierRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Модель коррекции", "Correction model"),
+            detail: t("Быстрая — VoiceScribe: ~0,2 с, мгновенная реакция. Качественная — YandexGPT 5 Light: заметно точнее (~4,9 ГБ).",
+                      "Fast — VoiceScribe: ~0.2 s, instant response. Quality — YandexGPT 5 Light: noticeably more accurate (~4.9 GB)."),
+            selectedValue: draft.correctionModelTier.rawValue,
+            options: [
+                (t("Быстрая (VoiceScribe)", "Fast (VoiceScribe)"), CorrectionModelTier.fast.rawValue),
+                (t("Качественная (YandexGPT 5 Light)", "Quality (YandexGPT 5 Light)"), CorrectionModelTier.quality.rawValue),
+            ],
+            action: #selector(selectCorrectionModelTier(_:)),
+            toolTip: t("Выбрать встроенную модель коррекции.", "Choose the bundled correction model.")
+        )
+    }
+
+    /// The rewrite master toggle — deliberately NOT coupled to the
+    /// correction toggle above it: both may be on at once, in which case
+    /// correction runs first and rewrite second.
+    private func rewriteModeRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Реврайтинг текста", "Text rewriting"),
+            size: 13,
+            weight: .semibold
+        ))
+        let modeDescription = panelLabel(
+            t("Переписывает продиктованный текст выбранным способом: причесать, структурировать в задачу или официальный стиль. Работает независимо от коррекции и может включаться вместе с ней.",
+              "Rewrites dictated text the selected way: polish, structure into a task, or official style. Independent from correction and can be enabled together with it."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        modeDescription.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(modeDescription)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleRewriteMode(_:))
+        toggle.state = draft.rewriteEnabled ? .on : .off
+        toggle.toolTip = t("Включить реврайтинг текста.", "Enable text rewriting.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func rewriteStyleRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Режим реврайта", "Rewrite style"),
+            detail: t("Причесать — убрать повторы и несогласования. Задача — структурировать вольный текст в чёткую задачу. Официальный — сухой формальный стиль.",
+                      "Polish — remove repeats and mismatches. Task — structure free-form text into a clear task. Official — dry formal style."),
+            selectedValue: draft.rewriteStyle.rawValue,
+            options: [
+                (t("Причесать текст", "Polish text"), RewriteStyle.polish.rawValue),
+                (t("Структурировать в задачу", "Structure into a task"), RewriteStyle.structuredTask.rawValue),
+                (t("Официальный стиль", "Official style"), RewriteStyle.official.rawValue),
+            ],
+            action: #selector(selectRewriteStyle(_:)),
+            toolTip: t("Выбрать способ переработки текста.", "Choose how the text is rewritten.")
+        )
+    }
+
+    private func rewriteEngineBackendRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Движок реврайта", "Rewrite engine"),
+            detail: t("Встроенная модель YandexGPT 5 Light работает локально. Свой сервер — любой OpenAI-совместимый эндпоинт, отдельный от коррекции.",
+                      "The built-in YandexGPT 5 Light runs locally. A custom server is any OpenAI-compatible endpoint, separate from correction."),
+            selectedValue: draft.rewriteEngineBackend.rawValue,
+            options: [
+                (t("Встроенная (локально)", "Built-in (local)"), LLMEngineBackend.bundledLocal.rawValue),
+                (t("Свой сервер", "Custom server"), LLMEngineBackend.customEndpoint.rawValue),
+            ],
+            action: #selector(selectRewriteEngineBackend(_:)),
+            toolTip: t("Выбрать, где выполняется реврайтинг текста.", "Choose where text rewriting runs.")
+        )
+    }
+
     @objc private func toggleLLMCorrectionMode(_ sender: NSSwitch) {
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.textPostprocessingMode = sender.state == .on ? .correction : .off
@@ -2088,13 +2305,61 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
-    @objc private func startLLMModelDownload(_ sender: NSButton) {
+    @objc private func selectCorrectionModelTier(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let tier = CorrectionModelTier(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.correctionModelTier = tier
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleRewriteMode(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectRewriteStyle(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let style = RewriteStyle(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteStyle = style
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectRewriteEngineBackend(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let backend = LLMEngineBackend(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteEngineBackend = backend
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func startFastCorrectionModelDownload(_ sender: NSButton) {
+        startBundledModelDownload(kind: .fastCorrection)
+    }
+
+    @objc private func startYandexModelDownload(_ sender: NSButton) {
+        startBundledModelDownload(kind: .yandex)
+    }
+
+    private func startBundledModelDownload(kind: LLMBundledModelKind) {
         guard llmModelDownloadTask == nil else { return }
+        llmModelDownloadKind = kind
         llmModelDownloadState = .downloading
         refreshSettingsWindow()
-        llmModelDownloadTask = Task { [weak self] in
+        llmModelDownloadTask = Task { [weak self, kind] in
             do {
-                _ = try await downloadGECModelIfNeeded()
+                switch kind {
+                case .fastCorrection:
+                    _ = try await downloadCorrectionModelIfNeeded(tier: .fast)
+                case .yandex:
+                    _ = try await downloadYandexModelIfNeeded()
+                }
                 guard let self, !Task.isCancelled else { return }
                 self.llmModelDownloadState = .idle
             } catch is CancellationError {
@@ -3036,6 +3301,12 @@ header.addArrangedSubview(panelLabel(
             draft.llmCustomAPIKey = field.stringValue
         case Self.llmCustomModelNameFieldTag:
             draft.llmCustomModelName = field.stringValue
+        case Self.rewriteCustomBaseURLFieldTag:
+            draft.rewriteCustomBaseURL = field.stringValue
+        case Self.rewriteCustomAPIKeyFieldTag:
+            draft.rewriteCustomAPIKey = field.stringValue
+        case Self.rewriteCustomModelNameFieldTag:
+            draft.rewriteCustomModelName = field.stringValue
         default:
             return
         }
@@ -3073,6 +3344,13 @@ header.addArrangedSubview(panelLabel(
         settings.llmCustomBaseURL = draft.llmCustomBaseURL
         settings.llmCustomAPIKey = draft.llmCustomAPIKey
         settings.llmCustomModelName = draft.llmCustomModelName
+        settings.correctionModelTier = draft.correctionModelTier
+        settings.rewriteEnabled = draft.rewriteEnabled
+        settings.rewriteStyle = draft.rewriteStyle
+        settings.rewriteEngineBackend = draft.rewriteEngineBackend
+        settings.rewriteCustomBaseURL = draft.rewriteCustomBaseURL
+        settings.rewriteCustomAPIKey = draft.rewriteCustomAPIKey
+        settings.rewriteCustomModelName = draft.rewriteCustomModelName
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)

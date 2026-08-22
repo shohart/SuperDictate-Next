@@ -218,6 +218,9 @@ func downloadParakeetModelIfNeeded() async throws -> URL {
 // Parakeet ASR model's own on-demand policy.
 
 enum GECModelDownloadError: LocalizedError {
+    // Neutral "LLM model" wording, not "GEC model": this error type is
+    // shared by the fast-tier, YandexGPT, and LoRA downloads below, and
+    // these strings surface verbatim in the Settings UI.
     case checksumMismatch(expected: String, actual: String)
     case sizeMismatch(expected: Int64, actual: Int64)
     case downloadFailed(underlying: Error)
@@ -227,15 +230,15 @@ enum GECModelDownloadError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .checksumMismatch(let expected, let actual):
-            return "Downloaded GEC model checksum mismatch: expected \(expected), got \(actual)"
+            return "Downloaded LLM model checksum mismatch: expected \(expected), got \(actual)"
         case .sizeMismatch(let expected, let actual):
-            return "Downloaded GEC model size mismatch: expected \(expected) bytes, got \(actual) bytes"
+            return "Downloaded LLM model size mismatch: expected \(expected) bytes, got \(actual) bytes"
         case .downloadFailed(let underlying):
-            return "Failed to download GEC model: \(underlying.localizedDescription)"
+            return "Failed to download LLM model: \(underlying.localizedDescription)"
         case .httpError(let statusCode):
-            return "GEC model download failed with HTTP \(statusCode)"
+            return "LLM model download failed with HTTP \(statusCode)"
         case .unsafeDestination(let detail):
-            return "Refusing unsafe GEC model destination: \(detail)"
+            return "Refusing unsafe LLM model destination: \(detail)"
         }
     }
 }
@@ -400,6 +403,113 @@ func downloadGECModelIfNeeded() async throws -> URL {
         expectedSHA256: GEC_LORA_SHA256
     )
     return base
+}
+
+// MARK: - YandexGPT-5-Lite-8B model (quality correction + rewrite)
+//
+// One file serves TWO functions (docs/specs/rewrite-tiered-correction-
+// spec.md §2.2): the `.quality` correction tier AND the bundled rewrite
+// model. Selected from benchmark/REPORT.md (2026-08-21):
+//   - correction: EM 0.892, Levenshtein 0.985, Identity 1.000, p50 433 ms
+//     — clear winner over every other candidate including 9B Qwen3.5.
+//   - rewrite: FactRec 0.527 (highest), LenRatio 0.966 (closest to 1.0),
+//     p50 2668 ms.
+// Pinned to the OFFICIAL yandex/YandexGPT-5-Lite-8B-instruct-GGUF repo at
+// a specific revision, never `main` — same policy as every other pin in
+// this file. The SHA256 below was computed from the actual bytes of the
+// local copy this benchmark ran on (benchmark/models/, 2026-08-21) and
+// cross-checked against the repo's LFS metadata — identical values, i.e.
+// the app downloads the exact model the benchmark validated.
+
+let YANDEXGPT_MODEL_REPOSITORY = "yandex/YandexGPT-5-Lite-8B-instruct-GGUF"
+let YANDEXGPT_MODEL_REVISION = "9fe287d2f512503046bb008aed350f2b4bbb903d"
+let YANDEXGPT_MODEL_FILENAME = "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf"
+private let YANDEXGPT_MODEL_URL = URL(
+    string: "https://huggingface.co/\(YANDEXGPT_MODEL_REPOSITORY)/resolve/\(YANDEXGPT_MODEL_REVISION)/\(YANDEXGPT_MODEL_FILENAME)"
+)!
+let YANDEXGPT_MODEL_SHA256 = "d9ff5b826f20fbcc2f898f9f2349ac21241579f8fbb79cd32148a333623ba228"
+let YANDEXGPT_MODEL_SIZE_BYTES: Int64 = 4_920_741_184
+
+func yandexGPTModelPath() -> URL {
+    llmModelCacheDirectory().appendingPathComponent(YANDEXGPT_MODEL_FILENAME, isDirectory: false)
+}
+
+func yandexGPTModelCacheExists() -> Bool {
+    guard isPlainRegularFile(yandexGPTModelPath().path) else { return false }
+    let attributes = try? FileManager.default.attributesOfItem(atPath: yandexGPTModelPath().path)
+    return (attributes?[.size] as? Int64) == YANDEXGPT_MODEL_SIZE_BYTES
+}
+
+func assertSufficientDiskSpaceForYandexModelDownload() throws {
+    let requiredBytes = YANDEXGPT_MODEL_SIZE_BYTES + MODEL_DOWNLOAD_HEADROOM_BYTES
+    let availableBytes = availableImportantDiskSpaceBytes(containing: llmModelCacheDirectory())
+    guard let availableBytes, availableBytes >= 0, availableBytes < requiredBytes else {
+        return
+    }
+    let detail = """
+    Parakey needs about \(formattedByteCount(UInt64(YANDEXGPT_MODEL_SIZE_BYTES))) of free disk space to download YandexGPT 5 Light.
+
+    Available: \(formattedByteCount(UInt64(availableBytes)))
+    Needed: \(formattedByteCount(UInt64(requiredBytes)))
+
+    Free some disk space, then retry.
+    """
+    throw NSError(domain: "Parakey", code: -10, userInfo: [NSLocalizedDescriptionKey: detail])
+}
+
+@discardableResult
+func downloadYandexModelIfNeeded() async throws -> URL {
+    try assertSufficientDiskSpaceForYandexModelDownload()
+    return try await downloadGECFileIfNeeded(
+        existingDescription: "YandexGPT model",
+        destination: yandexGPTModelPath(),
+        remoteURL: YANDEXGPT_MODEL_URL,
+        expectedSize: YANDEXGPT_MODEL_SIZE_BYTES,
+        expectedSHA256: YANDEXGPT_MODEL_SHA256
+    )
+}
+
+// MARK: - Tier-aware bundled-model resolution
+
+/// The bundled model file the correction pass loads for `tier`:
+/// `.fast` → the VoiceScribe pair's base GGUF (LoRA applied on top by the
+/// host via correctionBundledLoraPath); `.quality` → YandexGPT-5-Lite-8B.
+func correctionBundledModelPath(tier: CorrectionModelTier) -> URL {
+    switch tier {
+    case .fast: return gecModelPath()
+    case .quality: return yandexGPTModelPath()
+    }
+}
+
+/// The LoRA adapter the bundled correction host must load for `tier`
+/// (empty STRING = none; never an empty URL — `URL(fileURLWithPath:"").path`
+/// silently resolves to the process working directory). Only the fast tier
+/// has one (VoiceScribe V15 R-3, rsLoRA-compensated scale — see
+/// GEC_LORA_SCALE).
+func correctionBundledLoraPath(tier: CorrectionModelTier) -> String {
+    switch tier {
+    case .fast: return gecLoraPath().path
+    case .quality: return ""
+    }
+}
+
+/// Whether every file the bundled correction pass needs for `tier` is
+/// present and size-verified in the LLM cache.
+func correctionBundledModelExists(tier: CorrectionModelTier) -> Bool {
+    switch tier {
+    case .fast: return gecModelCacheExists()
+    case .quality: return yandexGPTModelCacheExists()
+    }
+}
+
+/// On-demand download for whichever files `tier`'s bundled correction
+/// pass needs (no-op returning the cached file when already verified).
+@discardableResult
+func downloadCorrectionModelIfNeeded(tier: CorrectionModelTier) async throws -> URL {
+    switch tier {
+    case .fast: return try await downloadGECModelIfNeeded()
+    case .quality: return try await downloadYandexModelIfNeeded()
+    }
 }
 
 private func resolvedParakeetSupportDirectory(_ override: URL?) -> URL? {

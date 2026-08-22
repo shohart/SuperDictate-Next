@@ -1464,16 +1464,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// Switches the already-visible transcribing HUD to the "improving
-    /// text" animation right before the LLM correction request goes out.
-    /// Callers must only invoke this once they know
+    /// text" animation right before an LLM postprocessing request goes
+    /// out. Callers must only invoke this once they know
     /// LLMPostprocessingCoordinator.finalizedText is actually about to do
-    /// real work (settings.textPostprocessingMode == .correction) --
-    /// otherwise it's a needless flicker for users who never enabled
-    /// correction, since finalizedText itself no-ops instantly in that case.
+    /// real work (correction OR rewrite enabled — either stage shows the
+    /// same "improving" animation) -- otherwise it's a needless flicker
+    /// for users who never enabled either function, since finalizedText
+    /// itself no-ops instantly in that case.
     /// A no-op if the HUD panel isn't visible at all (e.g. showRecordingWaveform
     /// disabled, or the silent startup-recovery path that never shows a HUD).
     private func showCorrectingHUD() {
-        guard settings.textPostprocessingMode == .correction,
+        guard settings.textPostprocessingMode == .correction || settings.rewriteEnabled,
               recordingHUDPanel?.isVisible == true else { return }
         updateRecordingHUD(mode: .correcting, level: 0)
         startRecordingHUDMotion()
@@ -2988,10 +2989,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Flips LLM text correction on/off directly via the hotkey — does NOT
     /// go through the Settings window's Save flow, so no background-service
     /// restart happens (that restart already tears down the LLM host
-    /// subprocess on every save, defeating the point of a fast toggle).
+    /// subprocesses on every save, defeating the point of a fast toggle).
     /// finalizedText(_:settings:) already reads settings.textPostprocessingMode
     /// fresh on every call, so this takes effect on the very next dictation
-    /// with no other propagation needed.
+    /// with no other propagation needed. The REWRITE toggle is deliberately
+    /// independent (docs/specs/rewrite-tiered-correction-spec.md §1.4) and
+    /// is NOT flipped here; the delayed unload below only stops hosts no
+    /// still-enabled function needs (e.g. a shared YandexGPT host stays
+    /// warm while rewrite remains on).
     private func toggleTextCorrectionMode() {
         let next: TextPostprocessingMode = settings.textPostprocessingMode == .correction ? .off : .correction
         settings.textPostprocessingMode = next
@@ -3003,11 +3008,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 Sounds.playDone()
             }
         }
-        Task { [llmPostprocessing] in
+        Task { [llmPostprocessing, settings] in
             if next == .correction {
                 await llmPostprocessing.cancelScheduledUnload()
             } else {
-                await llmPostprocessing.scheduleDelayedUnload()
+                await llmPostprocessing.scheduleDelayedUnload(settings: settings)
             }
         }
     }
