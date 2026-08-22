@@ -60,11 +60,15 @@ actor LLMPostprocessingCoordinator {
         correctionBundledModelPath(tier: tier).path + "|" + correctionBundledLoraPath(tier: tier)
     }
 
-    /// Host identity for the bundled rewrite model — the YandexGPT file,
-    /// i.e. exactly the quality-tier correction identity, so both
-    /// functions transparently share one host process when both are on.
-    static func rewriteHostIdentity() -> String {
-        yandexGPTModelPath().path + "|"
+    /// Host identity for the bundled rewrite model — deliberately
+    /// IDENTICAL to the equivalent correction tier's identity (see
+    /// RewriteBundledModel.correctionTierEquivalent): one YandexGPT host
+    /// serves both the quality correction tier and yandexGPT rewrite, and
+    /// one 0.8B host serves both fast correction and voiceScribe rewrite.
+    /// Sharing is safe — the host serializes requests internally, and the
+    /// correction/rewrite stages are sequential anyway.
+    static func rewriteHostIdentity(model: RewriteBundledModel) -> String {
+        correctionHostIdentity(tier: model.correctionTierEquivalent)
     }
 
     /// The set of host identities the still-enabled functions need under
@@ -79,7 +83,7 @@ actor LLMPostprocessingCoordinator {
         }
         if settings.rewriteEnabled,
            settings.rewriteEngineBackend == .bundledLocal {
-            needed.insert(rewriteHostIdentity())
+            needed.insert(rewriteHostIdentity(model: settings.rewriteBundledModel))
         }
         return needed
     }
@@ -337,16 +341,24 @@ actor LLMPostprocessingCoordinator {
     }
 
     private func rewrittenViaBundledHost(_ text: String, settings: Settings) async -> String {
-        guard yandexGPTModelCacheExists() else {
-            log("LLM postprocessing: rewrite model (YandexGPT 5 Light) not downloaded yet; passing text through unchanged")
+        let model = settings.rewriteBundledModel
+        let tier = model.correctionTierEquivalent
+        guard correctionBundledModelExists(tier: tier) else {
+            log("LLM postprocessing: bundled rewrite model (\(model.rawValue)) not downloaded yet; passing text through unchanged")
             return text
         }
-        let identity = Self.rewriteHostIdentity()
+        let identity = Self.rewriteHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
-        let startResult = await hostProcess.start(modelPath: yandexGPTModelPath().path,
-                                                  loraPath: "",
-                                                  loraScale: 1.0,
-                                                  ctxSize: 8192,
+        let startResult = await hostProcess.start(modelPath: correctionBundledModelPath(tier: tier).path,
+                                                  loraPath: correctionBundledLoraPath(tier: tier),
+                                                  loraScale: tier == .fast ? GEC_LORA_SCALE : 1.0,
+                                                  // The 8B YandexGPT host
+                                                  // gets a larger context:
+                                                  // rewrite outputs on long
+                                                  // dictations need prompt
+                                                  // + up to ~3072 completion
+                                                  // tokens inside one window.
+                                                  ctxSize: tier == .quality ? 8192 : 4096,
                                                   useGPU: settings.useGPU)
         switch startResult {
         case .failure(let error):
@@ -361,7 +373,7 @@ actor LLMPostprocessingCoordinator {
         }
         return await requestRewrite(baseURL: baseURL,
                                     apiKey: nil,
-                                    model: "rewrite",
+                                    model: "rewrite-\(model.rawValue)",
                                     text: text,
                                     settings: settings)
     }

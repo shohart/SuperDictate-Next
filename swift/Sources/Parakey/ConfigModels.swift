@@ -502,6 +502,34 @@ func normalizedRewriteStyle(rawValue: String?) -> RewriteStyle {
     return style
 }
 
+/// Which bundled model file the rewrite pass loads when its backend is
+/// `.bundledLocal` — the Settings dropdown next to the style picker
+/// (docs/specs/rewrite-tiered-correction-spec.md §9). `.yandexGPT` is
+/// the benchmark winner and the default (FactRec 0.527, LenRatio 0.966 —
+/// benchmark/REPORT.md); `.voiceScribe` reuses the fast correction pair
+/// (rewrite LenRatio 0.599: much faster but compresses text — kept as an
+/// experimental choice because it is the only other bundled file and
+/// needs no extra download for fast-tier correction users).
+enum RewriteBundledModel: String, CaseIterable, Codable {
+    case yandexGPT = "yandexgpt"
+    case voiceScribe = "voicescribe"
+
+    /// The correction tier whose bundled files this choice maps to — used
+    /// to resolve model/LoRA paths and to SHARE a host process with that
+    /// tier: one 0.8B host serves fast correction AND voiceScribe rewrite;
+    /// one YandexGPT host serves quality correction AND yandexGPT rewrite.
+    var correctionTierEquivalent: CorrectionModelTier {
+        self == .yandexGPT ? .quality : .fast
+    }
+}
+
+func normalizedRewriteBundledModel(rawValue: String?) -> RewriteBundledModel {
+    guard let rawValue, let model = RewriteBundledModel(rawValue: rawValue) else {
+        return .yandexGPT
+    }
+    return model
+}
+
 enum RecentTranscriptLimit: String, CaseIterable {
     case off
     case last1 = "1"

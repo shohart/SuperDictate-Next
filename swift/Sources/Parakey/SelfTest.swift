@@ -3300,8 +3300,8 @@ enum ParakeySelfTest {
         }
 
         // Defaults: fast tier (the branch's fixed VoiceScribe choice),
-        // rewrite off, polish style, bundled rewrite backend, empty custom
-        // endpoint fields.
+        // rewrite off, polish style, bundled rewrite backend, YandexGPT as
+        // the bundled rewrite model, empty custom endpoint fields.
         do {
             let settings = freshSettings()
             try expect(settings.correctionModelTier, equals: .fast,
@@ -3312,6 +3312,8 @@ enum ParakeySelfTest {
                        "polish must be the default rewrite style")
             try expect(settings.rewriteEngineBackend, equals: .bundledLocal,
                        "bundled local must be the default rewrite backend")
+            try expect(settings.rewriteBundledModel, equals: .yandexGPT,
+                       "YandexGPT must be the default bundled rewrite model (benchmark winner)")
             try expect(settings.rewriteCustomBaseURL.isEmpty && settings.rewriteCustomAPIKey.isEmpty && settings.rewriteCustomModelName.isEmpty,
                        equals: true,
                        "rewrite custom endpoint fields must start empty")
@@ -3323,10 +3325,12 @@ enum ParakeySelfTest {
             defaults.set("yolo", forKey: "correction_model_tier_v1")
             defaults.set("ultra", forKey: "rewrite_style_v1")
             defaults.set("quantum", forKey: "rewrite_engine_backend_v1")
+            defaults.set("weird", forKey: "rewrite_bundled_model_v1")
             let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
             try expect(settings.correctionModelTier, equals: .fast, "unknown tier raw value must normalize to .fast")
             try expect(settings.rewriteStyle, equals: .polish, "unknown style raw value must normalize to .polish")
             try expect(settings.rewriteEngineBackend, equals: .bundledLocal, "unknown backend raw value must normalize to .bundledLocal")
+            try expect(settings.rewriteBundledModel, equals: .yandexGPT, "unknown rewrite model raw value must normalize to .yandexGPT")
         }
 
         // Toggle independence: flipping rewrite never touches correction
@@ -3356,16 +3360,21 @@ enum ParakeySelfTest {
                        "the two endpoint model names must stay separate values")
         }
 
-        // Host identities: the quality correction tier and bundled rewrite
-        // SHARE one YandexGPT host; the fast tier is a distinct host.
+        // Host identities: the quality correction tier and bundled
+        // yandexGPT rewrite SHARE one YandexGPT host; the fast tier and
+        // bundled voiceScribe rewrite share one 0.8B host; the two tiers
+        // are always distinct.
         do {
             let fast = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .fast)
             let quality = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .quality)
-            let rewrite = LLMPostprocessingCoordinator.rewriteHostIdentity()
+            let rewriteYandex = LLMPostprocessingCoordinator.rewriteHostIdentity(model: .yandexGPT)
+            let rewriteVoiceScribe = LLMPostprocessingCoordinator.rewriteHostIdentity(model: .voiceScribe)
             try expect(fast != quality, equals: true,
                        "fast and quality correction tiers must map to different host identities")
-            try expect(quality == rewrite, equals: true,
-                       "quality correction and bundled rewrite must share one YandexGPT host identity")
+            try expect(quality == rewriteYandex, equals: true,
+                       "quality correction and bundled yandexGPT rewrite must share one YandexGPT host identity")
+            try expect(fast == rewriteVoiceScribe, equals: true,
+                       "fast correction and bundled voiceScribe rewrite must share one 0.8B host identity")
         }
 
         // neededHostIdentities (the delayed-unload keep-set) across the
@@ -3396,6 +3405,11 @@ enum ParakeySelfTest {
             settings.textPostprocessingMode = .off
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
                        "rewrite alone keeps the shared YandexGPT host (correction toggle-off must not unload it)")
+
+            settings.rewriteBundledModel = .voiceScribe
+            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
+                       "voiceScribe rewrite alone needs exactly the fast 0.8B host")
+            settings.rewriteBundledModel = .yandexGPT
 
             settings.rewriteEngineBackend = .customEndpoint
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).isEmpty, equals: true,

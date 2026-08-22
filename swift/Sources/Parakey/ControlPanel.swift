@@ -84,6 +84,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var correctionModelTier: CorrectionModelTier
     var rewriteEnabled: Bool
     var rewriteStyle: RewriteStyle
+    var rewriteBundledModel: RewriteBundledModel
     var rewriteEngineBackend: LLMEngineBackend
     var rewriteCustomBaseURL: String
     var rewriteCustomAPIKey: String
@@ -122,6 +123,7 @@ struct ControlPanelSettingsDraft: Equatable {
         correctionModelTier = settings.correctionModelTier
         rewriteEnabled = settings.rewriteEnabled
         rewriteStyle = settings.rewriteStyle
+        rewriteBundledModel = settings.rewriteBundledModel
         rewriteEngineBackend = settings.rewriteEngineBackend
         rewriteCustomBaseURL = settings.rewriteCustomBaseURL
         rewriteCustomAPIKey = settings.rewriteCustomAPIKey
@@ -685,10 +687,16 @@ case .text:
             content.addArrangedSubview(rewriteModeRow(draft))
             if draft.rewriteEnabled {
                 content.addArrangedSubview(rewriteStyleRow(draft))
+                content.addArrangedSubview(rewriteModelRow(draft))
                 content.addArrangedSubview(rewriteEngineBackendRow(draft))
                 switch draft.rewriteEngineBackend {
                 case .bundledLocal:
-                    content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
+                    switch draft.rewriteBundledModel {
+                    case .yandexGPT:
+                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
+                    case .voiceScribe:
+                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .fastCorrection))
+                    }
                 case .customEndpoint:
                     content.addArrangedSubview(rewriteCustomEndpointRows(draft))
                 }
@@ -2202,7 +2210,8 @@ header.addArrangedSubview(panelLabel(
 
     /// Fast vs quality bundled correction model picker
     /// (docs/specs/rewrite-tiered-correction-spec.md §2). Benchmark
-    /// numbers in the detail line come from benchmark/REPORT.md.
+    /// numbers in the detail line come from benchmark/REPORT.md; the "?"
+    /// button opens the same benchmark summary.
     private func correctionModelTierRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Модель коррекции", "Correction model"),
@@ -2214,7 +2223,8 @@ header.addArrangedSubview(panelLabel(
                 (t("Качественная (YandexGPT 5 Light)", "Quality (YandexGPT 5 Light)"), CorrectionModelTier.quality.rawValue),
             ],
             action: #selector(selectCorrectionModelTier(_:)),
-            toolTip: t("Выбрать встроенную модель коррекции.", "Choose the bundled correction model.")
+            toolTip: t("Выбрать встроенную модель коррекции.", "Choose the bundled correction model."),
+            showsHelp: true
         )
     }
 
@@ -2274,6 +2284,25 @@ header.addArrangedSubview(panelLabel(
         )
     }
 
+    /// Bundled rewrite model picker — mirrors the correction tier popup:
+    /// YandexGPT 5 Light (recommended, benchmark winner) or VoiceScribe
+    /// (reuses the fast correction pair; faster but compresses text).
+    private func rewriteModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Модель реврайта", "Rewrite model"),
+            detail: t("YandexGPT 5 Light — лучший по замерам. VoiceScribe — быстрее, но сильнее сжимает текст и чаще теряет детали.",
+                      "YandexGPT 5 Light — best measured. VoiceScribe — faster, but compresses text more and drops details more often."),
+            selectedValue: draft.rewriteBundledModel.rawValue,
+            options: [
+                (t("YandexGPT 5 Light (рекомендуется)", "YandexGPT 5 Light (recommended)"), RewriteBundledModel.yandexGPT.rawValue),
+                (t("VoiceScribe (быстрая)", "VoiceScribe (fast)"), RewriteBundledModel.voiceScribe.rawValue),
+            ],
+            action: #selector(selectRewriteBundledModel(_:)),
+            toolTip: t("Выбрать встроенную модель реврайта.", "Choose the bundled rewrite model."),
+            showsHelp: true
+        )
+    }
+
     private func rewriteEngineBackendRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Движок реврайта", "Rewrite engine"),
@@ -2326,6 +2355,15 @@ header.addArrangedSubview(panelLabel(
               let style = RewriteStyle(rawValue: raw) else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.rewriteStyle = style
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectRewriteBundledModel(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let model = RewriteBundledModel(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteBundledModel = model
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -2490,7 +2528,8 @@ header.addArrangedSubview(panelLabel(
                           selectedValue: String,
                           options: [(title: String, value: String)],
                           action: Selector,
-                          toolTip: String? = nil) -> NSView {
+                          toolTip: String? = nil,
+                          showsHelp: Bool = false) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -2520,7 +2559,71 @@ header.addArrangedSubview(panelLabel(
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(popup)
+        if showsHelp {
+            row.addArrangedSubview(benchmarkHelpButton())
+        }
         return row
+    }
+
+    /// Small round "?" button appended to model-picker rows; opens the
+    /// benchmark summary (benchmarkHelpSummaryText) so the user can see
+    /// what the measured differences between the bundled models actually
+    /// are without opening the repository.
+    private func benchmarkHelpButton() -> NSButton {
+        let button = NSButton(title: "?", target: self, action: #selector(showBenchmarkHelp(_:)))
+        button.bezelStyle = .circular
+        button.controlSize = .small
+        button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        button.toolTip = t("Результаты замеров моделей (бенчмарк).",
+                           "Model benchmark results.")
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        return button
+    }
+
+    @objc private func showBenchmarkHelp(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = t("Замеры моделей (бенчмарк, 21.08.2026)",
+                              "Model benchmark (Aug 21, 2026)")
+        alert.informativeText = benchmarkHelpSummaryText()
+        alert.addButton(withTitle: t("Понятно", "Got it"))
+        _ = alert.runModal()
+    }
+
+    /// Brief benchmark digest shown by the "?" help buttons next to the
+    /// model pickers — numbers from benchmark/REPORT.md (this machine,
+    /// AMD Radeon RX 6600, llama.cpp/Vulkan, temperature 0).
+    private func benchmarkHelpSummaryText() -> String {
+        t("""
+        Замеры на этом Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, 21 августа 2026 г.). Полный отчёт — benchmark/REPORT.md в репозитории.
+
+        КОРРЕКЦИЯ
+        • VoiceScribe — быстрая: 0,19 с на фразу, точность (EM) 0,600, вес 0,7 ГБ. Для повседневной диктовки, где важна мгновенная реакция.
+        • YandexGPT 5 Light — качественная: 0,43 с, EM 0,892 (на 49% точнее), лучше исправляет термины и пунктуацию. Вес 4,9 ГБ.
+        • Лучшая из остальных в замерах — Gemma 4 E4B (EM 0,862), в сборку не включена.
+
+        РЕВРАЙТ
+        • YandexGPT 5 Light — лучший: сохранение фактов 0,527, длина результата близка к исходной (0,97×), ~2,7 с на абзац. Рекомендуется.
+        • VoiceScribe — быстрее (~0,5 с), но сжимает текст до 0,6× и чаще теряет детали — экспериментальный вариант.
+
+        СОВМЕСТНАЯ РАБОТА
+        Коррекция и реврайт независимы: при включении обеих текст сначала исправляется, затем переписывается. Обе модели занимают на диске ~5,6 ГБ.
+        """,
+        """
+        Measured on this Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, Aug 21, 2026). Full report — benchmark/REPORT.md in the repository.
+
+        CORRECTION
+        • VoiceScribe — fast: 0.19 s per phrase, accuracy (EM) 0.600, 0.7 GB. For everyday dictation where instant response matters.
+        • YandexGPT 5 Light — quality: 0.43 s, EM 0.892 (49% more accurate), better term and punctuation fixing. 4.9 GB.
+        • Best of the rest in the benchmark — Gemma 4 E4B (EM 0.862), not included in this build.
+
+        REWRITE
+        • YandexGPT 5 Light — best: fact recall 0.527, output length close to input (0.97×), ~2.7 s per paragraph. Recommended.
+        • VoiceScribe — faster (~0.5 s) but compresses text to 0.6× and drops details more often — experimental.
+
+        WORKING TOGETHER
+        Correction and rewrite are independent: with both enabled, text is corrected first, then rewritten. Both models take ~5.6 GB of disk.
+        """)
     }
 
     private func settingsActionsRow(draft: ControlPanelSettingsDraft) -> NSView {
@@ -3347,6 +3450,7 @@ header.addArrangedSubview(panelLabel(
         settings.correctionModelTier = draft.correctionModelTier
         settings.rewriteEnabled = draft.rewriteEnabled
         settings.rewriteStyle = draft.rewriteStyle
+        settings.rewriteBundledModel = draft.rewriteBundledModel
         settings.rewriteEngineBackend = draft.rewriteEngineBackend
         settings.rewriteCustomBaseURL = draft.rewriteCustomBaseURL
         settings.rewriteCustomAPIKey = draft.rewriteCustomAPIKey

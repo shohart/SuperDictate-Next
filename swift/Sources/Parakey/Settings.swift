@@ -102,6 +102,7 @@ final class Settings: @unchecked Sendable {
     private static let keyCorrectionModelTier = "correction_model_tier_v1"
     private static let keyRewriteEnabled = "rewrite_enabled_v1"
     private static let keyRewriteStyle = "rewrite_style_v1"
+    private static let keyRewriteBundledModel = "rewrite_bundled_model_v1"
     private static let keyRewriteEngineBackend = "rewrite_engine_backend_v1"
     private static let keyRewriteCustomBaseURL = "rewrite_custom_base_url_v1"
     private static let keyRewriteCustomAPIKey = "rewrite_custom_api_key_v1"
@@ -967,6 +968,16 @@ final class Settings: @unchecked Sendable {
     var rewriteStyle: RewriteStyle {
         get { normalizedRewriteStyle(rawValue: defaults.string(forKey: Self.keyRewriteStyle)) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteStyle) }
+    }
+
+    /// Which bundled model the rewrite pass loads when
+    /// rewriteEngineBackend is `.bundledLocal` — the Settings dropdown
+    /// next to the style picker. `.yandexGPT` (default, benchmark winner)
+    /// or `.voiceScribe` (reuses the fast correction pair — faster but
+    /// compresses text, experimental).
+    var rewriteBundledModel: RewriteBundledModel {
+        get { normalizedRewriteBundledModel(rawValue: defaults.string(forKey: Self.keyRewriteBundledModel)) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteBundledModel) }
     }
 
     /// Backend for the rewrite pass — its own selector, independent from
