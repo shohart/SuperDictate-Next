@@ -2,12 +2,16 @@
 //   SD_ASR_TEST_MODEL_DIR  — an installed model directory with manifest.json
 //   SD_ASR_TEST_GOLDEN_DIR — pairs <name>.wav + <name>.txt, the .txt being the
 //                            reference implementation's exact output
-//                            (tools/reference_tdt.py)
-// are set.
+//                            (tools/reference_tdt.py; see tests/fixtures/)
+// are set. SD_ASR_TEST_PARITY selects the comparison: "exact" (default; the
+// machine class that produced the goldens) or "cer:<max>" e.g. "cer:0.02"
+// for other CPUs, where int8 MLAS kernels may legitimately flip an argmax.
 //   sd_asr_model_tests <assets_dir>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -25,6 +29,37 @@ namespace {
 
 fs::path g_assets, g_model, g_golden;
 sd_asr_handle *g_handle = nullptr;
+double g_max_cer = 0.0;  // 0 = exact match required
+
+std::u32string decode_utf8(const std::string &text) {
+    std::u32string out;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        const int length = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4;
+        char32_t cp = length == 1 ? c : length == 2 ? (c & 0x1F) : length == 3 ? (c & 0x0F) : (c & 0x07);
+        for (int k = 1; k < length && i + size_t(k) < text.size(); ++k) cp = (cp << 6) | (text[i + size_t(k)] & 0x3F);
+        out.push_back(cp);
+        i += size_t(length);
+    }
+    return out;
+}
+
+// Character error rate: Levenshtein distance over code points / reference length.
+double character_error_rate(const std::string &reference, const std::string &hypothesis) {
+    const std::u32string r = decode_utf8(reference), h = decode_utf8(hypothesis);
+    std::vector<size_t> row(h.size() + 1);
+    for (size_t j = 0; j <= h.size(); ++j) row[j] = j;
+    for (size_t i = 1; i <= r.size(); ++i) {
+        size_t diagonal = row[0];
+        row[0] = i;
+        for (size_t j = 1; j <= h.size(); ++j) {
+            const size_t above = row[j];
+            row[j] = std::min({row[j] + 1, row[j - 1] + 1, diagonal + (r[i - 1] == h[j - 1] ? 0 : 1)});
+            diagonal = above;
+        }
+    }
+    return r.empty() ? (h.empty() ? 0.0 : 1.0) : double(row[h.size()]) / double(r.size());
+}
 
 struct Call {
     sd_asr_status status;
@@ -93,11 +128,16 @@ TEST_CASE("golden parity with the reference implementation") {
         if (call.status != SD_ASR_OK) continue;
         const std::string expected = read_text(golden);
         const std::string actual = call.body["text"].get<std::string>();
+        const double cer = character_error_rate(expected, actual);
         if (actual != expected) {
-            std::printf("  %s\n    expected: %s\n    actual:   %s\n", entry.path().filename().u8string().c_str(),
-                        expected.c_str(), actual.c_str());
+            std::printf("  %s (CER %.4f)\n    expected: %s\n    actual:   %s\n",
+                        entry.path().filename().u8string().c_str(), cer, expected.c_str(), actual.c_str());
         }
-        CHECK_EQ(actual, expected);
+        if (g_max_cer == 0.0) {
+            CHECK_EQ(actual, expected);
+        } else {
+            CHECK(cer <= g_max_cer);
+        }
 
         // Words re-join to the text; timestamps are monotonic and in range.
         std::string joined;
@@ -164,6 +204,10 @@ int main(int argc, char **argv) {
     g_assets = fs::u8path(argv[1]);
     g_model = fs::u8path(model);
     g_golden = fs::u8path(golden);
+    if (const char *parity = std::getenv("SD_ASR_TEST_PARITY"); parity && std::strncmp(parity, "cer:", 4) == 0) {
+        g_max_cer = std::atof(parity + 4);
+        std::printf("parity mode: CER <= %.4f\n", g_max_cer);
+    }
     const json config = {{"model_directory", g_model.u8string()},
                          {"assets_directory", g_assets.u8string()},
                          {"verify_checksums", true}};

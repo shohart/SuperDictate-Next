@@ -32,14 +32,20 @@ Model tests run only when a model is installed:
 # 1. download the files listed for parakeet-ultra-int8 in catalog/onnx-models.json into $MODEL
 python3 native/asr-runtime/tools/make_manifest.py native/asr-runtime/catalog/onnx-models.json \
     parakeet-ultra-int8 "$MODEL" --verify
-# 2. goldens (venv with onnxruntime==1.23.2 numpy soundfile); $GOLDEN holds 16 kHz *.wav
-python3 native/asr-runtime/tools/reference_tdt.py "$MODEL" native/asr-runtime/assets "$GOLDEN" "$GOLDEN"/*.wav
+# 2. parity audio (pinned SHA-256) + committed goldens into $GOLDEN
+native/asr-runtime/tests/fixtures/fetch-audio.sh "$GOLDEN"
+#    (regenerate goldens only on purpose: venv with onnxruntime==1.23.2 numpy soundfile)
+#    python3 native/asr-runtime/tools/reference_tdt.py "$MODEL" native/asr-runtime/assets \
+#        native/asr-runtime/tests/fixtures "$GOLDEN"/*.wav
 # 3. parity + host
 SD_ASR_TEST_MODEL_DIR="$MODEL" SD_ASR_TEST_GOLDEN_DIR="$GOLDEN" \
     ctest --test-dir native/asr-runtime/build --output-on-failure
 python3 native/asr-runtime/tests/host_test.py native/asr-runtime/build/SuperDictateOnnxHost \
-    "$MODEL" "$PWD/native/asr-runtime/assets" "$GOLDEN/<long>.wav" "$GOLDEN/<long>.txt"
+    "$MODEL" "$PWD/native/asr-runtime/assets" "$GOLDEN/ru_long_example.wav" "$GOLDEN/ru_long_example.txt"
 ```
+
+Goldens were produced on an AVX2-only x86_64 CPU. On a different CPU class
+int8 kernels may flip a rare argmax; use `SD_ASR_TEST_PARITY=cer:0.02` there.
 
 Manual transcription:
 

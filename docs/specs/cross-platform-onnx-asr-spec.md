@@ -358,6 +358,27 @@ gates pass; existing Parakeet/GPU preferences are preserved.
 - Windows: host + `onnxruntime.dll` side by side; MSVC release; VC runtime check.
 - No vendor ggml tree is modified; ORT and ggml never share a binary.
 
+Known W5 risks (unverified on the dev box, must be checked on the Mac):
+
+- **Library validation.** Existing helpers link everything statically; this
+  host loads `libonnxruntime.1.23.2.dylib` from `Contents/Frameworks` under
+  the hardened runtime. Verify it loads with both the local self-signed
+  identity (no Team ID) and the ad-hoc public build. If it does not, either
+  sign the dylib with the same identity as the host or grant the host
+  `com.apple.security.cs.disable-library-validation` (helper only).
+- **Rpath.** Build-tree binaries carry `BUILD_RPATH` (the SDK dir). Bundle
+  binaries must come from `cmake --install` (or `BUILD_WITH_INSTALL_RPATH`)
+  so they carry `@executable_path/../Frameworks`; check with `otool -l`.
+- **CI architecture.** GitHub's `macos-15` runner is arm64 → fetch
+  `osx-arm64`; the Intel artifact is built and tested on the Intel Mac.
+- **Notices.** Ship ORT's `ThirdPartyNotices.txt` in the bundle; show the
+  model's CC-BY-4.0 attribution (NVIDIA, Moondream, mldecode) in About /
+  model info once the ONNX model is installed, not only in `NOTICE.md`.
+- **Parity on other CPUs.** Goldens come from an AVX2-only x86_64 (same ISA
+  class as the target Xeon E5-2678 v3). On another CPU class run
+  `SD_ASR_TEST_PARITY=cer:0.02`; onnxruntime 1.23.2 macOS x86_64/arm64
+  wheels exist on PyPI if goldens must be regenerated there.
+
 ## 11. Testing and release gates
 
 1. C ABI contract tests (no model): version, bad JSON, missing/forged
@@ -383,7 +404,8 @@ no regressions in long dictation and correction.
 W1–W3 are implemented in `native/asr-runtime/` and verified on Linux x64
 with ONNX Runtime 1.23.2: contract tests (12 cases), IPC framing tests,
 model tests (exact text parity with `tools/reference_tdt.py` on EN 11 s,
-RU 11 s and RU 71 s; BUSY; cancel), and the host integration test
+RU 11 s and RU 71 s — fixtures reproducible via
+`tests/fixtures/fetch-audio.sh`; BUSY; cancel), and the host integration test
 (`tests/host_test.py`). Measured on a 44-core Xeon, 8 intra-op threads:
 RU 71 s in 6.2 s (RTF 0.087), RU 11 s in 0.9 s; peak RSS ≈ 1.0 GB.
 Not yet verified on macOS or Windows (no toolchain on the dev box).
