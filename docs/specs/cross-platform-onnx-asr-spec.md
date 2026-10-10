@@ -178,15 +178,20 @@ void          sd_asr_free(char *p);
 ```json
 { "engine": "onnxruntime", "model_directory": "/…/parakeet-ultra-int8",
   "provider": "auto|cpu|coreml|directml", "language": "auto|ru|en",
-  "intra_op_threads": 0, "inter_op_threads": 1, "verify_checksums": false,
-  "diagnostics": false }
+  "assets_directory": "/…/Contents/Resources/onnx-asr",
+  "intra_op_threads": 0, "inter_op_threads": 1, "allow_spinning": true,
+  "verify_checksums": false, "allow_unvalidated_providers": false }
 ```
 
 `model_id`, `model_family`, quantization and file list come from the model
 directory's `manifest.json` (§7) — the caller cannot claim a family the
 manifest does not declare. `intra_op_threads: 0` = default policy
-`max(2, min(8, cores/2))` (same as the GGUF engine). Spinning is disabled
-(`session.intra_op.allow_spinning=0`) so an idle menubar app burns no CPU.
+`max(2, min(8, cores/2))` (same as the GGUF engine). The per-step graphs
+(preprocessor, decoder, joiner) always run single-threaded. ORT thread
+spinning stays enabled for the encoder by default: it is bounded (measured
+0.00 s CPU over 3 s idle after an inference) and disabling it costs ~25 %
+encoder throughput (8 threads, Linux x64). `allow_spinning: false` is the
+low-power escape hatch.
 
 ### 4.3 Result (transcribe)
 
@@ -308,8 +313,14 @@ little-endian), **not** the unversioned Whisper framing:
 ```
 request : "SDAQ" | u16 version=1 | u16 type | u64 request_id | u32 json_len | u64 pcm_bytes | json | pcm(f32)
 response: "SDAR" | u16 version=1 | u16 status | u64 request_id | u32 json_len | json
-types   : 1 CREATE(json=config)  2 TRANSCRIBE(json=options, pcm)  3 STATUS  4 CANCEL  5 SHUTDOWN
+types   : 1 CREATE(json=config)  2 TRANSCRIBE(json=options, pcm)  3 STATUS
+          4 CANCEL(json={"target": <request_id>})  5 SHUTDOWN
 ```
+
+TRANSCRIBE options may carry `"sample_rate"` (default 16000); the host sets
+`request_id` to the frame's id. A CANCEL frame has its own request id (its
+acknowledgement) and names the victim in `target`; the cancelled request
+then answers with status `CANCELLED` under its own id.
 
 - Bounds: `json_len ≤ 1 MiB`, `pcm_bytes ≤ 30 min × 16 kHz × 4`, `pcm_bytes % 4 == 0`.
   Violations → error response + host exits (stream is no longer trustworthy).
@@ -367,7 +378,17 @@ loads and transcribes on macOS Intel CPU (and Windows CPU via the CLI host);
 pinned multi-file download; honest provider reporting; clean packaging;
 no regressions in long dictation and correction.
 
-## 12. Waves
+## 12. Implementation status (2026-10-10)
+
+W1–W3 are implemented in `native/asr-runtime/` and verified on Linux x64
+with ONNX Runtime 1.23.2: contract tests (12 cases), IPC framing tests,
+model tests (exact text parity with `tools/reference_tdt.py` on EN 11 s,
+RU 11 s and RU 71 s; BUSY; cancel), and the host integration test
+(`tests/host_test.py`). Measured on a 44-core Xeon, 8 intra-op threads:
+RU 71 s in 6.2 s (RTF 0.087), RU 11 s in 0.9 s; peak RSS ≈ 1.0 GB.
+Not yet verified on macOS or Windows (no toolchain on the dev box).
+
+## 13. Waves
 
 | Wave | Content | Verifiable where |
 |---|---|---|
@@ -380,7 +401,7 @@ no regressions in long dictation and correction.
 | W6 | Quality & perf gates vs GGUF; optional CoreML/DirectML behind flags | Intel Mac, Windows |
 | W7 | GigaAM v3 CTC family; consolidation of selectors/diagnostics | all |
 
-## 13. Non-goals
+## 14. Non-goals
 
 No LLM migration to ONNX; no Python at runtime (Python is used only to
 produce test goldens); no assumption that `.onnx` files share a decoder; no

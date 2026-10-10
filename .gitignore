@@ -13,3 +13,7 @@ benchmark/runtime/
 benchmark/models/
 benchmark/results/raw/
 benchmark/logs/
+
+# ONNX ASR runtime: fetched SDKs and CMake build trees
+native/asr-runtime/third_party/onnxruntime/
+native/asr-runtime/build*/

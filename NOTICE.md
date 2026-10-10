@@ -23,3 +23,19 @@ the pinned commits, are checked in at
 package licenses remain available through their respective upstream
 projects.
 
+
+## ONNX ASR runtime (`native/asr-runtime/`, experimental)
+
+- [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.23.2 (MIT),
+  fetched as a pinned, hash-verified prebuilt by
+  `scripts/fetch-onnxruntime.sh`; its own `ThirdPartyNotices.txt` ships
+  alongside the library.
+- `native/asr-runtime/assets/nemo128.onnx` — NeMo-compatible 128-bin log-mel
+  feature graph from [onnx-asr](https://github.com/istupakov/onnx-asr) 0.12.0
+  by Ilya Stupakov (MIT).
+- `native/asr-runtime/third_party/nlohmann/json.hpp` —
+  [nlohmann/json](https://github.com/nlohmann/json) 3.11.3 (MIT).
+- Parakeet Ultra ONNX int8 weights (downloaded at runtime, not bundled):
+  [mldecode/parakeet-ultra-onnx-int8](https://huggingface.co/mldecode/parakeet-ultra-onnx-int8),
+  CC-BY-4.0 — based on [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra),
+  a retrain of NVIDIA [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
