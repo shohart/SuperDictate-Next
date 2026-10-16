@@ -166,9 +166,25 @@ public:
         check_cancelled(context);
 
         // 2. Encoder [1, encoder_dim, T'].
+        //
+        // The encoder length is the feature tensor's full frame count, NOT
+        // nemo128's features_lens (which is one frame shorter: the centred
+        // STFT's last frame). This int8 export (sherpa-onnx layout, always fed
+        // length == T there) returns NaN for EVERY output when the length
+        // leaves even one padded encoder frame, i.e. whenever
+        // ceil(features_lens / 8) < ceil(T / 8) — e.g. any clip of an exact
+        // 0.08 s multiple such as 4 s or 8 s: empty transcript. With batch 1
+        // the length only drives masking, so clips whose encoder lengths
+        // already matched decode bit-identically.
+        const int64_t feature_frames = features[0].GetTensorTypeAndShapeInfo().GetShape()[2];
+        int64_t encoder_length = feature_frames;
+        const int64_t encoder_length_shape[1] = {1};
         const char *enc_in[] = {"audio_signal", "length"};
         const char *enc_out[] = {"outputs", "encoded_lengths"};
-        Ort::Value enc_inputs[2] = {std::move(features[0]), std::move(features[1])};
+        Ort::Value enc_inputs[2] = {
+            std::move(features[0]),
+            Ort::Value::CreateTensor<int64_t>(memory_, &encoder_length, 1, encoder_length_shape, 1),
+        };
         auto encoded = encoder_->Run(run_options, enc_in, enc_inputs, 2, enc_out, 2);
         check_cancelled(context);
 

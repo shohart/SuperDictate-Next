@@ -170,6 +170,24 @@ TEST_CASE("silence, short audio and timestamps option") {
     CHECK_EQ(bare.body["request_id"].get<std::string>().empty(), false);
 }
 
+// Regression: nemo128's features_lens is one frame short of the feature
+// tensor; passed to the encoder as-is it leaves a padded encoder frame for
+// clips of an exact 0.08 s multiple and the int8 encoder returns all-NaN
+// (empty transcript). Every prefix of real speech must transcribe.
+TEST_CASE("short speech prefixes are never empty") {
+    const std::vector<float> audio = longest_golden_audio();
+    CHECK(audio.size() >= 16000 * 9);
+    if (audio.size() < 16000 * 9) return;
+    for (const size_t seconds : {2, 4, 6, 8}) {
+        const std::vector<float> prefix(audio.begin(), audio.begin() + long(seconds * 16000));
+        const Call call = transcribe(prefix);
+        CHECK_EQ(call.status, SD_ASR_OK);
+        if (call.status != SD_ASR_OK) continue;
+        if (call.body["text"].get<std::string>().empty()) std::printf("empty transcript for a %zu s prefix\n", seconds);
+        CHECK(!call.body["text"].get<std::string>().empty());
+    }
+}
+
 TEST_CASE("second concurrent call is BUSY, cancel interrupts, handle stays usable") {
     const std::vector<float> audio = longest_golden_audio();
     CHECK(!audio.empty());

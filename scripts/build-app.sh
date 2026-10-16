@@ -106,6 +106,11 @@ if [[ -d "$VULKAN_SHADER_SRC" ]]; then
 else
     echo "build-app.sh: WARNING: $VULKAN_SHADER_SRC not found -- shipping without a Vulkan shader corpus (Vulkan GPU mode will not be usable in this build; re-run scripts/vendor-parakeet-cpp.sh with cmake+glslc on PATH to generate it)" >&2
 fi
+# Experimental ONNX ASR backend (docs/specs/cross-platform-onnx-asr-spec.md
+# §10): SuperDictateOnnxHost in Contents/Helpers/, ONNX Runtime in
+# Contents/Frameworks/, catalog + feature graph + notices in
+# Contents/Resources/onnx-asr/. Signed together with the bundle below.
+"$ROOT_DIR/scripts/build-onnx-host.sh" "$STAGE_APP"
 chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime

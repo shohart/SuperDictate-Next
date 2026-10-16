@@ -408,7 +408,35 @@ RU 11 s and RU 71 s — fixtures reproducible via
 `tests/fixtures/fetch-audio.sh`; BUSY; cancel), and the host integration test
 (`tests/host_test.py`). Measured on a 44-core Xeon, 8 intra-op threads:
 RU 71 s in 6.2 s (RTF 0.087), RU 11 s in 0.9 s; peak RSS ≈ 1.0 GB.
-Not yet verified on macOS or Windows (no toolchain on the dev box).
+
+**macOS x86_64 (2026-10-16)**, Intel Mac (Xeon E5-2696 v3, AVX2, 36
+threads, macOS 26.7.1): the core builds against the osx-x86_64 1.23.2 SDK
+and contract, IPC and model tests pass with **exact** parity against the
+Linux goldens. `sd_asr_cli`, RU 71 s, warm run (load ≈ 2.7–3.6 s):
+
+| intra-op threads | processing | RTF |
+|---|---|---|
+| 4 | 13.4 s | 0.188 |
+| 8 | 9.0 s | 0.126 |
+| 16 | 6.0 s | 0.085 |
+
+Peak RSS of `sd_asr_cli` is ≈ 2.3 GB on macOS (`/usr/bin/time -l`, which
+counts the mapped model pages; the Linux figure above is VmHWM). Through
+the app (`--benchmark-transcribe-onnx 8`, Swift → SuperDictateOnnxHost):
+EN 11 s in 1.19 s, RU 11 s in 1.18 s, RU 71 s in 8.0 s (RTF 0.11), text
+identical to the goldens.
+
+**Bug found on the Mac and fixed (W4):** nemo128's `features_lens` is one
+frame shorter than its feature tensor. Passed to the encoder as-is it
+leaves one padded encoder frame whenever `ceil(len/8) < ceil(T/8)` (any
+clip of an exact 0.08 s multiple: 2 s, 4 s, 8 s…), and this int8 export —
+built for sherpa-onnx, which always feeds `length == T` — returns all-NaN
+encoder output: an **empty transcript** for most short dictations. The
+11 s / 71 s goldens happened to have equal encoder lengths, so parity
+tests missed it. The encoder now receives the full frame count (C++ and
+`reference_tdt.py`); with batch 1 the length only drives masking, so the
+goldens are unchanged. Regression test: "short speech prefixes are never
+empty" (`tests/model_tests.cpp`). Not yet verified on Windows.
 
 ## 13. Waves
 

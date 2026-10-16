@@ -63,7 +63,9 @@ def main():
             x = np.pad(x, (0, 4000 - len(x)))
         x = np.clip(np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), -1.0, 1.0).astype(np.float32)
         feats, flen = pre.run(None, {"waveforms": x[None], "waveforms_lens": np.array([len(x)], np.int64)})
-        out, olen = enc.run(None, {"audio_signal": feats, "length": flen})
+        # Full frame count, not flen (see nemo_tdt.cpp: the int8 encoder
+        # returns all-NaN when the length leaves a padded encoder frame).
+        out, olen = enc.run(None, {"audio_signal": feats, "length": np.array([feats.shape[2]], np.int64)})
         frames = min(int(olen[0]), out.shape[2])
         e = out[0]
         h = np.zeros((layers, 1, hidden), np.float32)

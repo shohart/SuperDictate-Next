@@ -52,3 +52,19 @@ Manual transcription:
 ```sh
 native/asr-runtime/build/sd_asr_cli --model "$MODEL" --assets native/asr-runtime/assets --text-only file.wav
 ```
+
+## App integration (macOS)
+
+`scripts/build-onnx-host.sh <staged.app>` (called by `build-app.sh` and
+`build-test-app.sh`) builds the host in `build-bundle/` with
+`CMAKE_BUILD_WITH_INSTALL_RPATH=ON` and stages `Contents/Helpers/SuperDictateOnnxHost`,
+`Contents/Frameworks/libonnxruntime.1.23.2.dylib` and
+`Contents/Resources/onnx-asr/` (catalog, `nemo128.onnx`, ORT notices). The Swift
+side is `OnnxAsrEngine.swift` / `OnnxModelDownload.swift`; the speech profile
+`parakeet_ultra_onnx` is experimental and CPU-only. Diagnostics without
+launching the app:
+
+```sh
+SuperDictate --benchmark-transcribe-onnx 8 file.wav...      # packaged or swift build binary
+SUPERDICTATE_ONNX_TEST_WAV=file.wav Parakey --self-test onnx-asr-real   # debug build
+```

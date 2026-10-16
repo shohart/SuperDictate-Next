@@ -93,6 +93,11 @@ if [[ -x "$LLM_HOST_BIN" ]]; then
     mkdir -p "$STAGE_APP/Contents/Helpers"
     cp "$LLM_HOST_BIN" "$STAGE_APP/Contents/Helpers/SuperDictateLLMHost"
 fi
+# Experimental ONNX ASR backend (docs/specs/cross-platform-onnx-asr-spec.md
+# §10): SuperDictateOnnxHost in Contents/Helpers/, ONNX Runtime in
+# Contents/Frameworks/, catalog + feature graph + notices in
+# Contents/Resources/onnx-asr/. Signed together with the bundle below.
+"$ROOT_DIR/scripts/build-onnx-host.sh" "$STAGE_APP"
 chmod 755 "$STAGE_APP/Contents/MacOS/${APP_NAME}"
 
 # Info.plist: same as swift/Info.plist but with the identity fields
