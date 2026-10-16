@@ -106,6 +106,8 @@ enum ParakeySelfTest {
             return runSuite("logging", testPrivateLogAppend)
         case "diagnostics":
             return runSuite("diagnostics", testDiagnostics)
+        case "agent-identity":
+            return runSuite("agent-identity", testAgentIdentity)
         case "insertion-target":
             return runSuite("insertion-target", testInsertionTargetTracking)
         case "insertion-target-live":
@@ -219,6 +221,7 @@ enum ParakeySelfTest {
 
     private static func testAll() throws {
         try testHotkey()
+        try testAgentIdentity()
         try testOnnxAsr()
         try testReadiness()
         try testPasteSuffixFormatting()
@@ -741,6 +744,24 @@ enum ParakeySelfTest {
             equals: "hardlink target\n",
             "log hard-link rejection should leave the target untouched"
         )
+    }
+
+    /// A side-by-side test bundle must never reuse the production
+    /// LaunchAgent label or agent state files (see AGENT_INSTANCE_SUFFIX).
+    private static func testAgentIdentity() throws {
+        try expect(agentInstanceSuffix(bundleIdentifier: nil), equals: "", "unbundled binary is production")
+        try expect(agentInstanceSuffix(bundleIdentifier: PRODUCTION_BUNDLE_IDENTIFIER), equals: "", "production bundle")
+        try expect(agentInstanceSuffix(bundleIdentifier: "com.local.superdictate.test"), equals: "test", "test bundle")
+        try expect(agentInstanceSuffix(bundleIdentifier: "com.local.superdictate.llm-gec"), equals: "llm-gec", "labelled test bundle")
+        try expect(agentInstanceSuffix(bundleIdentifier: "com.local.superdictatex"), equals: "", "lookalike prefix")
+        try expect(agentInstanceSuffix(bundleIdentifier: "com.local.superdictate."), equals: "", "empty suffix")
+        try expect(agentInstanceSuffix(bundleIdentifier: "com.local.superdictate.a/b"), equals: "", "unsafe suffix")
+        if Bundle.main.bundleIdentifier == nil {
+            try expect(AGENT_LABEL, equals: "com.local.superdictate.agent", "unbundled self-test keeps the production label")
+            try expect(AGENT_STATUS_FILE_NAME, equals: "AgentStatus.json", "unbundled self-test keeps the production state file")
+        } else if Bundle.main.bundleIdentifier != PRODUCTION_BUNDLE_IDENTIFIER {
+            try expect(AGENT_LABEL == "com.local.superdictate.agent", equals: false, "test bundle must not use the production label")
+        }
     }
 
     private static func testDiagnostics() throws {

@@ -51,10 +51,33 @@ let HOMEBREW_CASK_TOKEN = "shlgd/superdictate/superdictate"
 let HOMEBREW_CASK_INSTALLED_TOKEN = "parakey"
 let INSTALLED_APP_BUNDLE_PATH = "/Applications/SuperDictate.app"
 let AGENT_ARGUMENT = "--agent"
-let AGENT_LABEL = "com.local.superdictate.agent"
+let PRODUCTION_BUNDLE_IDENTIFIER = "com.local.superdictate"
+// A side-by-side test bundle (scripts/build-test-app.sh, e.g.
+// com.local.superdictate.test) gets its own LaunchAgent label, plist, state
+// files and launchd log. Sharing the production label let a test bundle
+// rewrite ~/Library/LaunchAgents/com.local.superdictate.agent.plist with
+// its own executable and restart the production agent from its control
+// panel. Unbundled binaries (swift build, self-tests) keep the production
+// names. The models cache in Application Support stays shared on purpose.
+func agentInstanceSuffix(bundleIdentifier: String?) -> String {
+    let prefix = PRODUCTION_BUNDLE_IDENTIFIER + "."
+    guard let identifier = bundleIdentifier, identifier.hasPrefix(prefix) else { return "" }
+    let suffix = identifier.dropFirst(prefix.count)
+    guard !suffix.isEmpty,
+          suffix.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else { return "" }
+    return String(suffix)
+}
+let AGENT_INSTANCE_SUFFIX = agentInstanceSuffix(bundleIdentifier: Bundle.main.bundleIdentifier)
+let AGENT_LABEL = AGENT_INSTANCE_SUFFIX.isEmpty
+    ? "com.local.superdictate.agent"
+    : "com.local.superdictate.\(AGENT_INSTANCE_SUFFIX).agent"
 let APP_SUPPORT_DIR_NAME = "SuperDictate"
-let AGENT_STATUS_FILE_NAME = "AgentStatus.json"
-let CONTROL_PANEL_PID_FILE_NAME = "ControlPanel.pid"
+let AGENT_STATUS_FILE_NAME = AGENT_INSTANCE_SUFFIX.isEmpty
+    ? "AgentStatus.json" : "AgentStatus-\(AGENT_INSTANCE_SUFFIX).json"
+let CONTROL_PANEL_PID_FILE_NAME = AGENT_INSTANCE_SUFFIX.isEmpty
+    ? "ControlPanel.pid" : "ControlPanel-\(AGENT_INSTANCE_SUFFIX).pid"
+let AGENT_LAUNCHD_LOG_NAME = AGENT_INSTANCE_SUFFIX.isEmpty
+    ? "SuperDictate-agent.launchd.log" : "SuperDictate-\(AGENT_INSTANCE_SUFFIX)-agent.launchd.log"
 let UPDATE_HELPER_LOG_PATH = (NSHomeDirectory() as NSString)
     .appendingPathComponent("Library/Logs/SuperDictate-update.log")
 let UPDATE_PROGRESS_ARGUMENT = "--update-progress"
