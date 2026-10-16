@@ -438,6 +438,23 @@ tests missed it. The encoder now receives the full frame count (C++ and
 goldens are unchanged. Regression test: "short speech prefixes are never
 empty" (`tests/model_tests.cpp`). Not yet verified on Windows.
 
+**W6 first comparison (2026-10-16, same Mac, release build of the app,
+8 threads, CPU vs CPU, idle machine).** `--benchmark-transcribe cpu 8` (GGUF
+parakeet-tdt-0.6b-v3 q8_0, in-process) vs `--benchmark-transcribe-onnx 8`:
+
+| Audio | GGUF CPU | ONNX CPU |
+|---|---|---|
+| EN 11 s | 1.26 s (RTF 0.114) | 0.78 s (0.070) |
+| RU 11 s | 1.40 s (0.123) | 0.81 s (0.071) |
+| RU 71 s | 9.98 s (0.140) | 6.11 s (0.085) |
+| RU 4 s (prefix) | 0.46 s | 0.31 s |
+| RU 5 s (mid-file) | 0.56 s | 0.45 s |
+
+Load: GGUF 0.66 s, ONNX 3.3 s (once per service start). Texts are close;
+the differences are punctuation/casing plus a few words (ONNX "надеждой
+сладкой" vs GGUF "Надежды сладкой"). The GGUF path on Vulkan (RX 6600) and a
+real-dictation WER comparison (§11 gate 4) are still open.
+
 ## 13. Waves
 
 | Wave | Content | Verifiable where |
