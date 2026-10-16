@@ -683,11 +683,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     // reentrancy guard) — belt-and-suspenders, not strictly
                     // required, cheap relative to model load.
                     let warmUpTiming = try await asr.warmUp()
-                    log("ASR: parakeet.cpp warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
+                    log("ASR: \(settings.speechModelProfile.displayName) warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
                 } catch {
                     // Model loading succeeded, so a failed best-effort warm-up
                     // must not make the dictation service unavailable.
-                    log("ASR: parakeet.cpp warm-up skipped: \(error.localizedDescription)")
+                    log("ASR: \(settings.speechModelProfile.displayName) warm-up skipped: \(error.localizedDescription)")
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
 
