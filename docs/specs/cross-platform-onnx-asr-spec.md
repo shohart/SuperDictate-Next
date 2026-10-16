@@ -422,7 +422,7 @@ Linux goldens. `sd_asr_cli`, RU 71 s, warm run (load ≈ 2.7–3.6 s):
 
 Peak RSS of `sd_asr_cli` is ≈ 2.3 GB on macOS (`/usr/bin/time -l`, which
 counts the mapped model pages; the Linux figure above is VmHWM). Through
-the app (`--benchmark-transcribe-onnx 8`, Swift → SuperDictateOnnxHost):
+the app (`--benchmark-transcribe onnx cpu 8`, Swift → SuperDictateOnnxHost):
 EN 11 s in 1.19 s, RU 11 s in 1.18 s, RU 71 s in 8.0 s (RTF 0.11), text
 identical to the goldens.
 
@@ -440,7 +440,7 @@ empty" (`tests/model_tests.cpp`). Not yet verified on Windows.
 
 **W6 first comparison (2026-10-16, same Mac, release build of the app,
 8 threads, CPU vs CPU, idle machine).** `--benchmark-transcribe cpu 8` (GGUF
-parakeet-tdt-0.6b-v3 q8_0, in-process) vs `--benchmark-transcribe-onnx 8`:
+parakeet-tdt-0.6b-v3 q8_0, in-process) vs `--benchmark-transcribe onnx cpu 8`:
 
 | Audio | GGUF CPU | ONNX CPU |
 |---|---|---|

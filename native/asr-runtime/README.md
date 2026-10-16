@@ -65,6 +65,6 @@ side is `OnnxAsrEngine.swift` / `OnnxModelDownload.swift`; the speech profile
 launching the app:
 
 ```sh
-SuperDictate --benchmark-transcribe-onnx 8 file.wav...      # packaged or swift build binary
+SuperDictate --benchmark-transcribe onnx cpu 8 file.wav... # packaged or swift build binary
 SUPERDICTATE_ONNX_TEST_WAV=file.wav Parakey --self-test onnx-asr-real   # debug build
 ```

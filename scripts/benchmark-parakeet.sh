@@ -154,7 +154,7 @@ run_one() {
         repeat_args+=("$clip_path")
     done
 
-    if /usr/bin/time -l "$BINARY" --benchmark-transcribe "$device" 8 "${repeat_args[@]}" \
+    if /usr/bin/time -l "$BINARY" --benchmark-transcribe parakeet "$device" 8 "${repeat_args[@]}" \
         > "$log_file" 2> "$time_file"; then
         echo "$log_file"
     else
