@@ -4730,6 +4730,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let gpuLanguage = settings.interfaceLanguage
         let vulkanAvailable = parakeetVulkanAvailable()
+        let deviceDescription = parakeetVulkanDeviceDescription()
         let useGPU = NSMenuItem(
             title: localizedText("Использовать GPU (Vulkan)", "Use GPU (Vulkan)", language: gpuLanguage),
             action: #selector(toggleUseGPU(_:)),
@@ -4739,10 +4740,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         useGPU.state = settings.useGPU ? .on : .off
         if vulkanAvailable {
             useGPU.isEnabled = true
-            let deviceDescription = parakeetVulkanDeviceDescription()
             useGPU.toolTip = localizedText(
-                "Запускает Vulkan-бэкенд вместо CPU для Parakeet и для модели коррекции текста (обнаружено: \(deviceDescription)). Перезагружает обе модели.",
-                "Runs the Vulkan backend instead of CPU for Parakeet and the text-correction model (detected: \(deviceDescription)). Reloads both models.",
+                "Запускает Vulkan-бэкенд вместо CPU для распознавания речи (ASR) (обнаружено: \(deviceDescription)). Перезагружает модель ASR. Модель коррекции/рерайтинга управляется отдельным переключателем «LLM на GPU».",
+                "Runs the Vulkan backend instead of CPU for speech recognition (ASR) (detected: \(deviceDescription)). Reloads the ASR model. The correction/rewrite model is governed by the separate \"LLM on GPU\" toggle.",
                 language: gpuLanguage
             )
         } else {
@@ -4758,6 +4758,31 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             )
         }
         sub.addItem(useGPU)
+
+        let llmGPU = NSMenuItem(
+            title: localizedText("LLM на GPU (Vulkan)", "LLM on GPU (Vulkan)", language: gpuLanguage),
+            action: #selector(toggleLLMUseGPU(_:)),
+            keyEquivalent: ""
+        )
+        llmGPU.target = self
+        llmGPU.state = settings.llmUseGPU ? .on : .off
+        if vulkanAvailable {
+            llmGPU.isEnabled = true
+            llmGPU.toolTip = localizedText(
+                "Запускает Vulkan-бэкенд для модели коррекции/рерайтинга текста (обнаружено: \(deviceDescription)). Независимо от переключателя ASR — можно держать ASR на CPU, а LLM на GPU. Перезагружает LLM-модель.",
+                "Runs the Vulkan backend for the text-correction/rewrite model (detected: \(deviceDescription)). Independent of the ASR toggle — you can keep ASR on CPU and the LLM on GPU. Reloads the LLM model.",
+                language: gpuLanguage
+            )
+        } else {
+            llmGPU.isEnabled = false
+            llmGPU.state = .off
+            llmGPU.toolTip = localizedText(
+                "Vulkan GPU не обнаружен. Модель коррекции/рерайтинга будет использовать CPU.",
+                "Vulkan GPU was not detected. The correction/rewrite model will use CPU.",
+                language: gpuLanguage
+            )
+        }
+        sub.addItem(llmGPU)
 
         let asrStatus = NSMenuItem(
             title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + lastKnownParakeetRuntimeStatusDescription(language: gpuLanguage),
@@ -6247,14 +6272,25 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch {
                 log("ASR: failed to reload after GPU setting change: \(error)")
             }
-            // The bundled correction-model host, if already running, was
-            // launched with the OLD --gpu-layers value baked into its
-            // process arguments (LLMHostProcess has no live-reconfigure
-            // path, unlike ParakeetEngine). Stop it so the next correction
-            // request lazily respawns it with the new useGPU value --
-            // mirrors the ASR reload immediately above, one user-facing
-            // toggle for both models.
+            // The ASR toggle governs ONLY the ASR backend now — the bundled
+            // LLM host has its own independent `llmUseGPU` toggle, so it is
+            // deliberately NOT stopped here.
+            self.rebuildMenu()
+        }
+        rebuildMenu()
+    }
+
+    @objc private func toggleLLMUseGPU(_ sender: NSMenuItem) {
+        settings.llmUseGPU.toggle()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // The bundled LLM host, if already running, was launched with the
+            // OLD --gpu-layers value baked into its process arguments
+            // (LLMHostProcess has no live-reconfigure path). Stop it so the
+            // next correction/rewrite request lazily respawns it with the new
+            // llmUseGPU value. ASR is untouched — it has its own toggle.
             await self.llmPostprocessing.stop()
+            log("LLM: stopped bundled host after LLM-GPU setting change (llmUseGPU=\(self.settings.llmUseGPU))")
             self.rebuildMenu()
         }
         rebuildMenu()

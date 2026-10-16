@@ -3126,12 +3126,12 @@ enum ParakeySelfTest {
         settings.textPostprocessingMode = .correction
         settings.llmEngineBackend = .bundledLocal
         // Exercise the SAME Vulkan backend Parakeet uses (atom hardware
-        // target + explicit product requirement: one GPU toggle governs
-        // both models). If no Vulkan device is present this falls back to
+        // target), via the LLM host's own GPU toggle. If no Vulkan device
+        // is present this falls back to
         // CPU inside SuperDictateLLMHost's own backend registry the same
         // way Parakeet does -- not a hard requirement for this test to
         // still pass, just the realistic runtime configuration.
-        settings.useGPU = true
+        settings.llmUseGPU = true
         // Stands in for "the user already corrected this once" -- the
         // app's real, general normalization mechanism (VocabularyStore
         // learns from actual user edits; this seeds one entry directly
@@ -3274,7 +3274,7 @@ enum ParakeySelfTest {
                                 vocabularyStore: vocabularyStore)
         settings.textPostprocessingMode = .correction
         settings.llmEngineBackend = .bundledLocal
-        settings.useGPU = true
+        settings.llmUseGPU = true
 
         let deterministic = processedDictationText(rawTranscript: transcription.text,
                                                     corrections: settings.transcriptCorrections,
@@ -3345,6 +3345,22 @@ enum ParakeySelfTest {
             try expect(settings.rewriteCustomBaseURL.isEmpty && settings.rewriteCustomAPIKey.isEmpty && settings.rewriteCustomModelName.isEmpty,
                        equals: true,
                        "rewrite custom endpoint fields must start empty")
+        }
+
+        // LLM GPU toggle: clean installs start on CPU; an unset toggle
+        // inherits the ASR toggle (pre-split behavior); once set it is
+        // independent of the ASR toggle.
+        do {
+            let settings = freshSettings()
+            try expect(settings.llmUseGPU, equals: false, "LLM must start on CPU on a clean install")
+            settings.useGPU = true
+            try expect(settings.llmUseGPU, equals: true, "an unset LLM GPU toggle must inherit the ASR toggle")
+            settings.llmUseGPU = false
+            try expect(settings.useGPU, equals: true, "setting the LLM toggle must not touch the ASR toggle")
+            try expect(settings.llmUseGPU, equals: false, "an explicit LLM GPU choice must override the ASR toggle")
+            settings.useGPU = false
+            settings.llmUseGPU = true
+            try expect(settings.llmUseGPU && !settings.useGPU, equals: true, "LLM on GPU with ASR on CPU must be representable")
         }
 
         // Corruption tolerance: unknown stored values fall back to defaults.
@@ -3583,7 +3599,7 @@ enum ParakeySelfTest {
                                 vocabularyStore: .inMemoryFallback())
         settings.rewriteEnabled = true
         settings.rewriteEngineBackend = .bundledLocal
-        settings.useGPU = true
+        settings.llmUseGPU = true
 
         // finalizedText resolves the rewrite model path via
         // yandexGPTModelPath() (Application Support) — stage the env

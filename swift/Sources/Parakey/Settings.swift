@@ -91,6 +91,14 @@ final class Settings: @unchecked Sendable {
     // changed. `use_gpu` itself is intentionally left unused/unread from
     // here on — it is simply abandoned old state, never migrated.
     private static let keyUseGPU = "parakeet_use_gpu"
+    // Independent GPU toggle for the bundled LLM postprocessing host
+    // (correction + rewrite). Deliberately separate from `parakeet_use_gpu`:
+    // the ASR benchmark showed Vulkan degrades ASR accuracy on this
+    // RX 6600/MoltenVK, while the LLM host is exactly where Vulkan pays off
+    // (~35 tok/s). A user may therefore run ASR on CPU and the LLM on GPU
+    // independently. Unset, it inherits `parakeet_use_gpu` (see `llmUseGPU`)
+    // — never forced on by default.
+    private static let keyLLMUseGPU = "llm_use_gpu_v1"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -1004,6 +1012,21 @@ final class Settings: @unchecked Sendable {
     var useGPU: Bool {
         get { defaults.bool(forKey: Self.keyUseGPU) }
         set { defaults.set(newValue, forKey: Self.keyUseGPU) }
+    }
+
+    /// Opt-in Vulkan GPU backend for the bundled LLM postprocessing host
+    /// (correction + rewrite). Independent of `useGPU` (which governs the
+    /// ASR backend) so the two can run on different devices — see
+    /// `keyLLMUseGPU`'s comment. Until the user flips it once it inherits
+    /// `useGPU`, which governed the LLM host before the split — an upgrade
+    /// never silently moves a GPU user's correction model to CPU. Clean
+    /// installs still start on CPU (both keys unset read as `false`).
+    var llmUseGPU: Bool {
+        get {
+            guard defaults.object(forKey: Self.keyLLMUseGPU) != nil else { return useGPU }
+            return defaults.bool(forKey: Self.keyLLMUseGPU)
+        }
+        set { defaults.set(newValue, forKey: Self.keyLLMUseGPU) }
     }
 
     /// Off / correction (see TextPostprocessingMode's own doc comment for
