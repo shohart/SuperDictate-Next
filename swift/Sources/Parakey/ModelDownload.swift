@@ -837,6 +837,8 @@ func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
         return parakeetModelPath()
     case .whisperRussian, .whisperRussianCodeSwitch:
         return whisperCppModelCacheDirectory()
+    case .parakeetUltraOnnx:
+        return onnxModelCacheDirectory()
     }
 }
 
@@ -966,7 +968,7 @@ func speechModelDiskSpaceFailureDetail(profile: SpeechModelProfile,
         return nil
     }
     return """
-    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for parakeet.cpp to prepare it.
+    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for the speech runtime to prepare it.
 
     Available: \(formattedByteCount(UInt64(availableBytes)))
     Needed: \(formattedByteCount(UInt64(requiredBytes)))
@@ -996,6 +998,9 @@ func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
         // The whisper.cpp cache is only ready when the GGUF file itself is
         // present (the directory may survive a failed/interrupted download).
         return isPlainRegularFile(whisperGGUFModelPath().path)
+    case .parakeetUltraOnnx:
+        // manifest.json is written last, only after every file verified.
+        return isPlainRegularFile(onnxModelManifestURL().path)
     }
 }
 

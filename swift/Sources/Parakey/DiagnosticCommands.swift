@@ -37,6 +37,17 @@ import QuartzCore
 import ServiceManagement
 import UniformTypeIdentifiers
 
+/// Exit status written by a detached diagnostic task and read after its
+/// semaphore is signalled (a plain captured `var` is rejected by Swift 6
+/// strict concurrency).
+final class DiagnosticExitCode: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: Int32 = EXIT_FAILURE
+
+    var value: Int32 { lock.lock(); defer { lock.unlock() }; return status }
+    func set(_ newValue: Int32) { lock.lock(); status = newValue; lock.unlock() }
+}
+
 func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
     guard arguments.first == "--diagnose-audio-capture" else { return nil }
     guard arguments.count == 3,
@@ -119,7 +130,7 @@ func runParakeetBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     // root-caused in the Phase 3 report. `Task.detached` + a semaphore
     // (the Phase 4 report's proven fix for this exact shape) avoids it.
     let semaphore = DispatchSemaphore(value: 0)
-    var exitCode: Int32 = EXIT_FAILURE
+    let exitCode = DiagnosticExitCode()
     Task.detached {
         defer { semaphore.signal() }
         do {
@@ -151,14 +162,70 @@ func runParakeetBenchmarkDiagnostic(arguments: [String]) -> Int32? {
                 print("BENCH_RESULT file=\(path) duration_s=\(durationSeconds) wall_s=\(wallSeconds) inference_s=\(result.inferenceSeconds) total_s=\(result.totalSeconds) rtf=\(rtf) used_gpu=\(result.usedGPU) text=\(escapedText)")
             }
             await engine.shutdown()
-            exitCode = EXIT_SUCCESS
+            exitCode.set(EXIT_SUCCESS)
         } catch {
             fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
-            exitCode = EXIT_FAILURE
+            exitCode.set(EXIT_FAILURE)
         }
     }
     semaphore.wait()
-    return exitCode
+    return exitCode.value
+}
+
+/// ONNX sibling of `--benchmark-transcribe` (spec §11 gate 6): same
+/// output lines, same "never construct NSApplication" rule, real production
+/// code paths (`downloadOnnxModelIfNeeded()`, `OnnxAsrEngine`, the
+/// SuperDictateOnnxHost helper resolved from Contents/Helpers).
+///
+/// usage: SuperDictate --benchmark-transcribe-onnx <threads> <wav1> [wav2 ...]
+func runOnnxBenchmarkDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--benchmark-transcribe-onnx" else { return nil }
+    let usage = "usage: SuperDictate --benchmark-transcribe-onnx <threads> <wav1> [wav2 ...]\n"
+    guard arguments.count >= 3, let threads = Int(arguments[1]), (1...32).contains(threads) else {
+        fputs(usage, stderr)
+        return EXIT_FAILURE
+    }
+    let wavPaths = Array(arguments.dropFirst(2))
+
+    let semaphore = DispatchSemaphore(value: 0)
+    let exitCode = DiagnosticExitCode()
+    Task.detached {
+        defer { semaphore.signal() }
+        do {
+            let modelDirectory = try await downloadOnnxModelIfNeeded()
+            let loadStart = ProcessInfo.processInfo.systemUptime
+            let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threads)
+            let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
+
+            let warmStart = ProcessInfo.processInfo.systemUptime
+            _ = try await engine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+            let warmSeconds = ProcessInfo.processInfo.systemUptime - warmStart
+            let provider = await engine.providerActual
+
+            print("BENCH_LOAD device=onnx requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=onnxruntime-\(provider)")
+
+            for path in wavPaths {
+                let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))
+                let durationSeconds = Double(samples.count) / SAMPLE_RATE
+                let callStart = ProcessInfo.processInfo.systemUptime
+                let result = try await engine.transcribe(samples: samples)
+                let wallSeconds = ProcessInfo.processInfo.systemUptime - callStart
+                let rtf = durationSeconds > 0 ? result.processingSeconds / durationSeconds : 0
+                let escapedText = result.text
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\t", with: " ")
+                    .replacingOccurrences(of: "\n", with: " ")
+                print("BENCH_RESULT file=\(path) duration_s=\(durationSeconds) wall_s=\(wallSeconds) inference_s=\(result.processingSeconds) total_s=\(wallSeconds) rtf=\(rtf) used_gpu=false text=\(escapedText)")
+            }
+            await engine.shutdown()
+            exitCode.set(EXIT_SUCCESS)
+        } catch {
+            fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
+            exitCode.set(EXIT_FAILURE)
+        }
+    }
+    semaphore.wait()
+    return exitCode.value
 }
 
 /// Reads a WAV file as mono Float32 PCM at `SAMPLE_RATE` Hz, converting if

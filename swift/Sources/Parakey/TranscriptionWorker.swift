@@ -180,6 +180,7 @@ actor TranscriptionWorker {
     private enum LoadedEngine {
         case parakeet(ParakeetEngine)
         case whisperCpp(WhisperCppEngine)
+        case onnx(OnnxAsrEngine)
     }
 
     private var engine: LoadedEngine?
@@ -238,7 +239,9 @@ actor TranscriptionWorker {
         // already failed once this session (§9.3 — never retry Vulkan again
         // within the same session; only a full app restart may attempt it
         // again, since the persisted preference is never auto-mutated).
-        let requestedGPU = Settings.shared.useGPU
+        // The ONNX backend is CPU-only (spec §6): the GPU preference does
+        // not apply to it and must not trigger Vulkan fallback bookkeeping.
+        let requestedGPU = Settings.shared.useGPU && !profile.usesOnnxRuntime
         let attemptVulkan = requestedGPU && !vulkanFailedThisSession
         if requestedGPU && vulkanFailedThisSession {
             log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan already failed once this session (\(vulkanFailureReason ?? "unknown reason")) — staying on CPU for the rest of this session")
@@ -260,11 +263,15 @@ actor TranscriptionWorker {
         }
         let t0 = Date()
         let loaded: LoadedEngine
-        if profile == .parakeetTDTv3 {
+        switch profile {
+        case .parakeetTDTv3:
             let result = try await loadParakeetEngine(attemptVulkan: attemptVulkan, progressHandler: progressHandler)
             loaded = .parakeet(result.engine)
             runtimeStatus = result.status
-        } else {
+        case .parakeetUltraOnnx:
+            loaded = .onnx(try await loadOnnxEngine(progressHandler: progressHandler))
+            runtimeStatus = .cpu
+        case .whisperRussian, .whisperRussianCodeSwitch:
             let modelURL = try await downloadWhisperGGUFModelIfNeeded()
             let language = profile == .whisperRussian ? "ru" : "auto"
             var effectiveGPU = useGPU
@@ -292,10 +299,13 @@ actor TranscriptionWorker {
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
         log("ASR model: \(profile.displayName)")
-        if case .parakeet = loaded {
+        switch loaded {
+        case .parakeet:
             log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
-        } else {
+        case .whisperCpp:
             log("ASR runtime: whisper.cpp (GGUF)")
+        case .onnx:
+            log("ASR runtime: ONNX Runtime (SuperDictateOnnxHost)")
         }
         log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
         if case .parakeet(let parakeet) = loaded {
@@ -303,6 +313,9 @@ actor TranscriptionWorker {
             log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(runtimeStatus == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
         } else if case .whisperCpp(let whisper) = loaded {
             log("ASR device selected: \(whisper.usedGPU ? "Vulkan" : "CPU")")
+        } else if case .onnx(let onnx) = loaded {
+            let reason = await onnx.providerFallbackReason
+            log("ASR device selected: \(await onnx.providerActual)\(reason.isEmpty ? "" : " (\(reason))")")
         }
         // Best-effort legacy cleanup, only after Parakeet has itself
         // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
@@ -360,6 +373,28 @@ actor TranscriptionWorker {
         return (cpuEngine, requestedGPUButFellBackStatus(attemptedVulkan: attemptVulkan))
     }
 
+    private func loadOnnxEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> OnnxAsrEngine {
+        let modelDirectory = try await downloadOnnxModelIfNeeded(progressHandler: progressHandler)
+        let threadCount = Self.resolvedParakeetThreadCount()
+        log("ASR threads: \(threadCount)")
+        let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threadCount)
+        log("ASR ONNX model load: \(String(format: "%.2f", await engine.loadSeconds)) s")
+        let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
+        _ = try await engine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+        log("ASR warm-up (ONNX CPU): \(String(format: "%.2f", ProcessInfo.processInfo.systemUptime - warmUpStartedAt)) s")
+        return engine
+    }
+
+    /// The ONNX helper is killed on a hard timeout or dies on a crash; the
+    /// next request gets a fresh one (spec §8) instead of a dead engine.
+    private func liveOnnxEngine(_ onnx: OnnxAsrEngine) async throws -> OnnxAsrEngine {
+        if await onnx.isAlive { return onnx }
+        log("ASR: ONNX helper is gone — relaunching")
+        let fresh = try await loadOnnxEngine(progressHandler: nil)
+        engine = .onnx(fresh)
+        return fresh
+    }
+
     /// `.cpuFallbackAfterVulkanError` iff this CPU load happened AFTER a
     /// Vulkan attempt just failed in the same call; plain `.cpu` if GPU was
     /// never requested at all this session.
@@ -413,6 +448,14 @@ actor TranscriptionWorker {
                                                      totalSeconds: transcription.processingSeconds,
                                                      inferenceSeconds: transcription.processingSeconds,
                                                      usedGPU: whisper.usedGPU)
+            case .onnx(let onnx):
+                isVulkanEngine = false
+                let live = try await liveOnnxEngine(onnx)
+                let transcription = try await live.transcribe(samples: samples)
+                result = ParakeetTranscriptionResult(text: transcription.text,
+                                                     totalSeconds: transcription.processingSeconds,
+                                                     inferenceSeconds: transcription.processingSeconds,
+                                                     usedGPU: false)
             }
         } catch where isVulkanEngine {
             // spec §9.3: a Vulkan engine that initialized fine but fails
@@ -515,11 +558,16 @@ actor TranscriptionWorker {
         defer { inFlight = false }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        guard case .parakeet(let parakeet) = engine else {
+        let transcription: TokenTranscription
+        switch engine {
+        case .parakeet(let parakeet):
+            transcription = try await parakeet.transcribeWithTokens(samples: samples)
+        case .onnx(let onnx):
+            transcription = try await liveOnnxEngine(onnx).transcribeWithTokens(samples: samples)
+        case .whisperCpp:
             throw NSError(domain: "Parakey", code: -5,
                           userInfo: [NSLocalizedDescriptionKey: "Token timestamps are only available for Parakeet"])
         }
-        let transcription = try await parakeet.transcribeWithTokens(samples: samples)
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TokenTranscriptionWorkerResult(
             transcription: transcription,
@@ -542,10 +590,13 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
-        if let engine {
-            if case .parakeet(let parakeet) = engine {
-                await parakeet.shutdown()
-            }
+        switch engine {
+        case .parakeet(let parakeet):
+            await parakeet.shutdown()
+        case .onnx(let onnx):
+            await onnx.shutdown()
+        case .whisperCpp, nil:
+            break
         }
         engine = nil
         loadedProfile = nil

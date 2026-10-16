@@ -190,6 +190,10 @@ enum ParakeySelfTest {
             return runSuite("llm-rewrite", testLLMRewriteIntegration)
         case "full-pipeline":
             return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
+        case "onnx-asr":
+            return runSuite("onnx-asr", testOnnxAsr)
+        case "onnx-asr-real":
+            return runSuite("onnx-asr-real", testOnnxAsrRealModel)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -215,6 +219,7 @@ enum ParakeySelfTest {
 
     private static func testAll() throws {
         try testHotkey()
+        try testOnnxAsr()
         try testReadiness()
         try testPasteSuffixFormatting()
         try testClipboardPasteInserterTransientMarking()
@@ -8908,6 +8913,99 @@ enum ParakeySelfTest {
             flagsRawValue: flags,
             isAutoRepeat: isAutoRepeat
         )
+    }
+
+    /// ONNX ASR wiring without a model: bundled catalog, derived manifest,
+    /// file-name safety, the experimental profile and its cache location.
+    private static func testOnnxAsr() throws {
+        guard let resources = resolvedOnnxAsrResources() else {
+            throw SelfTestFailure.failed("ONNX ASR resources not found (bundle or source tree)")
+        }
+        let entry = try loadOnnxCatalogEntry(catalogURL: resources.catalogURL)
+        try expect(entry.modelID, equals: PARAKEET_ULTRA_ONNX_MODEL_ID, "catalog model id")
+        try expect(entry.files.map(\.role), equals: ["decoder", "encoder", "joiner", "tokens"],
+                   "downloadable roles (bundled preprocessor excluded)")
+        try expect(entry.totalBytes, equals: PARAKEET_ULTRA_ONNX_SIZE_BYTES, "catalog byte total matches the UI constant")
+        try expect(entry.files.allSatisfy { $0.url.host == "huggingface.co" && $0.url.absoluteString.contains(entry.revision) },
+                   equals: true, "every URL is pinned to the catalog revision")
+
+        let manifestData = try onnxManifestData(for: entry)
+        guard let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+              let files = manifest["files"] as? [String: [String: Any]] else {
+            throw SelfTestFailure.failed("manifest is not a JSON object with files")
+        }
+        try expect(manifest["schema"] as? Int, equals: 1, "manifest schema")
+        try expect(manifest["family"] as? String, equals: "nemo_tdt", "manifest family")
+        try expect(manifest["display_name"] == nil && manifest["attribution"] == nil, equals: true,
+                   "catalog-only keys stripped")
+        try expect(files.values.contains { $0["url"] != nil }, equals: false, "download URLs stripped")
+        try expect(files["preprocessor"]?["bundled"] as? String, equals: "nemo128.onnx", "bundled preprocessor kept")
+
+        for bad in ["", ".", "..", "../x.onnx", "a/b.onnx", "/abs.onnx", ".hidden", "manifest.json", "a\\b"] {
+            try expect(isSafeOnnxModelFileName(bad), equals: false, "unsafe file name \(bad)")
+        }
+        try expect(isSafeOnnxModelFileName("encoder.int8.onnx"), equals: true, "plain file name")
+
+        try expect(productionSpeechModelProfile(rawValue: "parakeet_ultra_onnx"), equals: .parakeetUltraOnnx,
+                   "ONNX profile persists")
+        try expect(SpeechModelProfile.parakeetUltraOnnx.usesOnnxRuntime, equals: true, "ONNX profile uses ORT")
+        try expect(SpeechModelProfile.parakeetTDTv3.usesOnnxRuntime, equals: false, "GGUF Parakeet is not ORT")
+        try expect(SpeechModelProfile.productionDefault, equals: .parakeetTDTv3, "GGUF stays the default")
+        let cacheDir = speechModelCacheDirectory(for: .parakeetUltraOnnx)
+        try expect(cacheDir.path.hasSuffix("/SuperDictate/onnx/parakeet-ultra-int8"), equals: true, "ONNX cache location")
+        try expect(isSafeSpeechModelCacheDirectory(cacheDir), equals: true, "ONNX cache is removable by cache reset")
+
+        let empty = FileManager.default.temporaryDirectory.appendingPathComponent("onnx-selftest-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: empty) }
+        try expect(onnxInstalledModelMatchesCatalog(entry, directory: empty), equals: false, "empty dir is not installed")
+        try onnxManifestData(for: entry).write(to: empty.appendingPathComponent("manifest.json"))
+        try expect(onnxInstalledModelMatchesCatalog(entry, directory: empty), equals: false,
+                   "a manifest without the files is not installed")
+    }
+
+    /// Real model through the production path: TranscriptionWorker.load
+    /// (installed-cache check + SuperDictateOnnxHost), plain and token
+    /// transcription, and the multi-segment overlap path.
+    /// Needs the model installed in the app cache and SUPERDICTATE_ONNX_TEST_WAV.
+    private static func testOnnxAsrRealModel() throws {
+        guard speechModelCacheExists(for: .parakeetUltraOnnx),
+              let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_ONNX_TEST_WAV"],
+              FileManager.default.fileExists(atPath: wavPath) else {
+            print("SKIP onnx-asr-real: needs the installed ONNX model + SUPERDICTATE_ONNX_TEST_WAV")
+            return
+        }
+        let (samples, rate) = try loadWavMonoFloat32(path: wavPath)
+        try expect(rate, equals: UInt32(SAMPLE_RATE), "fixture sample rate")
+        let worker = TranscriptionWorker()
+        defer { _ = try? runParakeetEngineSynchronously { await worker.unload() } }
+        try runParakeetEngineSynchronously { try await worker.load(profile: .parakeetUltraOnnx) }
+        try expect(try runParakeetEngineSynchronously { await worker.runtimeStatus }, equals: .cpu, "ONNX runtime status")
+
+        let short = Array(samples.prefix(Int(SAMPLE_RATE * 8)))
+        let now = ProcessInfo.processInfo.systemUptime
+        let plain = try runParakeetEngineSynchronously {
+            try await worker.transcribe(samples: short, resolveViaKeyboard: false, requestedAt: now)
+        }
+        let tokens = try runParakeetEngineSynchronously {
+            try await worker.transcribeWithTokens(samples: short, requestedAt: now)
+        }
+        print("ONNX REAL plain: \(plain.text)")
+        try expect(plain.text.isEmpty, equals: false, "plain transcript")
+        try expect(tokens.transcription.text, equals: plain.text, "token path text equals plain path text")
+        try expect(tokens.transcription.frameSec, equals: 0.08, "TDT frame stride")
+        try expect(tokens.transcription.words.isEmpty, equals: false, "word timestamps present")
+        try expect(zip(tokens.transcription.words, tokens.transcription.words.dropFirst()).allSatisfy { $0.start <= $1.start },
+                   equals: true, "word timestamps are monotonic")
+
+        let segmented = try runParakeetEngineSynchronously {
+            try await transcribeSegmented(samples: samples, worker: worker, language: nil,
+                                          resolveViaKeyboard: false, requestedAt: now)
+        }
+        let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
+        print("ONNX REAL segmented (\(segments.count) segment(s)): \(segmented.text)")
+        try expect(segmented.text.isEmpty, equals: false, "segmented transcript")
+        try expect(segmented.hadSegmentFailure, equals: false, "no lost segment")
     }
 
     private static func expect<T: Equatable>(

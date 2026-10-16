@@ -353,6 +353,10 @@ enum SpeechModelProfile: String, CaseIterable {
     case parakeetTDTv3 = "parakeet_tdt_v3"
     case whisperRussian = "whisper_large_v3_turbo_russian"
     case whisperRussianCodeSwitch = "whisper_large_v3_turbo_russian_codeswitch"
+    /// Experimental ONNX backend (docs/specs/cross-platform-onnx-asr-spec.md):
+    /// Parakeet Ultra int8 in the SuperDictateOnnxHost helper, CPU only.
+    /// Explicit user choice; never selected or migrated to automatically.
+    case parakeetUltraOnnx = "parakeet_ultra_onnx"
 
     static let productionDefault: SpeechModelProfile = .parakeetTDTv3
 
@@ -369,6 +373,7 @@ enum SpeechModelProfile: String, CaseIterable {
         case .parakeetTDTv3: return "Parakeet TDT 0.6B v3"
         case .whisperRussian: return "Whisper Large v3 Turbo Russian"
         case .whisperRussianCodeSwitch: return "Whisper Large v3 Turbo Russian Code-Switch"
+        case .parakeetUltraOnnx: return "Parakeet Ultra 0.6B ONNX (experimental)"
         }
     }
 
@@ -381,6 +386,7 @@ enum SpeechModelProfile: String, CaseIterable {
         case .parakeetTDTv3: return "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
         case .whisperRussian: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: русский"
         case .whisperRussianCodeSwitch: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: авто (RU/EN)"
+        case .parakeetUltraOnnx: return "ONNX Runtime · Parakeet Ultra 0.6B (TDT) · ONNX int8 · CPU · CC-BY-4.0: NVIDIA (parakeet-tdt-0.6b-v3), Moondream (parakeet-ultra), mldecode (ONNX int8)"
         }
     }
 
@@ -393,11 +399,25 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var estimatedDownloadBytes: Int64 {
-        self == .parakeetTDTv3 ? PARAKEET_MODEL_SIZE_BYTES : WHISPER_GGUF_SIZE_BYTES
+        switch self {
+        case .parakeetTDTv3: return PARAKEET_MODEL_SIZE_BYTES
+        case .whisperRussian, .whisperRussianCodeSwitch: return WHISPER_GGUF_SIZE_BYTES
+        case .parakeetUltraOnnx: return PARAKEET_ULTRA_ONNX_SIZE_BYTES
+        }
     }
 
     var downloadSizeText: String {
-        self == .parakeetTDTv3 ? "about 940 MB" : "about 874 MB"
+        switch self {
+        case .parakeetTDTv3: return "about 940 MB"
+        case .whisperRussian, .whisperRussianCodeSwitch: return "about 874 MB"
+        case .parakeetUltraOnnx: return "about 630 MB"
+        }
+    }
+
+    /// True for the experimental ONNX Runtime backend (CPU only; the
+    /// "Use GPU" preference does not apply to it).
+    var usesOnnxRuntime: Bool {
+        self == .parakeetUltraOnnx
     }
 }
 

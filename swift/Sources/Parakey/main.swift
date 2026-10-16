@@ -47,6 +47,8 @@ let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
 if let benchmarkResult = runParakeetBenchmarkDiagnostic(arguments: launchArguments) {
     exit(benchmarkResult)
+} else if let onnxBenchmarkResult = runOnnxBenchmarkDiagnostic(arguments: launchArguments) {
+    exit(onnxBenchmarkResult)
 } else if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
