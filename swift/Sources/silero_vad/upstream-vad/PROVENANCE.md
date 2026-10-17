@@ -113,4 +113,4 @@ Do not hand-edit anything under this directory — re-run the vendor script.
   to that task's implementer.
 - License: both whisper.cpp and Silero VAD are MIT-licensed. See
   `LICENSE-whisper-cpp.txt` and `LICENSE-silero-vad.txt` in this directory.
-- Vendored on: 2026-07-30T21:51:10Z
+- Vendored on: 2026-10-17T17:22:42Z

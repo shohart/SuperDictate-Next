@@ -362,9 +362,8 @@ static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_pa
     // SuperDictate uses Silero VAD as a small CPU-side segmentation helper.
     // Do not add the registered ACCEL/BLAS backend to this scheduler: on the
     // Intel Accelerate path, short VAD matrix shapes can reach llamafile_sgemm
-    // with ldb < k and abort the process. Parakeet keeps its own CPU/Vulkan
-    // backend selection; this VAD context intentionally uses the safe CPU
-    // backend only.
+    // with ldb < k and abort the process. This VAD context intentionally uses
+    // the safe CPU backend only.
 
     ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (backend_cpu == nullptr) {

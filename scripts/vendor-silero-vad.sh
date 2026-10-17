@@ -4,7 +4,9 @@
 # whisper_vad_* functions) into swift/Sources/silero_vad/upstream-vad/.
 # Re-run this and commit the result to update the pin; never hand-edit files
 # under swift/Sources/silero_vad/upstream-vad/ — this script wipes and
-# regenerates that whole directory (see `rm -rf "$DEST"` below).
+# regenerates that whole directory. It is built in a scratch directory and
+# swapped in only after every step succeeded, so a failed run leaves the
+# committed tree untouched.
 #
 # This is a SEPARATE, additive vendor tree from
 # swift/Sources/silero_vad/upstream/ (the CPU-only ggml v0.13.0 core,
@@ -69,9 +71,10 @@ SILERO_VAD_MODEL_SIZE_BYTES=885098
 # branch name to an immutable revision SHA).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="$ROOT_DIR/swift/Sources/silero_vad/upstream-vad"
+DEST_FINAL="$ROOT_DIR/swift/Sources/silero_vad/upstream-vad"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
+DEST="$WORK_DIR/upstream-vad"
 
 echo "vendor-silero-vad.sh: cloning ggml-org/whisper.cpp @ $SILERO_VAD_SOURCE_COMMIT ..."
 git clone --quiet "$SILERO_VAD_SOURCE_REMOTE" "$WORK_DIR/src"
@@ -987,9 +990,9 @@ old = '''    // ACCEL backends
 new = '''    // SuperDictate uses Silero VAD as a small CPU-side segmentation helper.
     // Do not add the registered ACCEL/BLAS backend to this scheduler: on the
     // Intel Accelerate path, short VAD matrix shapes can reach llamafile_sgemm
-    // with ldb < k and abort the process. Parakeet keeps its own CPU/Vulkan
-    // backend selection; this VAD context intentionally uses the safe CPU
-    // backend only.
+    // with ldb < k and abort the process. This VAD context intentionally uses
+    // the safe CPU backend only.
+'''
 if old not in text:
     raise SystemExit("vendor-silero-vad.sh: expected ACCEL backend block was not found")
 path.write_text(text.replace(old, new, 1))
@@ -1147,7 +1150,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 EOF
 
-dest_file_count=$(find "$DEST" -type f | wc -l | tr -d ' ')
-dest_size=$(du -sh "$DEST" | cut -f1)
-echo "vendor-silero-vad.sh: vendored $dest_file_count files ($dest_size) into $DEST"
+rm -rf "$DEST_FINAL"
+mv "$DEST" "$DEST_FINAL"
+
+dest_file_count=$(find "$DEST_FINAL" -type f | wc -l | tr -d ' ')
+dest_size=$(du -sh "$DEST_FINAL" | cut -f1)
+echo "vendor-silero-vad.sh: vendored $dest_file_count files ($dest_size) into $DEST_FINAL"
 echo "vendor-silero-vad.sh: whisper.cpp @ $ACTUAL_COMMIT"
