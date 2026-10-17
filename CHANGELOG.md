@@ -8,6 +8,49 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## v0.7.0 — 2026-10-17
+
+### Changed
+- **Speech recognition is ONNX on the CPU.**
+  - The model is Parakeet Ultra 0.6B (TDT, ONNX int8), run by ONNX Runtime 1.23.2 in a new `SuperDictateOnnxHost` helper process.
+  - It is now the only speech engine. A saved GGUF or Whisper selection switches to it automatically.
+  - The model is downloaded once and is about 630 MB.
+- **The GPU is used only by the local LLM** (correction and rewrite), through the "LLM on GPU (Vulkan)" toggle.
+  - This toggle inherits the old "Use GPU" setting until you change it.
+  - It now asks the LLM host itself which Vulkan devices it can see.
+- **The app is smaller.**
+  - The app process no longer carries Vulkan or MoltenVK. Its executable shrank from 11 MB to 4.4 MB.
+  - The release ZIP shrank from 47 MB to 19 MB.
+  - Pause detection (Silero VAD) runs on a CPU-only ggml core.
+
+### Removed
+- The GGUF parakeet.cpp engine and its Vulkan path.
+- whisper.cpp: the Whisper profiles, the `SuperDictateWhisperHost` helper and its model download.
+- The ASR "Use GPU (Vulkan)" toggle.
+
+The model files from earlier versions are no longer used and can be deleted:
+- `~/Library/Application Support/SuperDictate/Models/tdt-0.6b-v3-q8_0.gguf`
+- `~/Library/Application Support/SuperDictate/Models/whisper-cpp/`
+
+### Fixed
+- Short dictations no longer come back empty: the ONNX encoder now receives the full feature frame count.
+- Side-by-side test bundles get their own LaunchAgent, so they can no longer take over the installed app's agent.
+
+### Why
+Benchmark on an Intel Mac (Xeon E5-2696 v3, AMD Radeon Vega). Every clip went through the real dictation path, with no LLM correction. The results are in `docs/specs/cross-platform-onnx-asr-spec.md` §12.
+
+| Engine | Mean WER | Mean RTF |
+|---|---:|---:|
+| ONNX on the CPU | 0.079 | 0.119 |
+| GGUF Parakeet on the CPU | 0.084 | 0.182 |
+| GGUF Parakeet on Vulkan | 0.084 | 0.133 |
+| whisper.cpp on Vulkan | — | about 11 s per call, whatever the clip length |
+
+### Validation
+- Version 0.7.0 (build 59), bundle id `com.local.superdictate`, macOS 14.0+, x86_64.
+- Self-test groups passed, plus these real-model runs: ONNX ASR, Silero VAD, LLM correction and rewrite on the GPU, and ONNX followed by LLM correction end to end.
+- `SuperDictate.zip` SHA-256: `4c247fbe4aa25bdaef90955549791b4d05681b7d5ad1702af39426cb86c83560`.
+
 ## v0.5.5 — 2026-08-19
 
 ### Added
