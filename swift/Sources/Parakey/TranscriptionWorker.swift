@@ -7,7 +7,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -18,24 +17,16 @@ import UniformTypeIdentifiers
 
 // MARK: - Transcription worker
 //
-// Owns the single loaded `ParakeetEngine`. parakeet.cpp's loaded context
-// doesn't tolerate concurrent inference calls — but the actor alone does
-// NOT keep that contract. Actors are reentrant at suspension points: while
-// `await engine.transcribe(...)` is suspended, a second transcribe() call
-// would enter the actor and start a concurrent inference against the same
-// context. The real guard is ParakeyApp.isBusy, which ensures the app never
-// issues a second transcribe while one is in flight. The `inFlight` flag
-// below is a cheap defensive backstop should that invariant ever break: it
-// refuses (and, in DEBUG, asserts on) a re-entrant call instead of
-// corrupting engine state. (The native bridge itself adds a THIRD,
-// independent guard — see `SD_PARAKEET_ERR_BUSY` in
-// swift/Sources/parakeet_cpp/bridge/superdictate_parakeet.cpp.)
-//
-// Per docs/parakeet-intel-backend.md §9, this is a single `ParakeetEngine?`
-// field, not an engine-picker enum — there is exactly one production ASR
-// engine (spec §2.1), so `LoadedSpeechEngine` (the old
-// `.whisperLargeV3Turbo(WhisperEngine)` single-case enum this replaces) is
-// gone entirely rather than gaining a second case.
+// Owns the single loaded `OnnxAsrEngine` (the SuperDictateOnnxHost helper,
+// CPU only). The helper serves one request at a time — but the actor alone
+// does NOT keep that contract. Actors are reentrant at suspension points:
+// while `await engine.transcribe(...)` is suspended, a second transcribe()
+// call would enter the actor and start a concurrent request. The real guard
+// is ParakeyApp.isBusy, which ensures the app never issues a second
+// transcribe while one is in flight. The `inFlight` flag below is a cheap
+// defensive backstop should that invariant ever break: it refuses (and, in
+// DEBUG, asserts on) a re-entrant call. (The helper itself answers a
+// concurrent request with BUSY — spec §8.)
 
 struct TranscriptionWorkerResult: Sendable {
     let text: String
@@ -77,48 +68,16 @@ struct CompletedTranscriptionWorkerResult: Sendable {
     let completedAt: TimeInterval
 }
 
-/// Runtime ASR backend status for diagnostics/UI (spec §11.4). Distinct
-/// from the *setting* (`Settings.shared.useGPU`) — this reflects what is
-/// ACTUALLY running right now.
-enum ParakeetRuntimeStatus: Sendable, Equatable {
-    case cpu
-    /// `deviceDescription` is e.g. "AMD Radeon RX 6600 (MoltenVK)".
-    case vulkan(deviceDescription: String)
-    /// GPU was requested and Vulkan init/warm-up (or a later mid-session
-    /// inference call) failed; this session has fallen back to CPU and will
-    /// not retry Vulkan again until the app restarts.
-    case cpuFallbackAfterVulkanError
-    /// GPU is enabled in the saved preference, but no engine has attempted
-    /// to load it yet in this session (e.g. before the first `load()`
-    /// call) — distinguishes "not yet tried" from an actual fallback.
-    case gpuRequestedNotYetLoaded
-
-    func localizedDescription(language: InterfaceLanguage) -> String {
-        switch self {
-        case .cpu:
-            return localizedText("CPU", "CPU", language: language)
-        case .vulkan(let deviceDescription):
-            return "Vulkan — \(deviceDescription)"
-        case .cpuFallbackAfterVulkanError:
-            return localizedText(
-                "CPU (переключено после ошибки Vulkan)",
-                "CPU fallback after Vulkan error",
-                language: language
-            )
-        case .gpuRequestedNotYetLoaded:
-            return localizedText(
-                "GPU включён в настройках, но используется CPU",
-                "GPU requested, CPU fallback active",
-                language: language
-            )
-        }
-    }
+/// The ASR backend line for diagnostics and the menu. Speech recognition
+/// runs only on the CPU; the GPU belongs to the LLM host.
+func asrBackendDescription(language: InterfaceLanguage) -> String {
+    localizedText("CPU (ONNX Runtime)", "CPU (ONNX Runtime)", language: language)
 }
 
 /// Thin `TaskGroup`-based timeout wrapper (spec §11.3: warm-up must
 /// complete within "a defined timeout"). Races `operation` against a sleep
 /// of `seconds`; whichever finishes first wins and the loser is cancelled.
-/// `operation` is expected to be cooperatively cancellable (parakeet.cpp's
+/// `operation` is expected to be cooperatively cancellable (the native
 /// bridge calls are synchronous C calls with no internal cancellation
 /// point, so in practice a timeout here means "stop waiting on this Task",
 /// not "abort the native call mid-flight" — the underlying native
@@ -142,92 +101,20 @@ func withTimeout<T: Sendable>(seconds: TimeInterval, operation: @Sendable @escap
     }
 }
 
-/// Thread-safe cache of the last-known ASR runtime status, so synchronous
-/// UI code (menu construction, which cannot `await` across the
-/// `TranscriptionWorker` actor without restructuring the whole menu-build
-/// path) can read a recent snapshot. `TranscriptionWorker` pushes every
-/// `runtimeStatus` change here; this is a diagnostic mirror, never the
-/// source of truth (that's always `TranscriptionWorker.runtimeStatus`
-/// itself, read via `await` wherever an async context is already available,
-/// e.g. `diagnosticsText()`).
-final class ParakeetRuntimeStatusCache: @unchecked Sendable {
-    static let shared = ParakeetRuntimeStatusCache()
-    private let lock = NSLock()
-    private var status: ParakeetRuntimeStatus = .gpuRequestedNotYetLoaded
-
-    func update(_ newStatus: ParakeetRuntimeStatus) {
-        lock.lock()
-        status = newStatus
-        lock.unlock()
-    }
-
-    func current() -> ParakeetRuntimeStatus {
-        lock.lock()
-        defer { lock.unlock() }
-        return status
-    }
-}
-
-/// Synchronous convenience for menu construction: the last-known ASR
-/// backend status, localized. Falls back to
-/// `.gpuRequestedNotYetLoaded`/`.cpu`-equivalent wording before the first
-/// `TranscriptionWorker.load()` call has completed.
-func lastKnownParakeetRuntimeStatusDescription(language: InterfaceLanguage) -> String {
-    ParakeetRuntimeStatusCache.shared.current().localizedDescription(language: language)
-}
-
 actor TranscriptionWorker {
-    private enum LoadedEngine {
-        case parakeet(ParakeetEngine)
-        case whisperCpp(WhisperCppEngine)
-        case onnx(OnnxAsrEngine)
-    }
-
-    private var engine: LoadedEngine?
-    /// The profile actually running, which differs from the requested one
-    /// when a GPU-only Whisper profile fell back to Parakeet.
+    private var engine: OnnxAsrEngine?
     private(set) var loadedProfile: SpeechModelProfile?
-    /// The "Use GPU (Vulkan)" preference. The app reads the saved setting;
-    /// `--benchmark-transcribe` passes its own device choice so it never
-    /// has to write the user's settings.
-    private let useGPUPreference: @Sendable () -> Bool
-
-    init(useGPUPreference: @escaping @Sendable () -> Bool = { Settings.shared.useGPU }) {
-        self.useGPUPreference = useGPUPreference
-    }
-    private var loadedUseGPU: Bool?
     private(set) var ready = false
     /// Reentrancy backstop — see the comment above. True for the full
     /// duration of transcribe(), including across its await.
     private var inFlight = false
-
-    /// Current actual runtime backend (spec §11.4) — distinct from the
-    /// saved `Settings.shared.useGPU` preference. Updated by `load()` and by
-    /// the mid-session Vulkan-inference-failure fallback in `transcribe()`.
-    /// Every change is mirrored into `ParakeetRuntimeStatusCache` for
-    /// synchronous UI reads (see that type's doc comment).
-    private(set) var runtimeStatus: ParakeetRuntimeStatus = .cpu {
-        didSet { ParakeetRuntimeStatusCache.shared.update(runtimeStatus) }
-    }
-
-    /// Set once per app session the first time a Vulkan attempt fails
-    /// (init/warm-up OR a later mid-session inference call) while GPU is
-    /// enabled in Settings. Per spec §9.3: never retry Vulkan again within
-    /// the same session once this is set, regardless of how many more
-    /// times `load()` is called (e.g. after a settings change unrelated to
-    /// GPU) — only a full app restart may attempt Vulkan again. Reset only
-    /// by `unload()` immediately followed by process exit; NOT reset by a
-    /// normal `load()` call, and never mutates the persisted
-    /// `Settings.shared.useGPU` preference.
-    private var vulkanFailedThisSession = false
-    private var vulkanFailureReason: String?
 
     /// Default thread policy from docs/parakeet-intel-backend.md §10:
     /// `max(2, min(8, activeProcessorCount / 2))`, with an optional
     /// `SUPERDICTATE_ASR_THREADS` diagnostic override validated to `1...32`.
     /// An out-of-range or non-numeric override is ignored (falls back to the
     /// computed default) rather than crashing a debug/test run.
-    static func resolvedParakeetThreadCount(
+    static func resolvedASRThreadCount(
         activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
         environmentOverride: String? = ProcessInfo.processInfo.environment["SUPERDICTATE_ASR_THREADS"]
     ) -> Int {
@@ -240,33 +127,11 @@ actor TranscriptionWorker {
 
     func load(profile requestedProfile: SpeechModelProfile,
               progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws {
-        var profile = requestedProfile.productionProfile
+        let profile = requestedProfile.productionProfile
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
         }
-        // Whisper is GPU-only (WhisperCppEngine.swift): without a usable
-        // discrete GPU this session runs the default Parakeet profile
-        // instead. The saved choice is left untouched.
-        if profile.requiresDiscreteGPU,
-           let reason = whisperUnavailableReason(useGPUSetting: useGPUPreference(),
-                                                 vulkanFailedThisSession: vulkanFailedThisSession) {
-            log("ASR: \(profile.shortName) runs only on a discrete GPU (\(reason)) — using \(SpeechModelProfile.productionDefault.shortName) instead")
-            profile = .productionDefault
-        }
-        // spec §9.1 loading algorithm: read the GPU preference, and only
-        // actually attempt Vulkan if (a) it's enabled AND (b) Vulkan hasn't
-        // already failed once this session (§9.3 — never retry Vulkan again
-        // within the same session; only a full app restart may attempt it
-        // again, since the persisted preference is never auto-mutated).
-        // The ONNX backend is CPU-only (spec §6): the GPU preference does
-        // not apply to it and must not trigger Vulkan fallback bookkeeping.
-        let requestedGPU = useGPUPreference() && !profile.usesOnnxRuntime
-        let attemptVulkan = requestedGPU && !vulkanFailedThisSession
-        if requestedGPU && vulkanFailedThisSession {
-            log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan already failed once this session (\(vulkanFailureReason ?? "unknown reason")) — staying on CPU for the rest of this session")
-        }
-        var useGPU = attemptVulkan
-        if ready, engine != nil, loadedProfile == profile, loadedUseGPU == useGPU {
+        if ready, engine != nil, loadedProfile == profile {
             log("ASR: \(profile.shortName) already ready")
             return
         }
@@ -281,119 +146,20 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        let loaded: LoadedEngine
-        switch profile {
-        case .parakeetTDTv3:
-            let result = try await loadParakeetEngine(attemptVulkan: attemptVulkan, progressHandler: progressHandler)
-            loaded = .parakeet(result.engine)
-            runtimeStatus = result.status
-        case .parakeetUltraOnnx:
-            loaded = .onnx(try await loadOnnxEngine(progressHandler: progressHandler))
-            runtimeStatus = .cpu
-        case .whisperRussian, .whisperRussianCodeSwitch:
-            let modelURL = try await downloadWhisperGGUFModelIfNeeded()
-            let language = profile == .whisperRussian ? "ru" : "auto"
-            do {
-                let whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language)
-                _ = try await whisper.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
-                loaded = .whisperCpp(whisper)
-                runtimeStatus = .vulkan(deviceDescription: parakeetVulkanDeviceDescription())
-            } catch {
-                // GPU init/warm-up failed. Never Whisper on CPU: count it as
-                // this session's Vulkan failure and run Parakeet on CPU.
-                log("ASR: whisper.cpp GPU engine failed to start (\(error.localizedDescription)) — using \(SpeechModelProfile.productionDefault.shortName) on CPU for the rest of this session")
-                vulkanFailedThisSession = true
-                vulkanFailureReason = error.localizedDescription
-                profile = .productionDefault
-                useGPU = false
-                let result = try await loadParakeetEngine(attemptVulkan: false, progressHandler: progressHandler)
-                loaded = .parakeet(result.engine)
-                runtimeStatus = .cpuFallbackAfterVulkanError
-            }
-        }
+        let loaded = try await loadOnnxEngine(progressHandler: progressHandler)
         engine = loaded
         loadedProfile = profile
-        loadedUseGPU = useGPU
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
         log("ASR model: \(profile.displayName)")
-        switch loaded {
-        case .parakeet:
-            log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
-        case .whisperCpp:
-            log("ASR runtime: whisper.cpp (GGUF)")
-        case .onnx:
-            log("ASR runtime: ONNX Runtime (SuperDictateOnnxHost)")
-        }
-        log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
-        if case .parakeet(let parakeet) = loaded {
-            let loadedDeviceIsVulkan = parakeet.device == .vulkan
-            log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(runtimeStatus == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
-        } else if case .whisperCpp = loaded {
-            log("ASR device selected: Vulkan")
-        } else if case .onnx(let onnx) = loaded {
-            let reason = await onnx.providerFallbackReason
-            log("ASR device selected: \(await onnx.providerActual)\(reason.isEmpty ? "" : " (\(reason))")")
-        }
-        // Best-effort legacy cleanup, only after Parakeet has itself
-        // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
-        if profile == .parakeetTDTv3 {
-            removeLegacyWhisperModelFileIfPresent()
-        }
-    }
-
-    private func loadParakeetEngine(
-        attemptVulkan: Bool,
-        progressHandler: SpeechModelDownloadProgressHandler?
-    ) async throws -> (engine: ParakeetEngine, status: ParakeetRuntimeStatus) {
-        if !speechModelCacheExists(for: .parakeetTDTv3) {
-            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .parakeetTDTv3)
-        }
-        let modelPath = try await downloadParakeetModelIfNeeded()
-        let threadCount = Self.resolvedParakeetThreadCount()
-        log("ASR threads: \(threadCount)")
-
-        if attemptVulkan {
-            do {
-                let vulkanEngine = try ParakeetEngine(modelPath: modelPath.path, device: .vulkan, threadCount: threadCount)
-                // Warm-up with a defined timeout (spec §11.3: warm-up must
-                // complete within "a defined timeout" — no numeric value is
-                // specified upstream; 30s is chosen here as generous
-                // relative to the measured ~1.2s cold Vulkan/MoltenVK
-                // pipeline-compile cost from the Phase 5 pre-spike, while
-                // still bounding a genuinely hung/broken driver rather than
-                // blocking app startup indefinitely).
-                let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
-                try await withTimeout(seconds: 30) {
-                    try await vulkanEngine.warmUp()
-                }
-                let warmUpSeconds = ProcessInfo.processInfo.systemUptime - warmUpStartedAt
-                log("ASR warm-up (Vulkan): \(String(format: "%.2f", warmUpSeconds)) s")
-                let deviceDescription = parakeetVulkanDeviceDescription()
-                log("ASR device: Vulkan — \(deviceDescription.isEmpty ? await vulkanEngine.backendDescription() : deviceDescription)")
-                return (vulkanEngine, .vulkan(deviceDescription: deviceDescription.isEmpty ? await vulkanEngine.backendDescription() : deviceDescription))
-            } catch {
-                // Any failure — init, capability probe, warm-up timeout, or
-                // the post-init "actually selected CPU" check — destroys
-                // the partial Vulkan attempt and falls back to a fresh CPU
-                // engine. Never retried again this session (spec §9.3).
-                log("ASR: Vulkan init/warm-up failed (\(error.localizedDescription)) — falling back to Parakeet CPU for the rest of this session")
-                vulkanFailedThisSession = true
-                vulkanFailureReason = error.localizedDescription
-            }
-        }
-
-        let cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
-        let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
-        try await cpuEngine.warmUp()
-        let warmUpSeconds = ProcessInfo.processInfo.systemUptime - warmUpStartedAt
-        log("ASR warm-up (CPU): \(String(format: "%.2f", warmUpSeconds)) s")
-        return (cpuEngine, requestedGPUButFellBackStatus(attemptedVulkan: attemptVulkan))
+        log("ASR runtime: ONNX Runtime (SuperDictateOnnxHost)")
+        let reason = await loaded.providerFallbackReason
+        log("ASR device: \(await loaded.providerActual)\(reason.isEmpty ? "" : " (\(reason))")")
     }
 
     private func loadOnnxEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> OnnxAsrEngine {
         let modelDirectory = try await downloadOnnxModelIfNeeded(progressHandler: progressHandler)
-        let threadCount = Self.resolvedParakeetThreadCount()
+        let threadCount = Self.resolvedASRThreadCount()
         log("ASR threads: \(threadCount)")
         let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threadCount)
         log("ASR ONNX model load: \(String(format: "%.2f", await engine.loadSeconds)) s")
@@ -405,19 +171,13 @@ actor TranscriptionWorker {
 
     /// The ONNX helper is killed on a hard timeout or dies on a crash; the
     /// next request gets a fresh one (spec §8) instead of a dead engine.
-    private func liveOnnxEngine(_ onnx: OnnxAsrEngine) async throws -> OnnxAsrEngine {
-        if await onnx.isAlive { return onnx }
+    private func liveEngine() async throws -> OnnxAsrEngine {
+        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        if await engine.isAlive { return engine }
         log("ASR: ONNX helper is gone — relaunching")
         let fresh = try await loadOnnxEngine(progressHandler: nil)
-        engine = .onnx(fresh)
+        self.engine = fresh
         return fresh
-    }
-
-    /// `.cpuFallbackAfterVulkanError` iff this CPU load happened AFTER a
-    /// Vulkan attempt just failed in the same call; plain `.cpu` if GPU was
-    /// never requested at all this session.
-    private func requestedGPUButFellBackStatus(attemptedVulkan: Bool) -> ParakeetRuntimeStatus {
-        attemptedVulkan ? .cpuFallbackAfterVulkanError : .cpu
     }
 
     func transcribe(samples: [Float],
@@ -425,7 +185,7 @@ actor TranscriptionWorker {
                                resolveViaKeyboard: Bool = true,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
-        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard engine != nil else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
             log("ASR: transcribe re-entered while another transcription is in flight — refusing (ParakeyApp.isBusy should make this impossible)")
             assertionFailure("TranscriptionWorker.transcribe re-entered across a suspension point")
@@ -436,12 +196,11 @@ actor TranscriptionWorker {
 
         // `resolveEffectiveDictationLanguage` is only used for deterministic
         // post-processing today (see `DictationLanguage`'s doc comment) —
-        // parakeet.cpp's plain PCM entry point this bridge wraps does not
-        // accept a forced-language parameter, unlike whisper.cpp's
-        // `params.language`. `TranscriptionWorker` is an actor, so this
-        // method runs on its executor, not the main thread — hop explicitly
-        // for the Carbon TIS call inside `resolveEffectiveDictationLanguage`,
-        // which (like the rest of AppKit/Carbon) is only main-thread-safe.
+        // the ASR model takes no forced-language parameter.
+        // `TranscriptionWorker` is an actor, so this method runs on its
+        // executor, not the main thread — hop explicitly for the Carbon TIS
+        // call inside `resolveEffectiveDictationLanguage`, which (like the
+        // rest of AppKit/Carbon) is only main-thread-safe.
         // `resolveViaKeyboard` is false for recovered (previous-session)
         // audio: the *current* keyboard layout has no bearing on what
         // language a stale recording was spoken in.
@@ -452,94 +211,14 @@ actor TranscriptionWorker {
         }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let isVulkanEngine: Bool
-        let result: ParakeetTranscriptionResult
-        do {
-            switch engine {
-            case .parakeet(let parakeet):
-                isVulkanEngine = parakeet.device == .vulkan
-                result = try await parakeet.transcribe(samples: samples)
-            case .whisperCpp(let whisper):
-                isVulkanEngine = true
-                let transcription = try await whisper.transcribe(samples: samples)
-                result = ParakeetTranscriptionResult(text: transcription.text,
-                                                     totalSeconds: transcription.processingSeconds,
-                                                     inferenceSeconds: transcription.processingSeconds,
-                                                     usedGPU: true)
-            case .onnx(let onnx):
-                isVulkanEngine = false
-                let live = try await liveOnnxEngine(onnx)
-                let transcription = try await live.transcribe(samples: samples)
-                result = ParakeetTranscriptionResult(text: transcription.text,
-                                                     totalSeconds: transcription.processingSeconds,
-                                                     inferenceSeconds: transcription.processingSeconds,
-                                                     usedGPU: false)
-            }
-        } catch where isVulkanEngine {
-            // spec §9.3: a Vulkan engine that initialized fine but fails
-            // DURING a real transcription — retain the captured PCM
-            // (`samples`, already in hand), destroy the Vulkan engine,
-            // create a fresh CPU engine, warm it up, and retry THIS SAME
-            // dictation exactly once on CPU. Never retry Vulkan again this
-            // session; never fall back to Whisper (removed); never mutate
-            // the persisted `useGPU` preference.
-            log("ASR: Vulkan inference failed mid-session (\(error.localizedDescription)) — falling back to CPU and retrying this dictation once")
-            vulkanFailedThisSession = true
-            vulkanFailureReason = error.localizedDescription
-            if case .parakeet(let parakeet) = engine {
-                await parakeet.shutdown()
-                let threadCount = Self.resolvedParakeetThreadCount()
-                let cpuEngine: ParakeetEngine
-                do {
-                    guard let modelPath = try? await downloadParakeetModelIfNeeded() else {
-                        throw ParakeetEngineError.inferenceFailed("model path unavailable during mid-session CPU fallback")
-                    }
-                    cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
-                    try await cpuEngine.warmUp()
-                } catch {
-                    // The engine is now unusable and no CPU replacement could
-                    // be constructed either — leave `self.engine` nil so the
-                    // next `load()` call rebuilds from scratch, and surface the
-                    // ORIGINAL Vulkan failure (more informative than the
-                    // fallback-construction failure) to the caller.
-                    self.engine = nil
-                    ready = false
-                    throw error
-                }
-                self.engine = .parakeet(cpuEngine)
-                loadedUseGPU = false
-                runtimeStatus = .cpuFallbackAfterVulkanError
-                result = try await cpuEngine.transcribe(samples: samples)
-            } else if case .whisperCpp(let deadEngine) = engine {
-                // Same §9.3 contract for the whisper.cpp helper, except that
-                // Whisper never runs on CPU: shut the dead GPU helper down
-                // and retry THIS dictation once on Parakeet CPU, which then
-                // serves the rest of the session.
-                await deadEngine.shutdown()
-                let cpuEngine: ParakeetEngine
-                do {
-                    cpuEngine = try await loadParakeetEngine(attemptVulkan: false, progressHandler: nil).engine
-                } catch {
-                    self.engine = nil
-                    ready = false
-                    throw error
-                }
-                self.engine = .parakeet(cpuEngine)
-                loadedProfile = .productionDefault
-                loadedUseGPU = false
-                runtimeStatus = .cpuFallbackAfterVulkanError
-                result = try await cpuEngine.transcribe(samples: samples)
-            } else {
-                throw error
-            }
-        }
+        let transcription = try await liveEngine().transcribe(samples: samples)
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TranscriptionWorkerResult(
-            text: result.text,
+            text: transcription.text,
             workerQueueSeconds: workerEnteredAt - requestedAt,
             decoderPreparationSeconds: 0,
             engineCallSeconds: engineCallCompletedAt - engineCallStartedAt,
-            engineProcessingSeconds: result.inferenceSeconds
+            engineProcessingSeconds: transcription.processingSeconds
         )
     }
 
@@ -549,18 +228,10 @@ actor TranscriptionWorker {
     /// `defer` that clears it, so a throw out of here leaves the worker
     /// usable for the plain-path fallback that immediately follows) and
     /// timing accounting.
-    ///
-    /// Deliberately does NOT reimplement `transcribe`'s mid-session
-    /// Vulkan-inference-failure CPU fallback: a Vulkan failure here throws,
-    /// `transcribeSegmented` catches it and re-runs the whole dictation on
-    /// the plain path, and THAT path's `transcribe(...)` performs the real
-    /// fallback exactly as it does today. One fallback implementation, one
-    /// site mutating `vulkanFailedThisSession`/`runtimeStatus`/`engine`.
-    /// See task-9-report.md for the full reasoning.
     func transcribeWithTokens(samples: [Float],
                                           requestedAt: TimeInterval) async throws -> TokenTranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
-        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard engine != nil else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
             log("ASR: transcribeWithTokens re-entered while another transcription is in flight — refusing")
             throw NSError(domain: "Parakey", code: -3)
@@ -569,16 +240,7 @@ actor TranscriptionWorker {
         defer { inFlight = false }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let transcription: TokenTranscription
-        switch engine {
-        case .parakeet(let parakeet):
-            transcription = try await parakeet.transcribeWithTokens(samples: samples)
-        case .onnx(let onnx):
-            transcription = try await liveOnnxEngine(onnx).transcribeWithTokens(samples: samples)
-        case .whisperCpp:
-            throw NSError(domain: "Parakey", code: -5,
-                          userInfo: [NSLocalizedDescriptionKey: "Token timestamps are only available for Parakeet"])
-        }
+        let transcription = try await liveEngine().transcribeWithTokens(samples: samples)
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TokenTranscriptionWorkerResult(
             transcription: transcription,
@@ -601,17 +263,9 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
-        switch engine {
-        case .parakeet(let parakeet):
-            await parakeet.shutdown()
-        case .onnx(let onnx):
-            await onnx.shutdown()
-        case .whisperCpp, nil:
-            break
-        }
+        await engine?.shutdown()
         engine = nil
         loadedProfile = nil
-        loadedUseGPU = nil
         ready = false
         log("ASR: unloaded")
     }
@@ -785,7 +439,7 @@ private func sileroVadModelPath() -> String {
     if let override = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"], !override.isEmpty {
         return override
     }
-    return parakeetModelCacheDirectory()
+    return speechModelsDirectory()
         .appendingPathComponent("ggml-silero-v6.2.0.bin", isDirectory: false).path
 }
 

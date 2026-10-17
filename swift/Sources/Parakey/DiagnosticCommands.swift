@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
-// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (Parakeet via ONNX Runtime in the
+// SuperDictateOnnxHost helper, CPU only — the GPU is for the LLM host),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -87,7 +87,7 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 }
 
 /// Permanent, production-shipped diagnostic entry point backing
-/// `scripts/benchmark-parakeet.sh` and `scripts/benchmark-asr.sh` (spec
+/// `scripts/benchmark-asr.sh` (spec
 /// §19/§27). Deliberately checked BEFORE `NSApplication.shared` is ever
 /// constructed — like `runAudioCaptureDiagnostic` above and unlike the
 /// `#if DEBUG`-only `--self-test`/`--transcribe-file` hooks used in earlier
@@ -99,11 +99,10 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// same segmentation a recorded dictation goes through, with each engine's
 /// helper resolved from Contents/Helpers) — never a mock.
 ///
-/// usage: SuperDictate --benchmark-transcribe <whisper|parakeet|onnx> <cpu|vulkan> <threads> <wav1> [wav2 ...]
-///        (legacy, parakeet-only: SuperDictate --benchmark-transcribe <cpu|vulkan> <threads> <wav1> [wav2 ...])
+/// usage: SuperDictate --benchmark-transcribe [onnx] cpu <threads> <wav1> [wav2 ...]
 ///
-/// `onnx` is CPU-only (spec §11 gate 6) and `whisper` is GPU-only (a
-/// discrete GPU); the other device is rejected for each.
+/// Speech recognition is ONNX on the CPU only; the retired `whisper` and
+/// `parakeet` (GGUF) backends and `vulkan` are rejected with a message.
 /// Loads the model once (device/threads as given), warms up, then
 /// transcribes every listed WAV path IN ORDER through that one loaded
 /// worker (repeat a path multiple times in argv to measure
@@ -114,30 +113,27 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// a message on stderr for any failure.
 func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     guard arguments.first == "--benchmark-transcribe" else { return nil }
-    let usage = "usage: SuperDictate --benchmark-transcribe <whisper|parakeet|onnx> <cpu|vulkan> <threads> <wav1> [wav2 ...]\n"
+    let usage = "usage: SuperDictate --benchmark-transcribe [onnx] cpu <threads> <wav1> [wav2 ...]\n"
     var rest = Array(arguments.dropFirst())
-    var backend = "parakeet"
-    if let first = rest.first, ["whisper", "parakeet", "onnx"].contains(first) {
-        backend = first
+    if let first = rest.first, first == "whisper" || first == "parakeet" {
+        fputs("benchmark: the \(first) backend was removed; speech recognition is ONNX on the CPU only\n", stderr)
+        return EXIT_FAILURE
+    }
+    if rest.first == "onnx" {
         rest.removeFirst()
     }
+    if rest.first == "vulkan" {
+        fputs("benchmark: speech recognition is CPU-only (the GPU is reserved for the LLM host)\n", stderr)
+        return EXIT_FAILURE
+    }
     guard rest.count >= 3,
-          rest[0] == "cpu" || rest[0] == "vulkan",
+          rest[0] == "cpu",
           let threads = Int(rest[1]), (1...32).contains(threads)
     else {
         fputs(usage, stderr)
         return EXIT_FAILURE
     }
-    let deviceArg = rest[0]
     let wavPaths = Array(rest.dropFirst(2))
-    if backend == "onnx" && deviceArg != "cpu" {
-        fputs("benchmark: the onnx backend is CPU-only\n", stderr)
-        return EXIT_FAILURE
-    }
-    if backend == "whisper" && deviceArg != "vulkan" {
-        fputs("benchmark: the whisper backend is GPU-only (vulkan on a discrete GPU)\n", stderr)
-        return EXIT_FAILURE
-    }
 
     // Bare top-level `Task { }` inherits MainActor isolation with no run
     // loop pumping here (no NSApplication yet) — a guaranteed self-deadlock,
@@ -148,7 +144,7 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     Task.detached {
         defer { semaphore.signal() }
         do {
-            try await runSegmentedBenchmark(backend: backend, deviceArg: deviceArg, threads: threads, wavPaths: wavPaths)
+            try await runSegmentedBenchmark(threads: threads, wavPaths: wavPaths)
             exitCode.set(EXIT_SUCCESS)
         } catch {
             fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
@@ -170,23 +166,17 @@ private func benchmarkEscapedText(_ text: String) -> String {
         .replacingOccurrences(of: "\n", with: " ")
 }
 
-/// One backend, one device, every WAV through the REAL dictation path: a
-/// `TranscriptionWorker` loaded like the agent loads it, then
-/// `transcribeSegmented` — PauseSegmenter (≤ 25 s segments), the overlap
-/// windows and seam dedup — exactly as a recorded dictation. Never a raw
-/// whole-file engine call: the app never hands an engine a long
-/// unsegmented clip, and the benchmark must not either.
-private func runSegmentedBenchmark(backend: String, deviceArg: String, threads: Int, wavPaths: [String]) async throws {
-    let profile: SpeechModelProfile
-    switch backend {
-    case "whisper": profile = .whisperRussianCodeSwitch
-    case "onnx": profile = .parakeetUltraOnnx
-    default: profile = .parakeetTDTv3
-    }
-    let wantsVulkan = deviceArg == "vulkan"
+/// Every WAV through the REAL dictation path: a `TranscriptionWorker`
+/// loaded like the agent loads it, then `transcribeSegmented` —
+/// PauseSegmenter (≤ 25 s segments), the overlap windows and seam dedup —
+/// exactly as a recorded dictation. Never a raw whole-file engine call: the
+/// app never hands the engine a long unsegmented clip, and the benchmark
+/// must not either.
+private func runSegmentedBenchmark(threads: Int, wavPaths: [String]) async throws {
+    let profile = SpeechModelProfile.productionDefault
     // The worker reads its thread count from this override (1...32).
     setenv("SUPERDICTATE_ASR_THREADS", String(threads), 1)
-    let worker = TranscriptionWorker(useGPUPreference: { wantsVulkan })
+    let worker = TranscriptionWorker()
 
     let loadStart = ProcessInfo.processInfo.systemUptime
     try await worker.load(profile: profile)
@@ -200,23 +190,9 @@ private func runSegmentedBenchmark(backend: String, deviceArg: String, threads: 
                                     resolveViaKeyboard: false,
                                     requestedAt: warmStart)
     let warmSeconds = ProcessInfo.processInfo.systemUptime - warmStart
-
-    let loadedProfile = await worker.loadedProfile
-    let status = await worker.runtimeStatus
-    var actualDevice = "cpu"
-    if case .vulkan = status { actualDevice = "vulkan" }
-    // A silent fallback (Whisper → Parakeet, Vulkan → CPU) is never a
-    // benchmark result for the requested backend/device.
-    guard loadedProfile == profile else {
-        await worker.unload()
-        throw NSError(domain: "SuperDictateBenchmark", code: 2, userInfo: [NSLocalizedDescriptionKey:
-            "requested \(profile.shortName) but the worker fell back to \(loadedProfile?.shortName ?? "nothing") (Whisper needs a discrete GPU)"])
-    }
-    guard !wantsVulkan || actualDevice == "vulkan" else {
-        await worker.unload()
-        throw NSError(domain: "SuperDictateBenchmark", code: 3, userInfo: [NSLocalizedDescriptionKey:
-            "requested vulkan but the engine runs on \(status)"])
-    }
+    let backend = "onnx"
+    let deviceArg = "cpu"
+    let actualDevice = "cpu"
 
     print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented")
 
@@ -232,7 +208,7 @@ private func runSegmentedBenchmark(backend: String, deviceArg: String, threads: 
                                                    requestedAt: callStart)
         let wallSeconds = ProcessInfo.processInfo.systemUptime - callStart
         let rtf = durationSeconds > 0 ? result.engineProcessingSeconds / durationSeconds : 0
-        print("BENCH_RESULT backend=\(backend) file=\(path) duration_s=\(durationSeconds) segments=\(segmentCount) wall_s=\(wallSeconds) inference_s=\(result.engineProcessingSeconds) total_s=\(wallSeconds) rtf=\(rtf) used_gpu=\(actualDevice == "vulkan") segment_failure=\(result.hadSegmentFailure) text=\(benchmarkEscapedText(result.text))")
+        print("BENCH_RESULT backend=\(backend) file=\(path) duration_s=\(durationSeconds) segments=\(segmentCount) wall_s=\(wallSeconds) inference_s=\(result.engineProcessingSeconds) total_s=\(wallSeconds) rtf=\(rtf) used_gpu=false segment_failure=\(result.hadSegmentFailure) text=\(benchmarkEscapedText(result.text))")
     }
     await worker.unload()
 }
@@ -248,11 +224,11 @@ func benchmarkReadMonoPCM(fileURL: URL) throws -> [Float] {
                                             sampleRate: SAMPLE_RATE,
                                             channels: 1,
                                             interleaved: false) else {
-        throw ParakeetEngineError.inferenceFailed("could not construct target PCM format")
+        throw ASREngineError.inferenceFailed("could not construct target PCM format")
     }
     guard let sourceBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
                                                frameCapacity: AVAudioFrameCount(file.length)) else {
-        throw ParakeetEngineError.inferenceFailed("could not allocate source buffer for \(fileURL.path)")
+        throw ASREngineError.inferenceFailed("could not allocate source buffer for \(fileURL.path)")
     }
     try file.read(into: sourceBuffer)
 
@@ -264,13 +240,13 @@ func benchmarkReadMonoPCM(fileURL: URL) throws -> [Float] {
     }
 
     guard let converter = AVAudioConverter(from: file.processingFormat, to: targetFormat) else {
-        throw ParakeetEngineError.inferenceFailed("could not construct converter for \(fileURL.path)")
+        throw ASREngineError.inferenceFailed("could not construct converter for \(fileURL.path)")
     }
     let estimatedFrames = AVAudioFrameCount(
         Double(sourceBuffer.frameLength) * targetFormat.sampleRate / file.processingFormat.sampleRate
     ) + 16
     guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimatedFrames) else {
-        throw ParakeetEngineError.inferenceFailed("could not allocate output buffer for \(fileURL.path)")
+        throw ASREngineError.inferenceFailed("could not allocate output buffer for \(fileURL.path)")
     }
     var delivered = false
     var conversionError: NSError?
@@ -284,10 +260,10 @@ func benchmarkReadMonoPCM(fileURL: URL) throws -> [Float] {
         return sourceBuffer
     }
     if let conversionError {
-        throw ParakeetEngineError.inferenceFailed("PCM conversion failed for \(fileURL.path): \(conversionError.localizedDescription)")
+        throw ASREngineError.inferenceFailed("PCM conversion failed for \(fileURL.path): \(conversionError.localizedDescription)")
     }
     guard let channelData = outBuffer.floatChannelData else {
-        throw ParakeetEngineError.inferenceFailed("converted buffer has no channel data for \(fileURL.path)")
+        throw ASREngineError.inferenceFailed("converted buffer has no channel data for \(fileURL.path)")
     }
     return Array(UnsafeBufferPointer(start: channelData[0], count: Int(outBuffer.frameLength)))
 }

@@ -217,7 +217,7 @@ actor OnnxAsrEngine {
         do {
             return try JSONDecoder().decode(TokenTranscription.self, from: object.data)
         } catch {
-            throw ParakeetEngineError.tokenDecodeFailed(error.localizedDescription)
+            throw ASREngineError.tokenDecodeFailed(error.localizedDescription)
         }
     }
 
@@ -247,7 +247,7 @@ actor OnnxAsrEngine {
     }
 
     private func transcribeJSON(samples: [Float], timestamps: Bool) throws -> (dictionary: [String: Any], data: Data) {
-        guard !samples.isEmpty else { throw ParakeetEngineError.emptyAudio }
+        guard !samples.isEmpty else { throw ASREngineError.emptyAudio }
         let options: [String: Any] = ["timestamps": timestamps, "sample_rate": Int(SAMPLE_RATE)]
         return try roundTripRaw(type: .transcribe,
                                 json: try JSONSerialization.data(withJSONObject: options),

@@ -1,41 +1,36 @@
 #!/bin/bash
 #
-# scripts/benchmark-asr.sh — head-to-head ASR backend benchmark for the
-# production speech engines (whisper / parakeet GGUF / parakeet ONNX) on the
-# current hardware, measuring raw speech recognition WITHOUT any LLM
-# correction: speed (cold load, warm-up, first-inference, warm latency,
-# RTF, peak RSS) and quality (WER, CER, punctuation F1 vs the reference
-# text that was actually spoken into the synthetic corpus).
+# scripts/benchmark-asr.sh — benchmark of the app's speech engine
+# (Parakeet via ONNX Runtime, CPU only) on the current hardware, measuring
+# raw speech recognition WITHOUT any LLM correction: speed (cold load,
+# warm-up, first-inference, warm latency, RTF, peak RSS) and quality (WER,
+# CER, punctuation F1 vs the reference text that was actually spoken into
+# the synthetic corpus).
 #
 # Requires macOS (uses `say`/`afconvert` for corpus synthesis and
-# `/usr/bin/time -l` for peak RSS) and a built release SuperDictate binary
-# (`swift build -c release --package-path swift`).
+# `/usr/bin/time -l` for peak RSS) and a packaged bundle carrying the
+# SuperDictateOnnxHost helper (dist/SuperDictate-test.app, then
+# dist/SuperDictate.app).
 #
 # It drives the REAL, permanent `--benchmark-transcribe` diagnostic entry
 # point in swift/Sources/Parakey/main.swift, which itself calls the real
-# production code (download*ModelIfNeeded, ParakeetEngine, OnnxAsrEngine,
-# WhisperCppEngine) — never a mock backend.
+# production code (downloadOnnxModelIfNeeded, OnnxAsrEngine) — never a
+# mock backend.
 #
 # Usage:
 #   scripts/benchmark-asr.sh [--binary PATH] [--corpus-dir DIR]
-#                             [--out DIR] [--repeats N] [--devices "cpu vulkan"]
-#                             [--backends "whisper parakeet onnx"] [--threads N]
+#                             [--out DIR] [--repeats N] [--threads N]
 #                             [--run-timeout SECONDS]   (per process, default 600)
 #
 # Notes:
-#   - whisper.cpp (GPU only) is run with language=auto (the app's code-switch profile)
-#     so the mixed RU/EN corpus is scored fairly; it has no separate
-#     warm-up call, so its first transcribe is the cold first-inference.
 #   - Every clip goes through the app's own dictation path
 #     (TranscriptionWorker + transcribeSegmented: PauseSegmenter's <= 25 s
 #     segments, overlap windows, seam dedup), never one whole-file engine
 #     call. The long monologue clip (>= 60 s nominal) is transcribed once
 #     (accuracy only); shorter clips get --repeats (1 cold + N-1 warm).
-#   - onnx is CPU-only and whisper is GPU-only (discrete GPU): their
-#     other-device runs are skipped. It needs the
-#     SuperDictateOnnxHost helper, so the default binary is a packaged
-#     bundle (dist/SuperDictate-test.app, then dist/SuperDictate.app).
-#   - Each backend downloads its model on first use if it is missing.
+#   - The whisper and GGUF parakeet backends and the vulkan device were
+#     removed (2026-10-17 comparison, spec §12); the app rejects them.
+#   - The model is downloaded on first use if it is missing.
 #
 # Safety: this script never touches /Applications/SuperDictate.app or its
 # LaunchAgent. It only invokes a locally built binary with
@@ -51,8 +46,8 @@ BINARY=""
 CORPUS_DIR="${TMPDIR:-/tmp}/superdictate-benchmark-corpus"
 OUT_DIR="$ROOT_DIR/dist/benchmark-asr-$(date +%Y%m%d-%H%M%S)"
 REPEATS=3    # first call = "first inference (cold)"; remaining N-1 = warm pool
-DEVICES="cpu vulkan"
-BACKENDS="whisper parakeet onnx"
+DEVICES="cpu"
+BACKENDS="onnx"
 THREADS=8
 RUN_TIMEOUT_SECONDS=600
 
@@ -65,8 +60,6 @@ while [[ $# -gt 0 ]]; do
         --corpus-dir) CORPUS_DIR="$2"; shift 2 ;;
         --out) OUT_DIR="$2"; shift 2 ;;
         --repeats) REPEATS="$2"; shift 2 ;;
-        --devices) DEVICES="$2"; shift 2 ;;
-        --backends) BACKENDS="$2"; shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
         --run-timeout) RUN_TIMEOUT_SECONDS="$2"; shift 2 ;;
         -h|--help)
@@ -265,11 +258,14 @@ with wave.open('$clip_path', 'rb') as w:
     /usr/bin/time -l "$BINARY" --benchmark-transcribe "$backend" "$device" "$THREADS" "${repeat_args[@]}" \
         > "$log_file" 2> "$time_file" &
     local run_pid=$!
-    ( sleep "$RUN_TIMEOUT_SECONDS"; pkill -TERM -P "$run_pid" 2>/dev/null; kill -TERM "$run_pid" 2>/dev/null ) &
+    # The timer must not hold this function's stdout: it runs inside $(...),
+    # and an orphaned sleep would keep the pipe open for the full timeout.
+    ( sleep "$RUN_TIMEOUT_SECONDS"; pkill -TERM -P "$run_pid" 2>/dev/null; kill -TERM "$run_pid" 2>/dev/null ) \
+        > /dev/null 2>&1 < /dev/null &
     local timer_pid=$!
     local run_status=0
     wait "$run_pid" || run_status=$?
-    kill "$timer_pid" 2>/dev/null; wait "$timer_pid" 2>/dev/null || true
+    pkill -P "$timer_pid" 2>/dev/null; kill "$timer_pid" 2>/dev/null; wait "$timer_pid" 2>/dev/null || true
     if [[ $run_status -eq 0 ]]; then
         echo "$log_file"
     else
@@ -295,7 +291,7 @@ REPORT="$OUT_DIR/report.md"
     echo "Repeats per clip: $REPEATS (first = cold first-inference, rest = warm pool; monologue = 1)"
     echo "Path: the app's segmented dictation path (PauseSegmenter <= 25 s, overlap windows, seam dedup)."
     echo "Scoring: WER/CER (case-insensitive, punctuation-stripped) and punctuation F1 (multiset of .,!?;:…—–) vs the reference text spoken into the corpus."
-    echo "Whisper language: auto (code-switch profile). No LLM correction applied to any backend."
+    echo "No LLM correction applied."
     echo
 } > "$REPORT"
 
@@ -329,8 +325,6 @@ TRANSCRIPTS_PART="$OUT_DIR/.transcripts.md"
 
 for backend in $BACKENDS; do
     for device in $DEVICES; do
-        [[ "$backend" == "onnx" && "$device" != "cpu" ]] && continue
-        [[ "$backend" == "whisper" && "$device" != "vulkan" ]] && continue
         log_msg "=== Backend: $backend / Device: $device ==="
         for clip_path in "${CORPUS_FILES[@]}"; do
             clip_name="$(basename "$clip_path" .wav)"
@@ -420,8 +414,6 @@ rm -f "$ACCURACY_PART" "$LATENCY_PART" "$TRANSCRIPTS_PART"
 
 for backend in $BACKENDS; do
     for device in $DEVICES; do
-        [[ "$backend" == "onnx" && "$device" != "cpu" ]] && continue
-        [[ "$backend" == "whisper" && "$device" != "vulkan" ]] && continue
         wer_vals=(); cer_vals=(); pf1_vals=(); first_vals=(); warm_vals=(); rtf_vals=(); load_vals=()
         for clip_path in "${CORPUS_FILES[@]}"; do
             clip_name="$(basename "$clip_path" .wav)"

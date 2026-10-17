@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
-// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (Parakeet via ONNX Runtime in the
+// SuperDictateOnnxHost helper, CPU only — the GPU is for the LLM host),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -4252,7 +4252,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Hotkey: \(hotkey.hotkey.name)",
                 "Trigger mode: \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue)",
                 "Speech model: \(speechModelProfile.displayName)",
-                "ASR backend: \(lastKnownParakeetRuntimeStatusDescription(language: .english)) (GPU setting: \(settings.useGPU))",
+                "ASR backend: \(asrBackendDescription(language: .english))",
+                "LLM on GPU setting: \(settings.llmUseGPU)",
                 "Language: \(languageSettingText)",
                 "Paste behavior: \(PASTE_SUFFIX_DISPLAY[settings.pasteSuffix] ?? settings.pasteSuffix.rawValue)",
                 "Remove filler words: \(settings.removeFillerWords)",
@@ -4729,36 +4730,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(dock)
 
         let gpuLanguage = settings.interfaceLanguage
-        let vulkanAvailable = parakeetVulkanAvailable()
-        let deviceDescription = parakeetVulkanDeviceDescription()
-        let useGPU = NSMenuItem(
-            title: localizedText("Использовать GPU (Vulkan)", "Use GPU (Vulkan)", language: gpuLanguage),
-            action: #selector(toggleUseGPU(_:)),
-            keyEquivalent: ""
-        )
-        useGPU.target = self
-        useGPU.state = settings.useGPU ? .on : .off
-        if vulkanAvailable {
-            useGPU.isEnabled = true
-            useGPU.toolTip = localizedText(
-                "Запускает Vulkan-бэкенд вместо CPU для распознавания речи (ASR) (обнаружено: \(deviceDescription)). Перезагружает модель ASR. Модель коррекции/рерайтинга управляется отдельным переключателем «LLM на GPU».",
-                "Runs the Vulkan backend instead of CPU for speech recognition (ASR) (detected: \(deviceDescription)). Reloads the ASR model. The correction/rewrite model is governed by the separate \"LLM on GPU\" toggle.",
-                language: gpuLanguage
-            )
-        } else {
-            // spec §11.2: disable with a clear explanation when no Vulkan
-            // device is enumerated, rather than letting the user enable a
-            // setting that can never take effect on this machine.
-            useGPU.isEnabled = false
-            useGPU.state = .off
-            useGPU.toolTip = localizedText(
-                "Vulkan GPU не обнаружен. Parakeet будет использовать CPU.",
-                "Vulkan GPU was not detected. Parakeet will use CPU.",
-                language: gpuLanguage
-            )
-        }
-        sub.addItem(useGPU)
-
+        let vulkanAvailable = vulkanGPUAvailable()
+        let deviceDescription = vulkanGPUDeviceDescription()
         let llmGPU = NSMenuItem(
             title: localizedText("LLM на GPU (Vulkan)", "LLM on GPU (Vulkan)", language: gpuLanguage),
             action: #selector(toggleLLMUseGPU(_:)),
@@ -4769,8 +4742,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if vulkanAvailable {
             llmGPU.isEnabled = true
             llmGPU.toolTip = localizedText(
-                "Запускает Vulkan-бэкенд для модели коррекции/рерайтинга текста (обнаружено: \(deviceDescription)). Независимо от переключателя ASR — можно держать ASR на CPU, а LLM на GPU. Перезагружает LLM-модель.",
-                "Runs the Vulkan backend for the text-correction/rewrite model (detected: \(deviceDescription)). Independent of the ASR toggle — you can keep ASR on CPU and the LLM on GPU. Reloads the LLM model.",
+                "Запускает Vulkan-бэкенд для модели коррекции/рерайтинга текста (обнаружено: \(deviceDescription)). Распознавание речи всегда идёт на CPU. Перезагружает LLM-модель.",
+                "Runs the Vulkan backend for the text-correction/rewrite model (detected: \(deviceDescription)). Speech recognition always runs on the CPU. Reloads the LLM model.",
                 language: gpuLanguage
             )
         } else {
@@ -4785,7 +4758,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(llmGPU)
 
         let asrStatus = NSMenuItem(
-            title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + lastKnownParakeetRuntimeStatusDescription(language: gpuLanguage),
+            title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + asrBackendDescription(language: gpuLanguage),
             action: nil,
             keyEquivalent: ""
         )
@@ -6259,25 +6232,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.showInDock.toggle()
         sender.state = settings.showInDock ? .on : .off
         refreshActivationPolicy()
-    }
-
-    @objc private func toggleUseGPU(_ sender: NSMenuItem) {
-        settings.useGPU.toggle()
-        let profile = settings.speechModelProfile
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                try await self.asr.load(profile: profile)
-                log("ASR: reloaded after GPU setting change (useGPU=\(self.settings.useGPU))")
-            } catch {
-                log("ASR: failed to reload after GPU setting change: \(error)")
-            }
-            // The ASR toggle governs ONLY the ASR backend now — the bundled
-            // LLM host has its own independent `llmUseGPU` toggle, so it is
-            // deliberately NOT stopped here.
-            self.rebuildMenu()
-        }
-        rebuildMenu()
     }
 
     @objc private func toggleLLMUseGPU(_ sender: NSMenuItem) {

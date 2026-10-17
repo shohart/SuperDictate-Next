@@ -24,10 +24,6 @@ let package = Package(
         // comment below for why (two independently vendored ggml copies
         // cannot share one linked binary).
         .executable(name: "SuperDictateLLMHost", targets: ["SuperDictateLLMHost"]),
-        // SuperDictateWhisperHost: whisper.cpp ASR helper process (Vulkan).
-        // Separate executable for the same duplicate-ggml-symbols reason as
-        // SuperDictateLLMHost above.
-        .executable(name: "SuperDictateWhisperHost", targets: ["SuperDictateWhisperHost"]),
     ],
     dependencies: [],
     targets: [
@@ -179,110 +175,6 @@ let package = Package(
                     "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
                 ]),
             ]
-        ),
-        // whisper_cpp — the vendored whisper.cpp tree restored from commit
-        // a7ceb9e (deleted in 1bb8ae4 during the Parakeet migration; brought
-        // back 2026-08-27 by user decision to run Whisper via whisper.cpp +
-        // GGUF + Vulkan on the RX 6600 instead of CTranslate2 CPU). Target
-        // settings transcribed verbatim from `git show a7ceb9e:swift/Package.swift`
-        // — that exact configuration was proven on this machine (Vulkan via
-        // statically-linked MoltenVK, pre-compiled SPIR-V corpus loaded at
-        // runtime). Consumed ONLY by the SuperDictateWhisperHost executable
-        // below, never by Parakey itself: this is a second independently
-        // vendored ggml copy alongside parakeet_cpp, and two ggml copies in
-        // one linked binary is a guaranteed duplicate-symbol error (same
-        // rationale as the llama_cpp host).
-        .target(
-            name: "whisper_cpp",
-            exclude: [
-                "ggml-cpu/arch/arm",
-                "ggml-cpu/arch/riscv",
-                "ggml-cpu/arch/powerpc",
-                "ggml-cpu/arch/s390",
-                "ggml-cpu/arch/wasm",
-                "ggml-cpu/arch/loongarch",
-                "ggml-cpu/spacemit",
-                // Metal backend excluded — Vulkan is this fork's GPU backend.
-                "ggml-metal-common.cpp",
-                "ggml-metal-context.m",
-                "ggml-metal.cpp",
-                "ggml-metal-device.cpp",
-                "ggml-metal-device.m",
-                "ggml-metal-embed.cpp",
-                "ggml-metal-ops.cpp",
-                // Raw .spv binaries (1785 files) pre-compiled by
-                // scripts/vendor-whisper-cpp.sh; loaded by explicit file
-                // path at runtime, never compiled in / never a SwiftPM
-                // resource. Shipped as Contents/Resources/whisper-vulkan-shaders/
-                // (its OWN directory, distinct from parakeet's
-                // vulkan-shaders/ corpus — different ggml pins).
-                "vulkan-shaders",
-            ],
-            cSettings: [
-                .define("GGML_USE_ACCELERATE"),
-                .define("GGML_USE_CPU"),
-                .define("GGML_USE_BLAS"),
-                .define("GGML_BLAS_USE_ACCELERATE"),
-                .define("ACCELERATE_NEW_LAPACK"),
-                .define("ACCELERATE_LAPACK_ILP64"),
-                .define("GGML_USE_VULKAN"),
-                .define("GGML_VERSION", to: "\"080bbbe8\""),
-                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
-                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
-                .headerSearchPath("."),
-                .headerSearchPath("ggml-cpu"),
-                .unsafeFlags([
-                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
-                    "-I/usr/local/opt/vulkan-headers/include",
-                ]),
-            ],
-            cxxSettings: [
-                .define("GGML_USE_ACCELERATE"),
-                .define("GGML_USE_CPU"),
-                .define("GGML_USE_BLAS"),
-                .define("GGML_BLAS_USE_ACCELERATE"),
-                .define("ACCELERATE_NEW_LAPACK"),
-                .define("ACCELERATE_LAPACK_ILP64"),
-                .define("GGML_USE_VULKAN"),
-                .define("GGML_VERSION", to: "\"080bbbe8\""),
-                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
-                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
-                .headerSearchPath("."),
-                .headerSearchPath("ggml-cpu"),
-                .unsafeFlags([
-                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
-                    "-I/usr/local/opt/vulkan-headers/include",
-                ]),
-            ],
-            linkerSettings: [
-                .linkedFramework("Accelerate"),
-                .linkedFramework("Foundation"),
-                .linkedFramework("IOSurface"),
-                .linkedFramework("IOKit"),
-                .linkedFramework("AppKit"),
-                .linkedFramework("QuartzCore"),
-                .linkedFramework("CoreFoundation"),
-                .linkedFramework("CoreGraphics"),
-                .linkedFramework("Metal"),
-                .linkedLibrary("objc"),
-                .linkedLibrary("c++"),
-                .unsafeFlags([
-                    "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
-                ]),
-            ]
-        ),
-        // SuperDictateWhisperHost — persistent whisper.cpp worker speaking
-        // the same stdio PCM protocol the Python faster-whisper host used
-        // (LE uint32 sample count + raw float32 PCM in, LE uint32 byte
-        // length + UTF-8 text out). Out-of-process on purpose: isolates the
-        // app from ggml/whisper crashes AND sidesteps the duplicate-ggml
-        // symbol clash with parakeet_cpp. Vulkan shaders are located via
-        // the SUPERDICTATE_VULKAN_SHADER_DIR env var (tier 1 of
-        // ggml-vulkan-shaders-runtime's 3-tier fallback).
-        .executableTarget(
-            name: "SuperDictateWhisperHost",
-            dependencies: ["whisper_cpp"],
-            path: "Sources/whisper_cpp_host"
         ),
         .executableTarget(
             name: "Parakey",

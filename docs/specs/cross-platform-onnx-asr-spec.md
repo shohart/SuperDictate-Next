@@ -8,6 +8,17 @@ facts verified during the initial spike (§2). The original proposal text is
 preserved in substance; everything marked **[verified]** was checked against
 primary artifacts on 2026-10-10.
 
+**Revision 3 (2026-10-17), user decision after the W6 comparison (§12):**
+speech recognition is ONNX on the CPU only. The GGUF parakeet.cpp engine,
+whisper.cpp, the `SuperDictateWhisperHost` helper and the ASR "Use GPU"
+toggle are removed; `parakeetUltraOnnx` is the only `SpeechModelProfile`
+and the default, and saved GGUF/Whisper selections migrate to it. The GPU
+(Vulkan) is used only by `SuperDictateLLMHost` (correction, rewrite). The
+`parakeet_cpp` C target stays, for the Silero VAD and the Vulkan device
+probe behind "LLM on GPU". Sections §1–§11 below describe the state they
+were written against and are kept for history; where they say GGUF stays
+the default or ONNX is experimental, revision 3 overrides them.
+
 ## 1. Motivation and repository context (as of `ef9c4ec`, v0.6.0)
 
 - The app is Swift/AppKit (`swift/Sources/Parakey`), macOS 14+, built by
@@ -134,8 +145,9 @@ SuperDictateOnnxHost  ------------>  libsd_asr (C++17, C ABI sd_asr.h)
                                        `-- ONNX Runtime 1.23.2 C/C++ API
 ```
 
-- The GGUF path (parakeet.cpp, whisper.cpp) stays intact and remains the
-  default. ONNX is opt-in until §10 gates pass.
+- ~~The GGUF path (parakeet.cpp, whisper.cpp) stays intact and remains the
+  default. ONNX is opt-in until §10 gates pass.~~ Revision 3: ONNX is the
+  only ASR engine; the GGUF path and Whisper are removed.
 - On macOS the app does **not** link ONNX Runtime. It talks to a helper
   process `SuperDictateOnnxHost` (crash isolation, bounded shutdown by
   killing the process, no SwiftPM binary target, no ggml/ORT co-residence).
@@ -455,6 +467,40 @@ the differences are punctuation/casing plus a few words (ONNX "надеждой
 сладкой" vs GGUF "Надежды сладкой"). The GGUF path on Vulkan (RX 6600) and a
 real-dictation WER comparison (§11 gate 4) are still open.
 
+**W6 segmented comparison (2026-10-17, same Mac with an AMD Radeon Vega
+discrete GPU, release test bundle, 8 threads, no LLM correction).** Every
+clip went through the app's real dictation path — `TranscriptionWorker` +
+`transcribeSegmented` (PauseSegmenter ≤ 25 s, 4 s overlap windows, seam
+dedup) — via `--benchmark-transcribe`, under a memory/swap/VRAM watchdog.
+Corpus: 8 `say` clips, 1.7–19 s plus a 52.5 s monologue, RU/EN/mixed,
+scored against the spoken reference text (`scripts/benchmark-asr.sh`).
+
+| Engine | Device | Mean WER | Mean CER | Mean punct F1 | Mean RTF | Cold load, s |
+|---|---|---:|---:|---:|---:|---:|
+| ONNX Parakeet Ultra int8 | CPU | **0.0787** | **0.0537** | **0.965** | **0.119** | 3.7 |
+| GGUF parakeet-tdt-0.6b-v3 q8_0 | CPU | 0.0844 | 0.0710 | 0.909 | 0.182 | 5.5 |
+| GGUF parakeet-tdt-0.6b-v3 q8_0 | Vulkan | 0.0844 | 0.0710 | 0.909 | 0.133 | 6.0 |
+| whisper.cpp large-v3-turbo q8_0 (auto language) | Vulkan | not scored | — | — | 0.63–6.4 | 16.6 (+11.3 warm-up) |
+
+- ONNX on the CPU beats GGUF on Vulkan on accuracy (WER, CER and
+  punctuation) and on speed. The 52.5 s monologue: ONNX 6.8 s, GGUF CPU
+  6.9 s, GGUF Vulkan 4.6 s — Vulkan wins only on long audio, and loses on
+  every short dictation. Peak RSS of the app process: ONNX 38–61 MB (the
+  model lives in the helper), GGUF in-process 0.97–1.26 GB. Swap stayed 0.
+- whisper.cpp spends ≈ 11 s per call regardless of clip length (it pads
+  every input to a 30 s window): 11.1 s for a 1.7 s command, 12.0 s for
+  19 s. It also misheard the code-switch clip ("валкой на UGPU" for
+  "Vulkan и GPU"). The run was stopped after 7 of 8 clips, so its WER is
+  not scored.
+- Earlier, a full benchmark that included whisper.cpp on the CPU (its host
+  then defaulted to 36 threads, plus a silent CPU fallback) hung the
+  machine; no log survived. Whisper was made GPU-only, then removed.
+
+**Decision (user, 2026-10-17):** ONNX on the CPU is the only ASR engine;
+GGUF Parakeet and whisper.cpp are removed (revision 3 above). Raw results:
+`dist/bench-safe/run2-*` and `run3-whisper-vulkan` on the Intel Mac (not
+committed).
+
 ## 13. Waves
 
 | Wave | Content | Verifiable where |
@@ -472,5 +518,6 @@ real-dictation WER comparison (§11 gate 4) are still open.
 
 No LLM migration to ONNX; no Python at runtime (Python is used only to
 produce test goldens); no assumption that `.onnx` files share a decoder; no
-silent "GPU" label on CPU execution; no removal of GGUF or Whisper; no
-streaming in the first release.
+silent "GPU" label on CPU execution; no streaming in the first release.
+(Revision 3 removed GGUF and Whisper after the §12 comparison; that is no
+longer a non-goal.)

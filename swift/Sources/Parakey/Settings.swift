@@ -83,14 +83,10 @@ final class Settings: @unchecked Sendable {
     private static let keyCustomFillerWords = "custom_filler_words"
     private static let keyDisabledCustomFillerWords = "disabled_custom_filler_words"
     private static let keyNormalizeNumbersToDigits = "normalize_numbers_to_digits"
-    // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
-    // inherit the old Whisper `useGPU` storage value... the persisted key
-    // must be new so an old installation with Whisper Vulkan enabled starts
-    // Parakeet on CPU after upgrading"). The Swift property below stays
-    // named `useGPU` for minimal call-site churn; only the UserDefaults key
-    // changed. `use_gpu` itself is intentionally left unused/unread from
-    // here on — it is simply abandoned old state, never migrated.
-    private static let keyUseGPU = "parakeet_use_gpu"
+    // The retired ASR "Use GPU (Vulkan)" toggle. Speech recognition is CPU
+    // only now; the key is read once more, as the inherited default of
+    // `llmUseGPU` (see there), and never written.
+    private static let keyLegacyASRUseGPU = "parakeet_use_gpu"
     // Independent GPU toggle for the bundled LLM postprocessing host
     // (correction + rewrite). Deliberately separate from `parakeet_use_gpu`:
     // the ASR benchmark showed Vulkan degrades ASR accuracy on this
@@ -1002,28 +998,16 @@ final class Settings: @unchecked Sendable {
     }
 
     // Opt-in Vulkan GPU backend for Parakeet (parakeet.cpp). Not implemented
-    // yet — Vulkan support is Phase 5 of the parakeet.cpp migration plan;
-    // this phase only adds the storage key + default so clean installs and
-    // upgrades both start on CPU (spec §10). Defaults to `false` (CPU) via
-    // `defaults.bool(forKey:)`'s standard "unset key reads as false"
-    // behavior — never force this on by default. Persisted under a NEW key
-    // (`parakeet_use_gpu`, see `keyUseGPU`'s comment), never inherited from
-    // the old Whisper `use_gpu` value.
-    var useGPU: Bool {
-        get { defaults.bool(forKey: Self.keyUseGPU) }
-        set { defaults.set(newValue, forKey: Self.keyUseGPU) }
-    }
-
     /// Opt-in Vulkan GPU backend for the bundled LLM postprocessing host
-    /// (correction + rewrite). Independent of `useGPU` (which governs the
-    /// ASR backend) so the two can run on different devices — see
-    /// `keyLLMUseGPU`'s comment. Until the user flips it once it inherits
-    /// `useGPU`, which governed the LLM host before the split — an upgrade
-    /// never silently moves a GPU user's correction model to CPU. Clean
-    /// installs still start on CPU (both keys unset read as `false`).
+    /// (correction + rewrite) — the only GPU path in the app (speech
+    /// recognition is CPU only). Until the user flips it once it inherits
+    /// the retired ASR "Use GPU" value, which governed the LLM host before
+    /// the split — an upgrade never silently moves a GPU user's correction
+    /// model to CPU. Clean installs still start on CPU (both keys unset read
+    /// as `false`).
     var llmUseGPU: Bool {
         get {
-            guard defaults.object(forKey: Self.keyLLMUseGPU) != nil else { return useGPU }
+            guard defaults.object(forKey: Self.keyLLMUseGPU) != nil else { return defaults.bool(forKey: Self.keyLegacyASRUseGPU) }
             return defaults.bool(forKey: Self.keyLLMUseGPU)
         }
         set { defaults.set(newValue, forKey: Self.keyLLMUseGPU) }

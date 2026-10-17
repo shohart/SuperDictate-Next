@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
-// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (Parakeet via ONNX Runtime in the
+// SuperDictateOnnxHost helper, CPU only — the GPU is for the LLM host),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -120,8 +120,8 @@ enum ParakeySelfTest {
             return runSuite("text-insertion-target-store", testPendingTextInsertionTargetStore)
         case "text-insertion-routing":
             return runSuite("text-insertion-routing", testTextInsertionRouting)
-        case "parakeet-bridge":
-            return runSuite("parakeet-bridge", testParakeetBridge)
+        case "asr-thread-policy":
+            return runSuite("asr-thread-policy", testASRThreadPolicy)
         case "silero-vad-bridge":
             return runSuite("silero-vad-bridge", testSileroVadBridge)
         case "silero-vad-real":
@@ -144,8 +144,6 @@ enum ParakeySelfTest {
             return runSuite("vad-boundary-oracle", testVadBoundaryOracle)
         case "vad-boundary-oracle-real":
             return runSuite("vad-boundary-oracle-real", testVadBoundaryOracleRealModel)
-        case "parakeet-cpu":
-            return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
         case "russian-number-itn-cardinal":
@@ -158,10 +156,6 @@ enum ParakeySelfTest {
             return runSuite("russian-number-itn-punctuation", testRussianNumberITNPunctuation)
         case "russian-number-itn-pipeline":
             return runSuite("russian-number-itn-pipeline", testProcessedDictationTextITN)
-        case "parakeet-vulkan":
-            return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
-        case "parakeet-vulkan-bench":
-            return runSuite("parakeet-vulkan-bench", benchmarkParakeetCPUvsVulkan)
         case "token-transcription-decode":
             return runSuite("token-transcription-decode", testTokenTranscriptionDecode)
         case "recording-hud-display-mode":
@@ -269,7 +263,7 @@ enum ParakeySelfTest {
         try testRussianNumberITNContext()
         try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
-        try testParakeetBridge()
+        try testASRThreadPolicy()
         try testSileroVadBridge()
         try testPauseSegmentation()
         try testOverlapWindowing()
@@ -1236,32 +1230,39 @@ enum ParakeySelfTest {
 
         try expect(
             productionSpeechModelProfile(rawValue: nil),
-            equals: .parakeetTDTv3,
+            equals: .parakeetUltraOnnx,
             "missing speech model setting should use the production default"
         )
         try expect(
-            productionSpeechModelProfile(rawValue: SpeechModelProfile.parakeetTDTv3.rawValue),
-            equals: .parakeetTDTv3,
-            "stored v3 speech model should remain valid"
+            productionSpeechModelProfile(rawValue: SpeechModelProfile.parakeetUltraOnnx.rawValue),
+            equals: .parakeetUltraOnnx,
+            "stored ONNX speech model should remain valid"
         )
+        for retired in ["parakeet_tdt_v3", "whisper_large_v3_turbo_russian", "whisper_large_v3_turbo_russian_codeswitch"] {
+            try expect(
+                productionSpeechModelProfile(rawValue: retired),
+                equals: .parakeetUltraOnnx,
+                "retired \(retired) speech model setting should migrate to the ONNX profile"
+            )
+        }
         try expect(
             productionSpeechModelProfile(rawValue: "english_unified"),
-            equals: .parakeetTDTv3,
-            "old deprecated/legacy speech model setting should migrate to Parakeet TDT v3"
+            equals: .parakeetUltraOnnx,
+            "old deprecated/legacy speech model setting should migrate to the ONNX profile"
         )
         try expect(
             productionSpeechModelProfile(rawValue: "multilingual_v3"),
-            equals: .parakeetTDTv3,
-            "old pre-migration Whisper speech model setting should migrate to Parakeet TDT v3"
+            equals: .parakeetUltraOnnx,
+            "old pre-migration Whisper speech model setting should migrate to the ONNX profile"
         )
         try expect(
             productionSpeechModelProfile(rawValue: "unknown_model"),
-            equals: .parakeetTDTv3,
-            "unknown speech model setting should migrate to Parakeet TDT v3"
+            equals: .parakeetUltraOnnx,
+            "unknown speech model setting should migrate to the ONNX profile"
         )
 
         try expect(
-            speechModelSetupRowState(profile: .parakeetTDTv3,
+            speechModelSetupRowState(profile: .parakeetUltraOnnx,
                                      isSpeechModelReady: false,
                                      isStartupInProgress: true,
                                      startupStatusTitle: "Downloading speech model… 50%",
@@ -1272,7 +1273,7 @@ enum ParakeySelfTest {
             "setup checklist should show speech model progress"
         )
         try expect(
-            speechModelSetupRowState(profile: .parakeetTDTv3,
+            speechModelSetupRowState(profile: .parakeetUltraOnnx,
                                      isSpeechModelReady: false,
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
@@ -1283,12 +1284,12 @@ enum ParakeySelfTest {
             "setup checklist should offer retry for speech model failures"
         )
         try expect(
-            speechModelSetupRowState(profile: .parakeetTDTv3,
+            speechModelSetupRowState(profile: .parakeetUltraOnnx,
                                      isSpeechModelReady: true,
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
                                      failure: nil),
-            equals: SetupChecklistRowState(detail: "Parakeet TDT 0.6B v3 is loaded locally.",
+            equals: SetupChecklistRowState(detail: "Parakeet Ultra 0.6B (ONNX) is loaded locally.",
                                            status: "Ready",
                                            buttonTitle: nil),
             "setup checklist should show the speech model when ready"
@@ -3231,13 +3232,13 @@ enum ParakeySelfTest {
     /// aren't: real model loads and real inference, not appropriate for
     /// the always-on headless suite.
     private static func testFullDictationPipelineWithLLMCorrection() throws {
-        guard let asrModelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+        guard let asrModelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_ONNX_MODEL_DIR"],
               FileManager.default.fileExists(atPath: asrModelPath),
               let gecModelFixturePath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
               FileManager.default.fileExists(atPath: gecModelFixturePath),
               let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_FULL_PIPELINE_TEST_WAV"],
               FileManager.default.fileExists(atPath: wavPath) else {
-            print("SKIP full-pipeline: needs SUPERDICTATE_PARAKEET_MODEL + SUPERDICTATE_GEC_MODEL + SUPERDICTATE_FULL_PIPELINE_TEST_WAV")
+            print("SKIP full-pipeline: needs SUPERDICTATE_ONNX_MODEL_DIR + SUPERDICTATE_GEC_MODEL + SUPERDICTATE_FULL_PIPELINE_TEST_WAV")
             return
         }
 
@@ -3247,10 +3248,11 @@ enum ParakeySelfTest {
         }
 
         // Step 1: real ASR, exactly as TranscriptionWorker drives it.
-        let asrEngine = try ParakeetEngine(modelPath: asrModelPath, device: .cpu,
-                                          threadCount: TranscriptionWorker.resolvedParakeetThreadCount())
+        let asrEngine = try runParakeetEngineSynchronously {
+            try await OnnxAsrEngine.launch(modelDirectory: URL(fileURLWithPath: asrModelPath, isDirectory: true),
+                                           threadCount: TranscriptionWorker.resolvedASRThreadCount())
+        }
         defer { _ = try? runParakeetEngineSynchronously { await asrEngine.shutdown() } }
-        try runParakeetEngineSynchronously { try await asrEngine.warmUp() }
         let asrStarted = ProcessInfo.processInfo.systemUptime
         let transcription = try runParakeetEngineSynchronously {
             try await asrEngine.transcribe(samples: wavSamples)
@@ -3348,19 +3350,18 @@ enum ParakeySelfTest {
         }
 
         // LLM GPU toggle: clean installs start on CPU; an unset toggle
-        // inherits the ASR toggle (pre-split behavior); once set it is
-        // independent of the ASR toggle.
+        // inherits the retired ASR "Use GPU" key; once set it is explicit.
         do {
-            let settings = freshSettings()
+            let suite = "com.local.superdictate.selftest.llm-gpu-\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
             try expect(settings.llmUseGPU, equals: false, "LLM must start on CPU on a clean install")
-            settings.useGPU = true
-            try expect(settings.llmUseGPU, equals: true, "an unset LLM GPU toggle must inherit the ASR toggle")
+            defaults.set(true, forKey: "parakeet_use_gpu")
+            try expect(settings.llmUseGPU, equals: true, "an unset LLM GPU toggle must inherit the retired ASR toggle")
             settings.llmUseGPU = false
-            try expect(settings.useGPU, equals: true, "setting the LLM toggle must not touch the ASR toggle")
-            try expect(settings.llmUseGPU, equals: false, "an explicit LLM GPU choice must override the ASR toggle")
-            settings.useGPU = false
-            settings.llmUseGPU = true
-            try expect(settings.llmUseGPU && !settings.useGPU, equals: true, "LLM on GPU with ASR on CPU must be representable")
+            try expect(settings.llmUseGPU, equals: false, "an explicit LLM GPU choice must override the retired ASR toggle")
+            try expect(defaults.bool(forKey: "parakeet_use_gpu"), equals: true, "the LLM toggle must never write the retired key")
         }
 
         // Corruption tolerance: unknown stored values fall back to defaults.
@@ -4343,29 +4344,29 @@ enum ParakeySelfTest {
             equals: nil,
             "completed download should show indeterminate model progress"
         )
-        let requiredBytes = speechModelDownloadRequiredBytes(for: .parakeetTDTv3,
+        let requiredBytes = speechModelDownloadRequiredBytes(for: .parakeetUltraOnnx,
                                                              headroomBytes: 100)
         try expect(
             requiredBytes,
-            equals: PARAKEET_MODEL_SIZE_BYTES + 100,
+            equals: PARAKEET_ULTRA_ONNX_SIZE_BYTES + 100,
             "speech model download requirement should include model estimate plus headroom"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetUltraOnnx,
                                               availableBytes: requiredBytes - 1,
                                               requiredBytes: requiredBytes)?.contains("Free some disk space"),
             equals: true,
             "low disk-space failures should explain how to recover"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetUltraOnnx,
                                               availableBytes: requiredBytes,
                                               requiredBytes: requiredBytes),
             equals: nil,
             "disk-space check should pass once required space is available"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetUltraOnnx,
                                               availableBytes: nil,
                                               requiredBytes: requiredBytes),
             equals: nil,
@@ -4483,15 +4484,6 @@ enum ParakeySelfTest {
         }
         try expect(rejectedSymlinkHashRead, equals: true,
                    "model integrity hashing should not follow leaf symlinks")
-
-        let localParakeetCache = speechModelCacheDirectory(for: .productionDefault)
-        if fm.fileExists(atPath: localParakeetCache.path) {
-            try expect(
-                try sha256Hex(ofFileAt: localParakeetCache) == PARAKEET_MODEL_SHA256,
-                equals: true,
-                "cached Parakeet model should pass checksum verification"
-            )
-        }
     }
 
     private static func testSpeechModelCachePathSafety() throws {
@@ -5695,184 +5687,46 @@ enum ParakeySelfTest {
         try expect(corrected.text, equals: "мне 25 years old", "ITN should run before user corrections so corrections can match on the digit form")
     }
 
-    // MARK: - Parakeet bridge (spec §18.1 — no large model required)
+    // MARK: - ASR thread policy
 
-    private static func testParakeetBridge() throws {
-        // Null/invalid-path handling: ParakeetEngine.init checks
-        // FileManager existence before ever calling into the native bridge,
-        // so this also covers "invalid model path" without needing a live
-        // parakeet.cpp context or the ~940MB GGUF.
-        var threwModelNotFound = false
-        do {
-            _ = try ParakeetEngine(
-                modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
-                device: .cpu,
-                threadCount: 4
-            )
-        } catch ParakeetEngineError.modelNotFound {
-            threwModelNotFound = true
-        }
-        try expect(threwModelNotFound, equals: true,
-                   "ParakeetEngine should reject a nonexistent model path with .modelNotFound")
-
-        // Requesting Vulkan on a nonexistent model path must fail
-        // deterministically and honestly: with NO Vulkan device enumerated
-        // (CPU-only build, or a Vulkan-capable build on hardware with no
-        // usable GPU), ParakeetEngine.init's cheap registry probe rejects
-        // it with .vulkanUnavailable BEFORE even checking the model path —
-        // never silently falls back to CPU while claiming GPU. On a build
-        // where a Vulkan device IS enumerated (e.g. this fork's real Mac
-        // build against the RX 6600), the probe passes and the SAME
-        // nonexistent-path guard used above applies instead (.modelNotFound)
-        // — the point of this assertion either way is "never silently
-        // succeeds/claims GPU for a model path that doesn't exist."
-        if parakeetVulkanAvailable() {
-            var threwModelNotFoundForVulkan = false
-            do {
-                _ = try ParakeetEngine(
-                    modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
-                    device: .vulkan,
-                    threadCount: 4
-                )
-            } catch ParakeetEngineError.modelNotFound {
-                threwModelNotFoundForVulkan = true
-            }
-            try expect(threwModelNotFoundForVulkan, equals: true,
-                       "a Vulkan-capable build should still reject a nonexistent model path deterministically")
-        } else {
-            var threwVulkanUnavailable = false
-            do {
-                _ = try ParakeetEngine(
-                    modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
-                    device: .vulkan,
-                    threadCount: 4
-                )
-            } catch ParakeetEngineError.vulkanUnavailable {
-                threwVulkanUnavailable = true
-            }
-            try expect(threwVulkanUnavailable, equals: true,
-                       "requesting Vulkan with no device enumerated should fail deterministically, not silently fall back to CPU")
-        }
-
-        // parakeet.cpp's own version string is a native call that needs no
-        // loaded model — exercises the bridge/native link itself.
-        try expect(
-            parakeetRuntimeVersion().isEmpty,
-            equals: false,
-            "parakeet.cpp runtime version string should be non-empty"
-        )
-
+    private static func testASRThreadPolicy() throws {
         // Thread-count policy (spec §10): max(2, min(8, active/2)), with a
         // validated SUPERDICTATE_ASR_THREADS override (1...32).
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 4, environmentOverride: nil),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 4, environmentOverride: nil),
             equals: 2,
             "4 active processors should floor to the minimum of 2 threads"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 32, environmentOverride: nil),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 32, environmentOverride: nil),
             equals: 8,
             "a high processor count should cap at the maximum of 8 threads"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: nil),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: nil),
             equals: 4,
             "8 active processors should use half (4) within the 2...8 band"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "6"),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "6"),
             equals: 6,
             "a valid SUPERDICTATE_ASR_THREADS override should take precedence over the default policy"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "0"),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "0"),
             equals: 4,
             "an out-of-range (below 1) override should be ignored, falling back to the default"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "64"),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "64"),
             equals: 4,
             "an out-of-range (above 32) override should be ignored, falling back to the default"
         )
         try expect(
-            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "not-a-number"),
+            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "not-a-number"),
             equals: 4,
             "a non-numeric override should be ignored, falling back to the default"
         )
-
-        // Model metadata pins (spec §3 / §27) — guards against silent drift
-        // of the values recorded in the migration plan/report.
-        try expect(PARAKEET_MODEL_SIZE_BYTES, equals: 940_663_680,
-                   "pinned Parakeet model size must match the value verified in Phase 2")
-        try expect(PARAKEET_MODEL_SHA256, equals: "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757",
-                   "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
-        try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
-                   "pinned Parakeet model filename must not drift silently")
-
-        // sd_parakeet_transcribe_with_tokens: NULL out_result -> NULL_ARGUMENT.
-        // No live context is needed — this check runs before context/samples
-        // are ever inspected, mirroring sd_parakeet_transcribe's own
-        // out_result-first ordering.
-        var dummySample: Float = 0.1
-        let statusNullOutResult = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
-            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 16000, nil)
-        }
-        try expect(statusNullOutResult, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
-                   "sd_parakeet_transcribe_with_tokens with a NULL out_result should return NULL_ARGUMENT")
-
-        // sd_parakeet_transcribe_with_tokens: NULL context -> NULL_ARGUMENT,
-        // and the output struct's fields are all cleared (never left
-        // uninitialized), matching sd_parakeet_transcribe's contract for
-        // SDParakeetResult.
-        var tokenResult = SDParakeetTokenResult(
-            json: UnsafeMutablePointer(bitPattern: 1), // poison
-            total_seconds: 42,
-            inference_seconds: 42,
-            used_gpu: 1
-        )
-        let statusNullContext = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
-            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 16000, &tokenResult)
-        }
-        try expect(statusNullContext, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
-                   "sd_parakeet_transcribe_with_tokens with a NULL context should return NULL_ARGUMENT")
-        try expect(tokenResult.json == nil, equals: true,
-                   "a NULL_ARGUMENT failure must set out_result->json to NULL")
-        try expect(tokenResult.total_seconds, equals: 0.0,
-                   "a NULL_ARGUMENT failure must zero out_result->total_seconds")
-        try expect(tokenResult.inference_seconds, equals: 0.0,
-                   "a NULL_ARGUMENT failure must zero out_result->inference_seconds")
-        try expect(tokenResult.used_gpu, equals: 0,
-                   "a NULL_ARGUMENT failure must zero out_result->used_gpu")
-
-        // sd_parakeet_transcribe_with_tokens: NULL samples -> NULL_ARGUMENT
-        // (context stays NULL too, for the same reason documented in
-        // testSileroVadBridge — the bridge's guard is a single
-        // short-circuiting `!context || !context->native || !samples || ...`,
-        // so a fabricated non-NULL context handle would be dereferenced
-        // rather than isolating the samples check).
-        var tokenResult2 = SDParakeetTokenResult(
-            json: UnsafeMutablePointer(bitPattern: 1), total_seconds: 42, inference_seconds: 42, used_gpu: 1
-        )
-        let statusNullSamples = sd_parakeet_transcribe_with_tokens(nil, nil, 1, 16000, &tokenResult2)
-        try expect(statusNullSamples, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
-                   "sd_parakeet_transcribe_with_tokens with NULL samples should return NULL_ARGUMENT")
-        try expect(tokenResult2.json == nil, equals: true,
-                   "a NULL_ARGUMENT failure must set out_result->json to NULL")
-
-        // sd_parakeet_transcribe_with_tokens: sample_rate == 0 -> NULL_ARGUMENT
-        // (grouped with the other NULL-ish argument checks in the bridge's
-        // guard, same as sd_parakeet_transcribe).
-        var tokenResult3 = SDParakeetTokenResult(
-            json: UnsafeMutablePointer(bitPattern: 1), total_seconds: 42, inference_seconds: 42, used_gpu: 1
-        )
-        let statusZeroSampleRate = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
-            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 0, &tokenResult3)
-        }
-        try expect(statusZeroSampleRate, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
-                   "sd_parakeet_transcribe_with_tokens with sample_rate == 0 should return NULL_ARGUMENT")
-
-        // sd_parakeet_token_result_destroy must be safe (no crash) on NULL.
-        sd_parakeet_token_result_destroy(nil)
     }
 
     /// NULL-argument / invalid-path coverage for the `sd_silero_vad_*` C
@@ -6777,76 +6631,12 @@ enum ParakeySelfTest {
         try expect(lookbackOutput[4].text, equals: "token4", "token4 kept (collision outside lookback window)")
     }
 
-    // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
-
-    /// Skipped (not failed) unless `SUPERDICTATE_PARAKEET_MODEL` points at a
-    /// real, already-downloaded GGUF — mirrors spec §18.2's "if the
-    /// environment variable or device is absent, mark the integration test
-    /// skipped, not passed" requirement (written for the Vulkan case there,
-    /// applied here to the CPU case too since CI/most dev machines won't
-    /// have the ~940MB model pre-staged).
-    private static func testParakeetCPUIntegration() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
-              FileManager.default.fileExists(atPath: modelPath) else {
-            print("SKIP parakeet-cpu: SUPERDICTATE_PARAKEET_MODEL not set to an existing file")
-            return
-        }
-
-        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
-        let loadStarted = ProcessInfo.processInfo.systemUptime
-        // ParakeetEngine.init is synchronous (an actor's init runs before
-        // the instance's isolation is established, so no `await` is needed
-        // to call it) — only its instance methods need the sync bridge
-        // below. `engine` itself is Sendable (actors are Sendable by
-        // construction), so it can be captured directly in the bridge's
-        // `Task { }` closures with no extra wrapper.
-        let engine = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
-        let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
-
-        try runParakeetEngineSynchronously { try await engine.warmUp() }
-
-        // 0.5s of near-silence (a tiny DC offset, not exact zero, so this
-        // isn't indistinguishable from a truly empty buffer) — enough to
-        // exercise a real forward pass without needing a real speech
-        // fixture file bundled into the repo.
-        let sampleCount = Int(SAMPLE_RATE * 0.5)
-        let samples = [Float](repeating: 0.0001, count: sampleCount)
-        let inferStarted = ProcessInfo.processInfo.systemUptime
-        let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
-        let inferSeconds = ProcessInfo.processInfo.systemUptime - inferStarted
-        let rtf = inferSeconds / max(0.001, Double(sampleCount) / SAMPLE_RATE)
-
-        print("PARAKEET CPU: load \(String(format: "%.2f", loadSeconds))s, threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
-
-        // Repeat inference on the SAME loaded context (load-once contract).
-        let secondResult = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
-        print("PARAKEET CPU (2nd call, same context): text=\"\(secondResult.text)\"")
-
-        // Destroy and recreate the context safely (spec §18.2 item 7).
-        try runParakeetEngineSynchronously { await engine.shutdown() }
-        let recreated = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
-        try runParakeetEngineSynchronously { try await recreated.warmUp() }
-        try runParakeetEngineSynchronously { await recreated.shutdown() }
-    }
-
-    // MARK: - Parakeet Vulkan integration (spec §18.3 — real GPU, opt-in via
-    // env vars; skipped, not failed, when the hardware/model isn't present)
-
-    /// Skipped (not failed) unless BOTH `SUPERDICTATE_TEST_VULKAN=1` and
-    /// `SUPERDICTATE_PARAKEET_MODEL` (an existing GGUF path) are set — spec
-    /// §18.3's "if the environment variable or device is absent, mark the
-    /// integration test skipped, not passed." Real hardware verification
-    /// (device selection, forced-failure fallback, VRAM use) is covered by
-    /// the Phase 5 integration report's manual runs on the actual RX 6600;
-    /// this self-test is the re-runnable regression check for CI/dev boxes
-    /// that DO have Vulkan + the model staged.
-    // MARK: - Minimal WAV reader (Phase 5 benchmark harness only)
+    // MARK: - Minimal WAV reader (self-test fixtures only)
 
     /// Parses a canonical 16-bit PCM WAV file into mono Float32 samples in
     /// [-1, 1] at its native sample rate. Deliberately minimal (no
     /// float/24-bit/extensible fmt chunk support) — this exists ONLY to
-    /// drive `benchmarkParakeetCPUvsVulkan()` against the Phase 1 corpus
-    /// fixtures (16-bit PCM mono/stereo WAV), not as production audio I/O
+    /// feed self-test fixtures (16-bit PCM mono/stereo WAV), not as production audio I/O
     /// (the app's real capture path uses AVFoundation, never a file).
     private static func loadWavMonoFloat32(path: String) throws -> (samples: [Float], sampleRate: UInt32) {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -6894,183 +6684,6 @@ enum ParakeySelfTest {
             }
         }
         return (samples, sampleRate)
-    }
-
-    /// Phase 5 benchmark harness: Parakeet CPU vs Vulkan, wired through the
-    /// EXACT same ParakeetEngine/bridge path the app itself uses (not the
-    /// standalone parakeet-cli used by the Phase 5 pre-spike) — the point
-    /// is to measure whatever overhead Swift/actor/bridge marshalling adds
-    /// on top of the pre-spike's raw ~30-63% latency reduction. Opt-in via
-    /// SUPERDICTATE_TEST_VULKAN=1 + SUPERDICTATE_PARAKEET_MODEL (same gates
-    /// as testParakeetVulkanIntegration) plus SUPERDICTATE_BENCH_CORPUS_DIR
-    /// pointing at a directory of 16-bit PCM WAV files (the Phase 1 corpus
-    /// fixture set) and SUPERDICTATE_BENCH_DEVICE ("cpu" or "vulkan"). Runs
-    /// ONE device per process invocation deliberately — parakeet.cpp's
-    /// compute backend (pk::global_backend()) is a process-global
-    /// singleton that commits to one device for the process's lifetime
-    /// (confirmed by this same bridge's own post-init safety check, which
-    /// correctly refused a same-process CPU-then-Vulkan sequence here
-    /// during development), matching how TranscriptionWorker itself never
-    /// holds a CPU and a Vulkan engine alive at the same time either. Run
-    /// this once per device and compare the two logs' `cpu_ms`/timing
-    /// columns externally. Not part of testAll — this is a manual
-    /// measurement tool, not a pass/fail regression test (timings are
-    /// inherently machine/load-dependent; only the log output matters).
-    private static func benchmarkParakeetCPUvsVulkan() throws {
-        guard ProcessInfo.processInfo.environment["SUPERDICTATE_TEST_VULKAN"] == "1",
-              let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
-              FileManager.default.fileExists(atPath: modelPath),
-              let corpusDir = ProcessInfo.processInfo.environment["SUPERDICTATE_BENCH_CORPUS_DIR"],
-              let deviceRaw = ProcessInfo.processInfo.environment["SUPERDICTATE_BENCH_DEVICE"],
-              let device = deviceRaw == "cpu" ? ParakeetDevice.cpu : (deviceRaw == "vulkan" ? ParakeetDevice.vulkan : nil)
-        else {
-            print("SKIP parakeet-vulkan-bench: requires SUPERDICTATE_TEST_VULKAN=1, SUPERDICTATE_PARAKEET_MODEL, SUPERDICTATE_BENCH_CORPUS_DIR, SUPERDICTATE_BENCH_DEVICE=cpu|vulkan")
-            return
-        }
-        if device == .vulkan {
-            guard parakeetVulkanAvailable() else {
-                print("SKIP parakeet-vulkan-bench: no Vulkan device enumerated")
-                return
-            }
-        }
-        let clipNames = ["01_ru_short_command.wav", "02_en_short_command.wav", "03_ru_numbers.wav", "11_ru_paragraph_30s.wav"]
-        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
-
-        let engine = try ParakeetEngine(modelPath: modelPath, device: device, threadCount: threadCount)
-        try runParakeetEngineSynchronously { try await engine.warmUp() }
-        let actualDevice = try runParakeetEngineSynchronously { await engine.backendDescription() }
-
-        print("PARAKEET BENCH [\(deviceRaw), actual=\(actualDevice)]: clip,audio_s,wall_ms,text")
-        for name in clipNames {
-            let path = (corpusDir as NSString).appendingPathComponent(name)
-            guard FileManager.default.fileExists(atPath: path) else {
-                print("PARAKEET BENCH: SKIP \(name) (not found under \(corpusDir))")
-                continue
-            }
-            let (samples, sampleRate) = try loadWavMonoFloat32(path: path)
-            let audioSeconds = Double(samples.count) / Double(sampleRate)
-
-            let started = ProcessInfo.processInfo.systemUptime
-            let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples, sampleRate: sampleRate) }
-            let wallMs = (ProcessInfo.processInfo.systemUptime - started) * 1000
-
-            print("PARAKEET BENCH: \(name),\(String(format: "%.2f", audioSeconds)),\(String(format: "%.1f", wallMs)),\"\(result.text)\"")
-        }
-
-        try runParakeetEngineSynchronously { await engine.shutdown() }
-    }
-
-    private static func testParakeetVulkanIntegration() throws {
-        guard ProcessInfo.processInfo.environment["SUPERDICTATE_TEST_VULKAN"] == "1" else {
-            print("SKIP parakeet-vulkan: SUPERDICTATE_TEST_VULKAN=1 not set")
-            return
-        }
-        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
-              FileManager.default.fileExists(atPath: modelPath) else {
-            print("SKIP parakeet-vulkan: SUPERDICTATE_PARAKEET_MODEL not set to an existing file")
-            return
-        }
-        guard parakeetVulkanAvailable() else {
-            print("SKIP parakeet-vulkan: no Vulkan device enumerated by ggml's backend registry on this machine")
-            return
-        }
-
-        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
-
-        // Forced-failure fallback check FIRST, before any real Vulkan
-        // backend has been constructed in this process: parakeet.cpp's
-        // compute backend (pk::global_backend()) is a process-global
-        // singleton, created lazily on first use and NOT reconstructed on
-        // a later request unless explicitly reset — so this ordering
-        // matters. Running the forced-failure attempt first guarantees the
-        // bogus device name is actually consulted when the singleton is
-        // first constructed, rather than a real backend from an earlier
-        // sub-test being silently reused (which would make this assertion
-        // pass for the wrong reason — the check never even running, not
-        // "ran and correctly detected no fallback").
-        // SD_PARAKEET_TEST_FORCE_DEVICE_NAME is a test-only bridge hook
-        // (see sd_parakeet_create) that requests a device name guaranteed
-        // not to exist, reproducing exactly the upstream silent-CPU-fallback
-        // behavior the Phase 5 pre-spike found (backend.cpp logs "not
-        // found; falling back to CPU" and continues successfully) —
-        // confirms the bridge's post-init check catches it rather than
-        // reporting Vulkan success. Restores the environment afterward so
-        // it doesn't leak into the real-device sub-test below.
-        setenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME", "Vulkan9-does-not-exist", 1)
-        var threwFellBackToCPU = false
-        do {
-            let bogus = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
-            try runParakeetEngineSynchronously { try await bogus.warmUp() }
-        } catch ParakeetEngineError.vulkanFellBackToCPU {
-            threwFellBackToCPU = true
-        }
-        unsetenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME")
-        try expect(
-            threwFellBackToCPU, equals: true,
-            "a bogus forced device name (upstream falls back to CPU silently) must surface as .vulkanFellBackToCPU, never a silent success"
-        )
-
-        // Real-device verification second: the forced-failure attempt above
-        // left parakeet.cpp's process-global backend torn down (the bridge's
-        // post-init check calls pk::shutdown_backend() on this exact
-        // failure path — see sd_parakeet_warm_up), so this constructs a
-        // genuinely fresh backend against the real device name.
-        let loadStarted = ProcessInfo.processInfo.systemUptime
-        let engine = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
-        let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
-
-        // warmUp() is what forces parakeet.cpp's process-global backend
-        // construction and performs the mandatory post-init device check
-        // (see ParakeetEngine.warmUp's doc comment) — a build/environment
-        // where Vulkan silently fell back to CPU must surface here as
-        // .vulkanFellBackToCPU, not a quiet pass.
-        try runParakeetEngineSynchronously { try await engine.warmUp() }
-        let actualDevice = try runParakeetEngineSynchronously { await engine.backendDescription() }
-        try expect(
-            actualDevice.lowercased().hasPrefix("vulkan"),
-            equals: true,
-            "a Vulkan-requested engine must report an actual selected device name starting with \"Vulkan\" after warm-up, got \"\(actualDevice)\""
-        )
-
-        let sampleCount = Int(SAMPLE_RATE * 0.5)
-        let samples = [Float](repeating: 0.0001, count: sampleCount)
-        let inferStarted = ProcessInfo.processInfo.systemUptime
-        let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
-        let inferSeconds = ProcessInfo.processInfo.systemUptime - inferStarted
-        let rtf = inferSeconds / max(0.001, Double(sampleCount) / SAMPLE_RATE)
-        print("PARAKEET VULKAN: load \(String(format: "%.2f", loadSeconds))s, device \(actualDevice), threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
-
-        try runParakeetEngineSynchronously { await engine.shutdown() }
-
-        // Stale-singleton regression (production signature: "Vulkan was
-        // requested but the actual selected backend is 'cpu'" right after
-        // re-enabling GPU in settings). The process-global pk::Backend
-        // singleton outlives context destruction and reads PARAKEET_DEVICE
-        // only at construction, so a CPU context created after a Vulkan one
-        // (exactly what the mid-session Vulkan-error fallback does) leaves a
-        // CPU singleton behind. A subsequent Vulkan context — with the fix,
-        // the bridge resets the stale singleton when the device request
-        // changes and no contexts are alive — must come up on a real
-        // "Vulkan…" device, not throw .vulkanFellBackToCPU.
-        let cpuEngine = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
-        try runParakeetEngineSynchronously { try await cpuEngine.warmUp() }
-        let cpuDevice = try runParakeetEngineSynchronously { await cpuEngine.backendDescription() }
-        try expect(
-            cpuDevice.lowercased().hasPrefix("cpu") || cpuDevice.lowercased().hasPrefix("vulkan"),
-            equals: true,
-            "CPU-requested engine should report a sane backend (got \"\(cpuDevice)\")"
-        )
-        try runParakeetEngineSynchronously { await cpuEngine.shutdown() }
-
-        let vulkanReload = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
-        try runParakeetEngineSynchronously { try await vulkanReload.warmUp() }
-        let reloadedDevice = try runParakeetEngineSynchronously { await vulkanReload.backendDescription() }
-        try expect(
-            reloadedDevice.lowercased().hasPrefix("vulkan"),
-            equals: true,
-            "re-enabling Vulkan after a CPU context in the same process must select a Vulkan device, not reuse the stale CPU singleton (got \"\(reloadedDevice)\")"
-        )
-        try runParakeetEngineSynchronously { await vulkanReload.shutdown() }
     }
 
     private static func testAudioRouteChangeDecision() throws {
@@ -8780,21 +8393,21 @@ enum ParakeySelfTest {
     }
 
     /// Gated real-hardware end-to-end check for the overlap path. Skipped
-    /// (not failed) unless `SUPERDICTATE_PARAKEET_MODEL` points at a real
-    /// GGUF and `SUPERDICTATE_OVERLAP_TEST_WAV` at a genuinely long
+    /// (not failed) unless `SUPERDICTATE_ONNX_MODEL_DIR` points at an
+    /// installed ONNX model and `SUPERDICTATE_OVERLAP_TEST_WAV` at a genuinely long
     /// (multi-segment) 16-bit PCM WAV. `SUPERDICTATE_SILERO_VAD_MODEL` is
     /// optional — without it the chain runs mel-energy/midpoint, which is
     /// itself a supported production configuration.
     ///
     /// Never touches `TranscriptionWorker` or any app state: it drives
-    /// `ParakeetEngine` directly and calls the SAME pure
+    /// `OnnxAsrEngine` directly and calls the SAME pure
     /// `assembleOverlapTranscript` production uses.
     private static func testOverlapTranscriptionRealModel() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_ONNX_MODEL_DIR"],
               FileManager.default.fileExists(atPath: modelPath),
               let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_OVERLAP_TEST_WAV"],
               FileManager.default.fileExists(atPath: wavPath) else {
-            print("SKIP overlap-transcription-real: needs SUPERDICTATE_PARAKEET_MODEL + SUPERDICTATE_OVERLAP_TEST_WAV")
+            print("SKIP overlap-transcription-real: needs SUPERDICTATE_ONNX_MODEL_DIR + SUPERDICTATE_OVERLAP_TEST_WAV")
             return
         }
 
@@ -8809,10 +8422,11 @@ enum ParakeySelfTest {
             throw SelfTestFailure.failed("overlap-transcription-real needs a multi-segment fixture; \(wavPath) produced \(segments.count)")
         }
 
-        let engine = try ParakeetEngine(modelPath: modelPath, device: .cpu,
-                                        threadCount: TranscriptionWorker.resolvedParakeetThreadCount())
+        let engine = try runParakeetEngineSynchronously {
+            try await OnnxAsrEngine.launch(modelDirectory: URL(fileURLWithPath: modelPath, isDirectory: true),
+                                           threadCount: TranscriptionWorker.resolvedASRThreadCount())
+        }
         defer { _ = try? runParakeetEngineSynchronously { await engine.shutdown() } }
-        try runParakeetEngineSynchronously { try await engine.warmUp() }
 
         // --- The overlap path ---
         let windows = OverlapWindower.addOverlap(to: segments, sampleRate: SAMPLE_RATE)
@@ -8985,9 +8599,8 @@ enum ParakeySelfTest {
 
         try expect(productionSpeechModelProfile(rawValue: "parakeet_ultra_onnx"), equals: .parakeetUltraOnnx,
                    "ONNX profile persists")
-        try expect(SpeechModelProfile.parakeetUltraOnnx.usesOnnxRuntime, equals: true, "ONNX profile uses ORT")
-        try expect(SpeechModelProfile.parakeetTDTv3.usesOnnxRuntime, equals: false, "GGUF Parakeet is not ORT")
-        try expect(SpeechModelProfile.productionDefault, equals: .parakeetTDTv3, "GGUF stays the default")
+        try expect(SpeechModelProfile.productionDefault, equals: .parakeetUltraOnnx, "ONNX is the only speech engine")
+        try expect(SpeechModelProfile.allCases, equals: [.parakeetUltraOnnx], "no GGUF or Whisper profile remains")
         let cacheDir = speechModelCacheDirectory(for: .parakeetUltraOnnx)
         try expect(cacheDir.path.hasSuffix("/SuperDictate/onnx/parakeet-ultra-int8"), equals: true, "ONNX cache location")
         try expect(isSafeSpeechModelCacheDirectory(cacheDir), equals: true, "ONNX cache is removable by cache reset")
@@ -9017,7 +8630,7 @@ enum ParakeySelfTest {
         let worker = TranscriptionWorker()
         defer { _ = try? runParakeetEngineSynchronously { await worker.unload() } }
         try runParakeetEngineSynchronously { try await worker.load(profile: .parakeetUltraOnnx) }
-        try expect(try runParakeetEngineSynchronously { await worker.runtimeStatus }, equals: .cpu, "ONNX runtime status")
+        try expect(try runParakeetEngineSynchronously { await worker.loadedProfile }, equals: .parakeetUltraOnnx, "ONNX profile loaded")
 
         let short = Array(samples.prefix(Int(SAMPLE_RATE * 8)))
         let now = ProcessInfo.processInfo.systemUptime

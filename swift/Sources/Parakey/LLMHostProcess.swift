@@ -69,9 +69,8 @@ actor LLMHostProcess {
     /// "Save & Restart"), giving every `LLMHostProcess` instance a fresh
     /// `ParakeyApp` lifetime.
     ///
-    /// `useGPU` comes from `Settings.llmUseGPU`, the LLM host's own toggle,
-    /// independent of the ASR backend's `Settings.useGPU` (Vulkan on the
-    /// same GPU parakeet_cpp already uses). `999` is an
+    /// `useGPU` comes from `Settings.llmUseGPU` — the app's only GPU path
+    /// (speech recognition is CPU only). `999` is an
     /// intentionally-large layer count: this model has far fewer layers,
     /// so it just means "offload everything" without needing to know the
     /// exact layer count up front (same convention llama.cpp's own CLI
