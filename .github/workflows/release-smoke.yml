@@ -10,19 +10,65 @@ permissions:
 
 jobs:
   install:
-    runs-on: macos-15
+    # The published SuperDictate.zip is an Intel (x86_64) build, and
+    # install.sh refuses a build whose architecture differs from the Mac's,
+    # so the smoke test needs an Intel runner.
+    runs-on: macos-15-intel
     steps:
+      - name: Read the release pinned on main
+        id: pin
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh \
+            -o "$RUNNER_TEMP/install.sh"
+          version="$(sed -n 's/^RELEASE_VERSION="\(.*\)"$/\1/p' "$RUNNER_TEMP/install.sh")"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "install.sh on main pins $version"
+      - name: The published tag matches the pinned version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PINNED: ${{ steps.pin.outputs.version }}
+        run: test "$TAG" = "v$PINNED"
       - name: Install from the public command
         run: |
           curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | \
             SUPERDICTATE_NO_OPEN=1 bash
       - name: Verify installed release
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
         run: |
-          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
-          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "com.local.superdictate"
-          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.37"
-          file /Applications/SuperDictate.app/Contents/MacOS/SuperDictate | grep -q arm64
-          codesign --verify --deep --strict /Applications/SuperDictate.app
-          codesign -d --entitlements :- /Applications/SuperDictate.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
+          app=/Applications/SuperDictate.app
+          test -x "$app/Contents/MacOS/SuperDictate"
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = "com.local.superdictate"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" = "$VERSION"
+          file "$app/Contents/MacOS/SuperDictate" | grep -q x86_64
+          codesign --verify --deep --strict "$app"
+          codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$RUNNER_TEMP/entitlements.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.microphone' "$RUNNER_TEMP/entitlements.plist")" = "true"
+      - name: Verify bundled helpers and runtime
+        run: |
+          app=/Applications/SuperDictate.app
+          test -x "$app/Contents/Helpers/SuperDictateOnnxHost"
+          test -x "$app/Contents/Helpers/SuperDictateLLMHost"
+          test -f "$app/Contents/Frameworks/libonnxruntime.1.23.2.dylib"
+          test -f "$app/Contents/Resources/onnx-asr/onnx-models.json"
+          # Speech recognition is ONNX only: no Whisper helper and no ASR
+          # Vulkan shaders may ship any more.
+          test ! -e "$app/Contents/Helpers/SuperDictateWhisperHost"
+          test ! -e "$app/Contents/Resources/vulkan-shaders"
+          test ! -e "$app/Contents/Resources/whisper-vulkan-shaders"
+          # Everything is self-contained: no Homebrew, MoltenVK or Vulkan
+          # loader dylib at runtime.
+          for binary in "$app/Contents/MacOS/SuperDictate" "$app/Contents/Helpers/"* \
+                        "$app/Contents/Frameworks/"*.dylib; do
+            if otool -L "$binary" | tail -n +2 | grep -Ei '/usr/local|/opt/homebrew|Cellar|MoltenVK|libvulkan'; then
+              echo "unexpected runtime dependency in $binary" >&2
+              exit 1
+            fi
+          done
+      - name: Uninstall
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/uninstall.sh | bash
+          test ! -e /Applications/SuperDictate.app
