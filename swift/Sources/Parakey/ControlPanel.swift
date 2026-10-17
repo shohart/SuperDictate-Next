@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
-// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (Parakeet via ONNX Runtime in the
+// SuperDictateOnnxHost helper, CPU only — the GPU is for the LLM host),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -28,7 +28,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -3413,8 +3412,8 @@ header.addArrangedSubview(panelLabel(
     private func speechModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Движок распознавания", "Speech engine"),
-            detail: t("Parakeet и Whisper работают через Vulkan (GGUF); при сбое GPU — CPU.",
-                       "Parakeet and Whisper both run via Vulkan (GGUF); CPU on GPU failure."),
+            detail: t("Parakeet через ONNX Runtime, только CPU. Видеокарта используется лишь для LLM-коррекции и рерайта.",
+                       "Parakeet via ONNX Runtime, CPU only. The GPU is used only for LLM correction and rewrite."),
             selectedValue: draft.speechModelProfile.rawValue,
             options: SpeechModelProfile.allCases.map { ($0.displayName, $0.rawValue) },
             action: #selector(selectSpeechModelProfile(_:)),

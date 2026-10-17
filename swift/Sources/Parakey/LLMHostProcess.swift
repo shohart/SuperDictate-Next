@@ -69,10 +69,8 @@ actor LLMHostProcess {
     /// "Save & Restart"), giving every `LLMHostProcess` instance a fresh
     /// `ParakeyApp` lifetime.
     ///
-    /// `useGPU` mirrors the SAME `Settings.useGPU` toggle Parakeet itself
-    /// reads (TranscriptionWorker.swift) -- one user-facing switch governs
-    /// the backend for both models, per the atom's hardware target
-    /// (Vulkan on the same GPU parakeet_cpp already uses). `999` is an
+    /// `useGPU` comes from `Settings.llmUseGPU` — the app's only GPU path
+    /// (speech recognition is CPU only). `999` is an
     /// intentionally-large layer count: this model has far fewer layers,
     /// so it just means "offload everything" without needing to know the
     /// exact layer count up front (same convention llama.cpp's own CLI
@@ -173,7 +171,7 @@ actor LLMHostProcess {
 
     // MARK: - Helper binary resolution
 
-    private static func resolvedHelperBinaryURL() -> URL? {
+    static func resolvedHelperBinaryURL() -> URL? {
         let name = "SuperDictateLLMHost"
         // Packaged .app: scripts/build-app.sh copies the helper into
         // Contents/Helpers/ (NOT Contents/MacOS/ — it is not the app's

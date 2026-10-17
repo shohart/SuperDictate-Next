@@ -6,7 +6,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -15,55 +14,11 @@ import QuartzCore
 import ServiceManagement
 import UniformTypeIdentifiers
 
-// MARK: - Parakeet model download + checksum verification
+// MARK: - Model download helpers
 
-/// Progress callback for `TranscriptionWorker.load`. Parakeet-neutral name
-/// per spec §4.2 (renamed from the pre-migration `WhisperDownloadProgressHandler`).
-/// `downloadParakeetModelIfNeeded()` takes no progress callback today (single
-/// `URLSession.shared.download` call, no incremental byte reporting), so this
-/// parameter currently goes unused inside it — kept so call sites retain a
-/// progress-handler parameter of some concrete type.
+/// Progress callback for `TranscriptionWorker.load` (fraction completed,
+/// 0...1), forwarded to `downloadOnnxModelIfNeeded`.
 typealias SpeechModelDownloadProgressHandler = @Sendable (Double) -> Void
-
-enum ParakeetModelDownloadError: LocalizedError {
-    case checksumMismatch(expected: String, actual: String)
-    case sizeMismatch(expected: Int64, actual: Int64)
-    case downloadFailed(underlying: Error)
-    case httpError(statusCode: Int)
-    case unsafeDestination(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .checksumMismatch(let expected, let actual):
-            return "Downloaded Parakeet model checksum mismatch: expected \(expected), got \(actual)"
-        case .sizeMismatch(let expected, let actual):
-            return "Downloaded Parakeet model size mismatch: expected \(expected) bytes, got \(actual) bytes"
-        case .downloadFailed(let underlying):
-            return "Failed to download Parakeet model: \(underlying.localizedDescription)"
-        case .httpError(let statusCode):
-            return "Parakeet model download failed with HTTP \(statusCode)"
-        case .unsafeDestination(let detail):
-            return "Refusing unsafe Parakeet model destination: \(detail)"
-        }
-    }
-}
-
-/// Pinned to a specific Hugging Face revision commit, never `main`/`latest` —
-/// see docs/parakeet-intel-backend.md §3. Values verified for real on the
-/// target Intel Mac in Phase 2 of the migration (see
-/// .superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-2-cpu-spike-report.md):
-/// exact byte size and SHA-256 both computed from the actual downloaded
-/// bytes, not copied from any Hugging Face API metadata response.
-let PARAKEET_MODEL_REPOSITORY = "mudler/parakeet-cpp-gguf"
-let PARAKEET_MODEL_REVISION = "bf0af9f425fa01809cadec671b3cb672709d13e9"
-let PARAKEET_MODEL_FILENAME = "tdt-0.6b-v3-q8_0.gguf"
-let PARAKEET_MODEL_ARCH = "parakeet (TDT, hybrid)"
-let PARAKEET_MODEL_QUANTIZATION = "q8_0"
-private let PARAKEET_MODEL_URL = URL(
-    string: "https://huggingface.co/\(PARAKEET_MODEL_REPOSITORY)/resolve/\(PARAKEET_MODEL_REVISION)/\(PARAKEET_MODEL_FILENAME)"
-)!
-let PARAKEET_MODEL_SHA256 = "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757"
-let PARAKEET_MODEL_SIZE_BYTES: Int64 = 940_663_680
 
 /// Computes the SHA-256 digest of a single known file, hex-encoded.
 ///
@@ -89,79 +44,6 @@ func isPlainRegularFile(_ path: String) -> Bool {
     var st = stat()
     guard lstat(path, &st) == 0 else { return false }
     return (st.st_mode & S_IFMT) == S_IFREG
-}
-
-@discardableResult
-func downloadParakeetModelIfNeeded() async throws -> URL {
-    let destination = speechModelCacheDirectory(for: .productionDefault)
-    if FileManager.default.fileExists(atPath: destination.path) {
-        guard isPlainRegularFile(destination.path) else {
-            throw ParakeetModelDownloadError.unsafeDestination(
-                "existing cache path is not a plain regular file: \(destination.path)"
-            )
-        }
-        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
-        let actualSize = (attributes?[.size] as? Int64) ?? -1
-        if actualSize == PARAKEET_MODEL_SIZE_BYTES {
-            let actualHash = try sha256Hex(ofFileAt: destination)
-            if actualHash == PARAKEET_MODEL_SHA256 {
-                return destination
-            }
-        }
-        log("ASR: cached Parakeet model failed size/checksum verification; redownloading")
-        try? FileManager.default.removeItem(at: destination)
-    }
-
-    try assertSufficientDiskSpaceForSpeechModelDownload(profile: .productionDefault)
-
-    let destinationDirectory = destination.deletingLastPathComponent()
-    try FileManager.default.createDirectory(
-        at: destinationDirectory,
-        withIntermediateDirectories: true
-    )
-
-    // Download to a temp file ON THE SAME VOLUME as the destination (spec
-    // §4.2 item 5) so the final move below is a same-volume atomic rename,
-    // never a cross-volume copy that could leave a partial file visible
-    // under a production-looking name. `URLSession.shared.download` itself
-    // already writes to a private temp location; the explicit move to a
-    // sibling temp file here guarantees the same-volume property regardless
-    // of where the system temp directory happens to be mounted.
-    let (systemTempURL, response) = try await URLSession.shared.download(from: PARAKEET_MODEL_URL)
-    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-        try? FileManager.default.removeItem(at: systemTempURL)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-        throw ParakeetModelDownloadError.httpError(statusCode: code)
-    }
-
-    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
-        ".\(PARAKEET_MODEL_FILENAME).download-\(UUID().uuidString)", isDirectory: false
-    )
-    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
-
-    func cleanupTemp() {
-        try? FileManager.default.removeItem(at: sameVolumeTempURL)
-    }
-
-    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
-    let actualSize = (attributes?[.size] as? Int64) ?? -1
-    guard actualSize == PARAKEET_MODEL_SIZE_BYTES else {
-        cleanupTemp()
-        throw ParakeetModelDownloadError.sizeMismatch(expected: PARAKEET_MODEL_SIZE_BYTES, actual: actualSize)
-    }
-
-    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
-    guard actualHash == PARAKEET_MODEL_SHA256 else {
-        cleanupTemp()
-        throw ParakeetModelDownloadError.checksumMismatch(expected: PARAKEET_MODEL_SHA256, actual: actualHash)
-    }
-
-    // Atomic rename into place (spec §4.2 items 6-8): the verified temp file
-    // is only ever exposed under the production filename once fully
-    // verified. `replacingItemAt` performs an atomic swap on the same
-    // volume.
-    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
-    return destination
 }
 
 // MARK: - GEC correction model download + checksum verification
@@ -280,7 +162,7 @@ let GEC_LORA_SCALE: Double = 4.0
 /// `~/Library/Application Support/SuperDictate/Models/LLM/` — a sibling of
 /// the Parakeet ASR model directory, not inside it: this holds
 /// text-generation GGUF weights for SuperDictateLLMHost, a completely
-/// different runtime (llama_cpp_host) from parakeet_cpp.
+/// different runtime (llama_cpp_host) from the speech engine.
 func llmModelCacheDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil)!
         .appendingPathComponent("Models", isDirectory: true)
@@ -803,155 +685,20 @@ func speechModelCacheBaseDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
 }
 
-/// The directory Parakeet model files live under (`~/Library/Application
-/// Support/SuperDictate/Models`), per spec §4.1 — a new location, NOT the
-/// legacy `~/Library/Application Support/Whisper` tree (left untouched, spec
-/// §4.4).
-func parakeetModelCacheDirectory() -> URL {
+/// `~/Library/Application Support/SuperDictate/Models`: the optional Silero
+/// VAD model lives here (see `sileroVadModelPath`). The retired GGUF
+/// Parakeet and Whisper models also lived here; their files are left in
+/// place, never loaded.
+func speechModelsDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil)!
         .appendingPathComponent("Models", isDirectory: true)
 }
 
-/// The single Parakeet model file Parakey downloads and loads.
-func parakeetModelPath() -> URL {
-    parakeetModelCacheDirectory().appendingPathComponent(PARAKEET_MODEL_FILENAME, isDirectory: false)
-}
-
-/// Directory holding the whisper.cpp GGUF model cache.
-func whisperCppModelCacheDirectory() -> URL {
-    parakeetModelCacheDirectory()
-        .appendingPathComponent("whisper-cpp", isDirectory: true)
-}
-
-/// The single whisper.cpp GGUF file Parakey downloads and loads. Shared by
-/// both Whisper profiles — they differ only in the language forced at
-/// runtime ("ru" vs "auto"), not in weights.
-func whisperGGUFModelPath() -> URL {
-    whisperCppModelCacheDirectory()
-        .appendingPathComponent(WHISPER_GGUF_FILENAME, isDirectory: false)
-}
-
 func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
     switch profile {
-    case .parakeetTDTv3:
-        return parakeetModelPath()
-    case .whisperRussian, .whisperRussianCodeSwitch:
-        return whisperCppModelCacheDirectory()
+    case .parakeetUltraOnnx:
+        return onnxModelCacheDirectory()
     }
-}
-
-// MARK: - whisper.cpp model download + checksum verification
-//
-// Same download/verify/atomic-rename shape as the Parakeet single-file
-// flow above. Pin rationale (2026-08-27): whisper.cpp's OWN official model
-// distribution (ggerganov/whisper.cpp) — the native ggml quantization of
-// openai/whisper-large-v3-turbo, guaranteed loadable by this repo's
-// vendored whisper.cpp pin. (A third-party "GGUF" repo was tried first and
-// rejected on real hardware: transcribe.cpp-fork files fail whisper.cpp's
-// loader with "bad magic".) SHA-256 is the git-LFS content oid from the
-// pinned revision, i.e. computed from the actual file bytes.
-
-let WHISPER_GGUF_REPOSITORY = "ggerganov/whisper.cpp"
-let WHISPER_GGUF_REVISION = "5359861c739e955e79d9a303bcbc70fb988958b1"
-let WHISPER_GGUF_FILENAME = "ggml-large-v3-turbo-q8_0.bin"
-private let WHISPER_GGUF_URL = URL(
-    string: "https://huggingface.co/\(WHISPER_GGUF_REPOSITORY)/resolve/\(WHISPER_GGUF_REVISION)/\(WHISPER_GGUF_FILENAME)"
-)!
-let WHISPER_GGUF_SHA256 = "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"
-let WHISPER_GGUF_SIZE_BYTES: Int64 = 874_188_075
-
-enum WhisperGGUFDownloadError: LocalizedError {
-    case checksumMismatch(expected: String, actual: String)
-    case sizeMismatch(expected: Int64, actual: Int64)
-    case httpError(statusCode: Int)
-
-    var errorDescription: String? {
-        switch self {
-        case .checksumMismatch(let expected, let actual):
-            return "Downloaded Whisper GGUF checksum mismatch: expected \(expected), got \(actual)"
-        case .sizeMismatch(let expected, let actual):
-            return "Downloaded Whisper GGUF size mismatch: expected \(expected) bytes, got \(actual) bytes"
-        case .httpError(let statusCode):
-            return "Whisper GGUF download failed with HTTP \(statusCode)"
-        }
-    }
-}
-
-@discardableResult
-func downloadWhisperGGUFModelIfNeeded() async throws -> URL {
-    let destination = whisperGGUFModelPath()
-    if isPlainRegularFile(destination.path) {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
-        let actualSize = (attributes?[.size] as? Int64) ?? -1
-        if actualSize == WHISPER_GGUF_SIZE_BYTES,
-           (try? sha256Hex(ofFileAt: destination)) == WHISPER_GGUF_SHA256 {
-            return destination
-        }
-        log("ASR: cached Whisper GGUF failed size/checksum verification; redownloading")
-        try? FileManager.default.removeItem(at: destination)
-    }
-
-    try assertSufficientDiskSpaceForSpeechModelDownload(profile: .whisperRussian)
-
-    let destinationDirectory = whisperCppModelCacheDirectory()
-    try FileManager.default.createDirectory(at: destinationDirectory,
-                                            withIntermediateDirectories: true)
-
-    // Same-volume temp + verified atomic rename, exactly as the Parakeet
-    // download above (spec §4.2 items 5-8).
-    let (systemTempURL, response) = try await URLSession.shared.download(from: WHISPER_GGUF_URL)
-    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-        try? FileManager.default.removeItem(at: systemTempURL)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-        throw WhisperGGUFDownloadError.httpError(statusCode: code)
-    }
-
-    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
-        ".\(WHISPER_GGUF_FILENAME).download-\(UUID().uuidString)", isDirectory: false
-    )
-    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
-
-    func cleanupTemp() {
-        try? FileManager.default.removeItem(at: sameVolumeTempURL)
-    }
-
-    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
-    let actualSize = (attributes?[.size] as? Int64) ?? -1
-    guard actualSize == WHISPER_GGUF_SIZE_BYTES else {
-        cleanupTemp()
-        throw WhisperGGUFDownloadError.sizeMismatch(expected: WHISPER_GGUF_SIZE_BYTES, actual: actualSize)
-    }
-
-    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
-    guard actualHash == WHISPER_GGUF_SHA256 else {
-        cleanupTemp()
-        throw WhisperGGUFDownloadError.checksumMismatch(expected: WHISPER_GGUF_SHA256, actual: actualHash)
-    }
-
-    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
-    return destination
-}
-
-/// Legacy Whisper model cache file this migration leaves behind (spec §4.4).
-/// Never used for Parakeet operation. Optionally removed by
-/// `removeLegacyWhisperModelFileIfPresent()` below, ONLY after Parakeet has
-/// itself successfully downloaded, verified, loaded, and warmed up — and
-/// ONLY this exact known file, never the whole `~/Library/Application
-/// Support/Whisper` directory.
-private func legacyWhisperModelFilePath() -> URL? {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-        .appendingPathComponent("Whisper", isDirectory: true)
-        .appendingPathComponent("Models", isDirectory: true)
-        .appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: false)
-}
-
-/// Best-effort cleanup of the exact legacy Whisper model file. Never throws;
-/// failure to remove it must not prevent application startup (spec §4.4).
-/// Call only after a successful Parakeet warm-up.
-func removeLegacyWhisperModelFileIfPresent() {
-    guard let legacyPath = legacyWhisperModelFilePath() else { return }
-    guard isPlainRegularFile(legacyPath.path) else { return }
-    try? FileManager.default.removeItem(at: legacyPath)
 }
 
 func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
@@ -966,7 +713,7 @@ func speechModelDiskSpaceFailureDetail(profile: SpeechModelProfile,
         return nil
     }
     return """
-    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for parakeet.cpp to prepare it.
+    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for the speech runtime to prepare it.
 
     Available: \(formattedByteCount(UInt64(availableBytes)))
     Needed: \(formattedByteCount(UInt64(requiredBytes)))
@@ -990,12 +737,9 @@ func availableImportantDiskSpaceBytes(containing url: URL) -> Int64? {
 
 func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
     switch profile {
-    case .parakeetTDTv3:
-        return FileManager.default.fileExists(atPath: speechModelCacheDirectory(for: profile).path)
-    case .whisperRussian, .whisperRussianCodeSwitch:
-        // The whisper.cpp cache is only ready when the GGUF file itself is
-        // present (the directory may survive a failed/interrupted download).
-        return isPlainRegularFile(whisperGGUFModelPath().path)
+    case .parakeetUltraOnnx:
+        // manifest.json is written last, only after every file verified.
+        return isPlainRegularFile(onnxModelManifestURL().path)
     }
 }
 

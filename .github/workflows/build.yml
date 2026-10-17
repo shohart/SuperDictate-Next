@@ -15,6 +15,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Validate scripts and plists
         run: ./scripts/check.sh
+      - name: ONNX ASR core (contract + IPC tests, no model)
+        run: |
+          ./scripts/fetch-onnxruntime.sh osx-arm64
+          cmake -S native/asr-runtime -B native/asr-runtime/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/asr-runtime/build -j
+          ctest --test-dir native/asr-runtime/build --output-on-failure
       - name: Swift self-tests
         run: swift run -c debug --package-path swift Parakey --self-test all
       - name: Build app bundle
@@ -22,6 +28,9 @@ jobs:
       - name: Verify app bundle
         run: |
           test -x "$RUNNER_TEMP/SuperDictate.app/Contents/MacOS/SuperDictate"
+          test -x "$RUNNER_TEMP/SuperDictate.app/Contents/Helpers/SuperDictateOnnxHost"
+          test -f "$RUNNER_TEMP/SuperDictate.app/Contents/Frameworks/libonnxruntime.1.23.2.dylib"
+          test -f "$RUNNER_TEMP/SuperDictate.app/Contents/Resources/onnx-asr/onnx-models.json"
           codesign --verify --deep --strict "$RUNNER_TEMP/SuperDictate.app"
       - name: Exercise installer and uninstaller
         run: |

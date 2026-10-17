@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "model_id": "parakeet-ultra-int8",
+      "display_name": "Parakeet Ultra (ONNX int8)",
+      "family": "nemo_tdt",
+      "source": "https://huggingface.co/mldecode/parakeet-ultra-onnx-int8",
+      "base_model": "moondream/parakeet-ultra (retrain of nvidia/parakeet-tdt-0.6b-v3)",
+      "revision": "3282a6e32885b431c1543d58c7710e6e3412eac0",
+      "license": "CC-BY-4.0",
+      "attribution": "NVIDIA (parakeet-tdt-0.6b-v3), Moondream (parakeet-ultra), mldecode (ONNX int8 export)",
+      "quantization": "int8",
+      "sample_rate": 16000,
+      "languages": ["en", "de", "fr", "es", "it", "pt", "ru", "uk", "hr", "sl", "lv", "lt", "et", "fi", "sv", "da", "nl", "pl", "cs", "sk", "hu", "ro", "bg", "el", "mt"],
+      "capabilities": {"timestamps": true, "punctuation": true, "capitalization": true, "streaming": false, "code_switch": false},
+      "providers": ["cpu"],
+      "files": {
+        "encoder": {
+          "path": "encoder.int8.onnx",
+          "url": "https://huggingface.co/mldecode/parakeet-ultra-onnx-int8/resolve/3282a6e32885b431c1543d58c7710e6e3412eac0/encoder.int8.onnx",
+          "size": 611879344,
+          "sha256": "181382735a719c75076d13658dc4418de4b566aef39935ca0f8f55da16928f4e"
+        },
+        "decoder": {
+          "path": "decoder.int8.onnx",
+          "url": "https://huggingface.co/mldecode/parakeet-ultra-onnx-int8/resolve/3282a6e32885b431c1543d58c7710e6e3412eac0/decoder.int8.onnx",
+          "size": 12257685,
+          "sha256": "0ba8ace2de04bb2d9a6b20ed2d67138c23df4a385f268438df0ff200502de77a"
+        },
+        "joiner": {
+          "path": "joiner.int8.onnx",
+          "url": "https://huggingface.co/mldecode/parakeet-ultra-onnx-int8/resolve/3282a6e32885b431c1543d58c7710e6e3412eac0/joiner.int8.onnx",
+          "size": 5281747,
+          "sha256": "20ae4350c2484ba607d94f08ef25ae3ead762d8aaf70753758ffcc504e255ebb"
+        },
+        "tokens": {
+          "path": "tokens.txt",
+          "url": "https://huggingface.co/mldecode/parakeet-ultra-onnx-int8/resolve/3282a6e32885b431c1543d58c7710e6e3412eac0/tokens.txt",
+          "size": 93939,
+          "sha256": "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
+        },
+        "preprocessor": {
+          "bundled": "nemo128.onnx",
+          "sha256": "5b4a84c52eeaa615dc46d781cc7e4598f9b432184831d57493c48adcd01371a9"
+        }
+      },
+      "params": {
+        "feature_dim": 128,
+        "subsampling_factor": 8,
+        "hop_seconds": 0.01,
+        "vocab_size": 8193,
+        "blank_id": 8192,
+        "durations": [0, 1, 2, 3, 4],
+        "max_symbols_per_frame": 10,
+        "pred_hidden": 640,
+        "pred_rnn_layers": 2
+      }
+    }
+  ]
+}

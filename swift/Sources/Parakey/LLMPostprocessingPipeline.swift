@@ -248,7 +248,7 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.useGPU,
+                                                  useGPU: settings.llmUseGPU,
                                                   chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
@@ -374,20 +374,20 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.useGPU,
+                                                  useGPU: settings.llmUseGPU,
                                                   chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
         }
         switch startResult {
         case .failure(let error):
-            log("LLM postprocessing: rewrite host failed to start (\(error)); passing text through unchanged")
+            log("LLM postprocessing: bundled rewrite host failed to start (\(error)); passing text through unchanged")
             return text
         case .success:
             break
         }
         guard let baseURL = await hostProcess.baseURL else {
-            log("LLM postprocessing: rewrite host has no reachable baseURL; passing text through unchanged")
+            log("LLM postprocessing: bundled rewrite host has no reachable baseURL; passing text through unchanged")
             return text
         }
         return await requestRewrite(baseURL: baseURL,

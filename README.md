@@ -28,10 +28,10 @@ exists:
    on a Xeon E5-2678 v3 with an AMD Radeon RX 6600) were untested territory
    there. Here they are a first-class target.
 2. **A different speech engine.** Upstream stayed on whisper.cpp. SuperDictate
-   Next migrated to [parakeet.cpp](https://github.com/mudler/parakeet.cpp)
-   running NVIDIA Parakeet TDT 0.6B v3 (GGUF, q8_0): fast on CPU, and with a
-   real Vulkan GPU path for AMD cards via MoltenVK, with automatic fallback
-   to CPU.
+   Next runs NVIDIA Parakeet (TDT 0.6B, multilingual) through ONNX Runtime,
+   on the CPU only — it beat both whisper.cpp and the earlier GGUF
+   parakeet.cpp build, GPU included, on accuracy and speed. The GPU (Vulkan
+   via MoltenVK) is used only for the local LLM correction/rewrite model.
 3. **Room to iterate on dictation ergonomics** for a Russian+English daily
    workflow: filler-word management, auto-stop on silence, a proper settings
    window, Russian number normalization, long-dictation segmentation.
@@ -40,8 +40,8 @@ exists:
 
 | Area | Upstream (at fork point) | SuperDictate Next |
 |---|---|---|
-| Speech engine | whisper.cpp, large-v3-turbo | parakeet.cpp + Parakeet TDT 0.6B v3 (GGUF q8_0) — whisper removed entirely |
-| GPU acceleration | none in this path | Vulkan backend (ggml + MoltenVK), verified on AMD RX 6600, honest CPU fallback |
+| Speech engine | whisper.cpp, large-v3-turbo | Parakeet Ultra 0.6B (ONNX int8) on ONNX Runtime, CPU only — whisper removed entirely |
+| GPU acceleration | none in this path | only for the local LLM correction/rewrite model (Vulkan, ggml + MoltenVK) |
 | Intel Macs | untested | first-class target, verified on real hardware |
 | Filler words | single on/off toggle | per-word checklist: 27 curated RU/EN presets in 4 columns + your own words/phrases |
 | Auto-stop | — | ends dictation after 1–10 s of silence (optional) |
@@ -69,8 +69,8 @@ curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/inst
    Press **right Command** again to insert the text.
 
 On first launch, SuperDictate downloads a local speech-recognition model once
-(Parakeet TDT 0.6B v3, via the parakeet.cpp engine). It takes about 940 MB on
-disk; plan for at least 1.5 GB of free space during installation. After the
+(Parakeet Ultra 0.6B, ONNX int8). It takes about 630 MB on disk; plan for at
+least 1.5 GB of free space during installation. After the
 download completes, dictation works fully offline.
 
 ## ⬆️ Updating
@@ -250,46 +250,30 @@ running from that build. For regular use, prefer the
 `SUPERDICTATE_BUILD_FROM_SOURCE=1` command, which installs the app into
 `/Applications`.
 
-## 🗣️ Speech recognition: Parakeet TDT 0.6B v3
+## 🗣️ Speech recognition: Parakeet on ONNX Runtime, CPU only
 
-SuperDictate Next uses NVIDIA Parakeet TDT 0.6B v3 (a multilingual model,
-GGUF format, q8_0 quantization) via the
-[parakeet.cpp](https://github.com/mudler/parakeet.cpp) engine. Whisper.cpp
-and large-v3-turbo are no longer used — this is the only production speech
-recognition model in the app.
+SuperDictate Next recognizes speech with Parakeet Ultra 0.6B (a fine-tune of
+NVIDIA Parakeet TDT 0.6B v3, ONNX int8) running in ONNX Runtime inside the
+`SuperDictateOnnxHost` helper process. Recognition runs **on the CPU only**;
+there is no GPU option for it. The GPU (Vulkan) is reserved for the local
+LLM that corrects and rewrites text — see the `LLM on GPU (Vulkan)` toggle.
 
-Recognition runs on CPU by default. The app's settings (under the behavior
-toggles) include a `Use GPU (Vulkan)` option — a real switch wired to
-parakeet.cpp's Vulkan backend (ggml v0.13.0 + MoltenVK), verified on real
-hardware (Intel Xeon E5-2678 v3 + AMD Radeon RX 6600, macOS 15.7.7). The menu
-item is disabled, with an explanatory tooltip, when no Vulkan device is
-detected by the ggml registry — the toggle never reports GPU use when CPU is
-actually running: if Vulkan was requested but the effective backend turned
-out to be CPU (including when parakeet.cpp itself silently falls back to CPU
-after failing to find the requested device — a confirmed upstream behavior),
-the app switches to CPU and remembers this for the current session only,
-never changing the saved setting automatically.
+Why CPU only: on the reference Intel Mac (Xeon E5-2696 v3, AMD Radeon Vega),
+through the app's real dictation path (pause segmentation, overlap windows,
+seam dedup), 8 clips from 1.7 s to 52 s, 8 threads, no LLM correction:
 
-Real measurements on the RX 6600 (the full path through the app — the
-Swift/actor/C bridge, not a standalone CLI tool; `-c release` build), 4 clips
-from the Phase 1 corpus:
-
-| Clip | Audio, s | CPU, ms | Vulkan, ms | Latency change |
+| Engine | Mean WER | Mean punctuation F1 | Mean RTF | Load, s |
 |---|---:|---:|---:|---:|
-| `01_ru_short_command` | 1.67 | 330.9 | 422.9 | −27.8% (slower) |
-| `02_en_short_command` | 1.69 | 279.0 | 179.8 | 35.5% |
-| `03_ru_numbers` | 7.87 | 1095.2 | 809.7 | 26.1% |
-| `11_ru_paragraph_30s` | 25.58 | 3550.0 | 1529.1 | 56.9% |
+| **ONNX, CPU** | **0.079** | **0.965** | **0.119** | 3.7 |
+| parakeet.cpp GGUF q8_0, CPU | 0.084 | 0.909 | 0.182 | 5.5 |
+| parakeet.cpp GGUF q8_0, Vulkan | 0.084 | 0.909 | 0.133 | 6.0 |
+| whisper.cpp large-v3-turbo q8_0, Vulkan | — | — | 0.63–6.4 | 17 |
 
-On very short clips (around 1.7 s), the Swift/actor/C bridge overhead and
-Vulkan pipeline warm-up outweigh the GPU gain — Vulkan is slower than CPU
-here. On clips of ~2 s and longer, the gain is real and grows with audio
-length (26–57% in this run), which falls within the spec's target range
-(≥15–20%) for those clips. Transcript text is identical between CPU and
-Vulkan across all 4 clips. Full details, including measurements from a
-separate CMake build (without the Swift/bridge overhead, where Vulkan speeds
-up even short clips by 30%+), are in
-`.superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-5-vulkan-integration-report.md`.
+whisper.cpp spends about 11 s on every call whatever the clip length (it
+pads input to a 30 s window), so a 2 s command took 11 s; its run was
+stopped there, so its accuracy is not scored. The GGUF and
+Whisper engines were removed on 2026-10-17; details in
+`docs/specs/cross-platform-onnx-asr-spec.md` §12.
 
 ## 🎚️ Pause detection (Silero VAD)
 
@@ -316,25 +300,26 @@ lipo -info ./dist/SuperDictate.app/Contents/MacOS/SuperDictate
 ```
 
 `otool -L` must not list `/usr/local`, `/opt/homebrew`, `Cellar`,
-`MoltenVK.dylib`, or `libvulkan` (MoltenVK and all of ggml/parakeet.cpp are
-statically linked into the executable — the only runtime dependencies are
-Apple's system frameworks).
+`MoltenVK.dylib`, or `libvulkan`: the app executable carries only a CPU ggml
+core for the Silero VAD and no GPU code at all, and the LLM helper
+(`Contents/Helpers/SuperDictateLLMHost`) links MoltenVK statically — the
+only runtime dependencies are Apple's system frameworks.
 
 GitHub Actions repeats the self-tests, builds the bundle, runs the installer
 on a clean macOS runner, and verifies uninstallation.
 
-### Parakeet CPU vs Vulkan benchmark
+### Speech recognition benchmark
 
-`scripts/benchmark-parakeet.sh` is a persistent, re-runnable script (not a
-one-off spike): it synthesizes a fixed corpus via `say`/`afconvert`
-(RU/EN/mixed, short commands, numbers, technical terms, ~30s and ~120s
-segments), runs each clip through the real `--benchmark-transcribe` entry
-point (a permanent entry point in `main.swift`, checked before
-`NSApplication` is created, so it never falls through to a normal app
-launch) on both CPU and Vulkan, and prints a table with cold load, warm-up,
-first transcription, warm median/p95 latency, RTF, peak RSS, and the
-effectively selected device. Results from a real run are in
-`.superpowers/sdd/2026-07-28-parakeet-cpp-migration/FINAL-IMPLEMENTATION-REPORT.md`.
+`scripts/benchmark-asr.sh` is a persistent, re-runnable script: it
+synthesizes a fixed corpus via `say`/`afconvert` (RU/EN/mixed, short
+commands, numbers, technical terms, ~30 s and ~120 s segments), runs each
+clip through the real `--benchmark-transcribe onnx cpu <threads>` entry
+point (checked before `NSApplication` is created, so it never falls through
+to a normal app launch) and the app's own segmented dictation path, and
+writes a report with WER, CER, punctuation F1, cold load, warm-up, first
+transcription, warm median/p95 latency, RTF and peak RSS. It needs a
+packaged bundle (`scripts/build-test-app.sh`), because the ONNX helper lives
+in `Contents/Helpers`.
 
 ## ⚠️ Limitations
 
@@ -361,20 +346,19 @@ effectively selected device. Results from a real run are in
 - Protected password fields and apps that hide Accessibility data may not
   expose caret coordinates. This affects the animation's position but doesn't
   always prevent text insertion.
-- Resource footprint on the current build: about 940 MB on disk for the model
-  (`parakeet-tdt-0.6b-v3-q8_0.gguf`, parakeet.cpp engine; CPU by default,
-  Vulkan optional). Peak resident memory is about 940 MB–1.2 GB depending on
-  recording length (measured on real Intel hardware, see the migration
-  report). Older numbers for previous engines (whisper.cpp, FluidAudio/
-  CoreML) don't apply to parakeet.cpp.
+- Resource footprint on the current build: about 630 MB on disk for the
+  speech model (ONNX int8, CPU). The ONNX helper process peaks at about
+  2.2 GB resident (mapped model pages included); the app process itself
+  stays around 40–60 MB.
 
 ## 🔒 Privacy & data
 
 - History and settings: `~/Library/Application Support/SuperDictate`.
-- The parakeet.cpp model: `~/Library/Application Support/SuperDictate/Models`.
-  (An old whisper.cpp cache, if left over from a previous version, lives
-  separately in `~/Library/Application Support/Whisper/Models` and is not
-  used by the current version.)
+- The speech model: `~/Library/Application Support/SuperDictate/onnx`.
+  (GGUF Parakeet and whisper.cpp files left over from earlier versions, in
+  `~/Library/Application Support/SuperDictate/Models` and
+  `~/Library/Application Support/Whisper/Models`, are no longer used and can
+  be deleted.)
 - LaunchAgent: `~/Library/LaunchAgents/com.local.superdictate.agent.plist`.
 - Logs: `~/Library/Logs/SuperDictate*`.
 - No analytics, accounts, or telemetry.

@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
-// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (Parakeet via ONNX Runtime in the
+// SuperDictateOnnxHost helper, CPU only — the GPU is for the LLM host),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -28,7 +28,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -683,11 +682,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     // reentrancy guard) — belt-and-suspenders, not strictly
                     // required, cheap relative to model load.
                     let warmUpTiming = try await asr.warmUp()
-                    log("ASR: parakeet.cpp warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
+                    log("ASR: \(settings.speechModelProfile.displayName) warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
                 } catch {
                     // Model loading succeeded, so a failed best-effort warm-up
                     // must not make the dictation service unavailable.
-                    log("ASR: parakeet.cpp warm-up skipped: \(error.localizedDescription)")
+                    log("ASR: \(settings.speechModelProfile.displayName) warm-up skipped: \(error.localizedDescription)")
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
 
@@ -4252,7 +4251,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Hotkey: \(hotkey.hotkey.name)",
                 "Trigger mode: \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue)",
                 "Speech model: \(speechModelProfile.displayName)",
-                "ASR backend: \(lastKnownParakeetRuntimeStatusDescription(language: .english)) (GPU setting: \(settings.useGPU))",
+                "ASR backend: \(asrBackendDescription(language: .english))",
+                "LLM on GPU setting: \(settings.llmUseGPU)",
                 "Language: \(languageSettingText)",
                 "Paste behavior: \(PASTE_SUFFIX_DISPLAY[settings.pasteSuffix] ?? settings.pasteSuffix.rawValue)",
                 "Remove filler words: \(settings.removeFillerWords)",
@@ -4729,38 +4729,36 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(dock)
 
         let gpuLanguage = settings.interfaceLanguage
-        let vulkanAvailable = parakeetVulkanAvailable()
-        let useGPU = NSMenuItem(
-            title: localizedText("Использовать GPU (Vulkan)", "Use GPU (Vulkan)", language: gpuLanguage),
-            action: #selector(toggleUseGPU(_:)),
+        let llmGPUDevices = LLMGPUProbe.shared.devices()
+        let vulkanAvailable = !llmGPUDevices.isEmpty
+        let deviceDescription = llmGPUDevices.joined(separator: ", ")
+        let llmGPU = NSMenuItem(
+            title: localizedText("LLM на GPU (Vulkan)", "LLM on GPU (Vulkan)", language: gpuLanguage),
+            action: #selector(toggleLLMUseGPU(_:)),
             keyEquivalent: ""
         )
-        useGPU.target = self
-        useGPU.state = settings.useGPU ? .on : .off
+        llmGPU.target = self
+        llmGPU.state = settings.llmUseGPU ? .on : .off
         if vulkanAvailable {
-            useGPU.isEnabled = true
-            let deviceDescription = parakeetVulkanDeviceDescription()
-            useGPU.toolTip = localizedText(
-                "Запускает Vulkan-бэкенд вместо CPU для Parakeet и для модели коррекции текста (обнаружено: \(deviceDescription)). Перезагружает обе модели.",
-                "Runs the Vulkan backend instead of CPU for Parakeet and the text-correction model (detected: \(deviceDescription)). Reloads both models.",
+            llmGPU.isEnabled = true
+            llmGPU.toolTip = localizedText(
+                "Запускает Vulkan-бэкенд для модели коррекции/рерайтинга текста (обнаружено: \(deviceDescription)). Распознавание речи всегда идёт на CPU. Перезагружает LLM-модель.",
+                "Runs the Vulkan backend for the text-correction/rewrite model (detected: \(deviceDescription)). Speech recognition always runs on the CPU. Reloads the LLM model.",
                 language: gpuLanguage
             )
         } else {
-            // spec §11.2: disable with a clear explanation when no Vulkan
-            // device is enumerated, rather than letting the user enable a
-            // setting that can never take effect on this machine.
-            useGPU.isEnabled = false
-            useGPU.state = .off
-            useGPU.toolTip = localizedText(
-                "Vulkan GPU не обнаружен. Parakeet будет использовать CPU.",
-                "Vulkan GPU was not detected. Parakeet will use CPU.",
+            llmGPU.isEnabled = false
+            llmGPU.state = .off
+            llmGPU.toolTip = localizedText(
+                "Vulkan GPU не обнаружен. Модель коррекции/рерайтинга будет использовать CPU.",
+                "Vulkan GPU was not detected. The correction/rewrite model will use CPU.",
                 language: gpuLanguage
             )
         }
-        sub.addItem(useGPU)
+        sub.addItem(llmGPU)
 
         let asrStatus = NSMenuItem(
-            title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + lastKnownParakeetRuntimeStatusDescription(language: gpuLanguage),
+            title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + asrBackendDescription(language: gpuLanguage),
             action: nil,
             keyEquivalent: ""
         )
@@ -6236,25 +6234,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshActivationPolicy()
     }
 
-    @objc private func toggleUseGPU(_ sender: NSMenuItem) {
-        settings.useGPU.toggle()
-        let profile = settings.speechModelProfile
+    @objc private func toggleLLMUseGPU(_ sender: NSMenuItem) {
+        settings.llmUseGPU.toggle()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            do {
-                try await self.asr.load(profile: profile)
-                log("ASR: reloaded after GPU setting change (useGPU=\(self.settings.useGPU))")
-            } catch {
-                log("ASR: failed to reload after GPU setting change: \(error)")
-            }
-            // The bundled correction-model host, if already running, was
-            // launched with the OLD --gpu-layers value baked into its
-            // process arguments (LLMHostProcess has no live-reconfigure
-            // path, unlike ParakeetEngine). Stop it so the next correction
-            // request lazily respawns it with the new useGPU value --
-            // mirrors the ASR reload immediately above, one user-facing
-            // toggle for both models.
+            // The bundled LLM host, if already running, was launched with the
+            // OLD --gpu-layers value baked into its process arguments
+            // (LLMHostProcess has no live-reconfigure path). Stop it so the
+            // next correction/rewrite request lazily respawns it with the new
+            // llmUseGPU value. ASR is untouched — it has its own toggle.
             await self.llmPostprocessing.stop()
+            log("LLM: stopped bundled host after LLM-GPU setting change (llmUseGPU=\(self.settings.llmUseGPU))")
             self.rebuildMenu()
         }
         rebuildMenu()

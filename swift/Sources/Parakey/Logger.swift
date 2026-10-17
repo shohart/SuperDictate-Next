@@ -7,7 +7,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -285,7 +284,7 @@ enum SuperDictateAgentService {
                                                 attributes: [.posixPermissions: 0o700])
 
         let logPath = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/SuperDictate-agent.launchd.log").path
+            .appendingPathComponent("Logs/\(AGENT_LAUNCHD_LOG_NAME)").path
         let plist: [String: Any] = [
             "Label": AGENT_LABEL,
             "ProgramArguments": [agentExecutablePath(), AGENT_ARGUMENT],

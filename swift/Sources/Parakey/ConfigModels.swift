@@ -6,7 +6,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -346,15 +345,16 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
     .serbian: "Serbian",
 ]
 
-// ASR engine/model selection. Whisper profiles run whisper.cpp (GGUF) in
-// the SuperDictateWhisperHost helper process — Vulkan on the RX 6600 with
-// CPU fallback; Parakeet remains its own native Vulkan path.
+// ASR engine/model selection. Speech recognition runs only on the CPU, via
+// ONNX Runtime in the SuperDictateOnnxHost helper
+// (docs/specs/cross-platform-onnx-asr-spec.md). The GPU is reserved for the
+// bundled LLM host (correction, rewrite). Saved selections of the retired
+// GGUF Parakeet and Whisper profiles fall back to `productionDefault`
+// through `productionSpeechModelProfile(rawValue:)`.
 enum SpeechModelProfile: String, CaseIterable {
-    case parakeetTDTv3 = "parakeet_tdt_v3"
-    case whisperRussian = "whisper_large_v3_turbo_russian"
-    case whisperRussianCodeSwitch = "whisper_large_v3_turbo_russian_codeswitch"
+    case parakeetUltraOnnx = "parakeet_ultra_onnx"
 
-    static let productionDefault: SpeechModelProfile = .parakeetTDTv3
+    static let productionDefault: SpeechModelProfile = .parakeetUltraOnnx
 
     var isProductionSupported: Bool {
         true
@@ -366,9 +366,7 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .parakeetTDTv3: return "Parakeet TDT 0.6B v3"
-        case .whisperRussian: return "Whisper Large v3 Turbo Russian"
-        case .whisperRussianCodeSwitch: return "Whisper Large v3 Turbo Russian Code-Switch"
+        case .parakeetUltraOnnx: return "Parakeet Ultra 0.6B (ONNX)"
         }
     }
 
@@ -378,9 +376,7 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var aboutModelText: String {
         switch self {
-        case .parakeetTDTv3: return "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
-        case .whisperRussian: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: русский"
-        case .whisperRussianCodeSwitch: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: авто (RU/EN)"
+        case .parakeetUltraOnnx: return "ONNX Runtime · Parakeet Ultra 0.6B (TDT) · ONNX int8 · CPU · CC-BY-4.0: NVIDIA (parakeet-tdt-0.6b-v3), Moondream (parakeet-ultra), mldecode (ONNX int8)"
         }
     }
 
@@ -393,11 +389,15 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var estimatedDownloadBytes: Int64 {
-        self == .parakeetTDTv3 ? PARAKEET_MODEL_SIZE_BYTES : WHISPER_GGUF_SIZE_BYTES
+        switch self {
+        case .parakeetUltraOnnx: return PARAKEET_ULTRA_ONNX_SIZE_BYTES
+        }
     }
 
     var downloadSizeText: String {
-        self == .parakeetTDTv3 ? "about 940 MB" : "about 874 MB"
+        switch self {
+        case .parakeetUltraOnnx: return "about 630 MB"
+        }
     }
 }
 

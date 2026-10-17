@@ -24,42 +24,22 @@ let package = Package(
         // comment below for why (two independently vendored ggml copies
         // cannot share one linked binary).
         .executable(name: "SuperDictateLLMHost", targets: ["SuperDictateLLMHost"]),
-        // SuperDictateWhisperHost: whisper.cpp ASR helper process (Vulkan).
-        // Separate executable for the same duplicate-ggml-symbols reason as
-        // SuperDictateLLMHost above.
-        .executable(name: "SuperDictateWhisperHost", targets: ["SuperDictateWhisperHost"]),
     ],
     dependencies: [],
     targets: [
+        // silero_vad — the Silero VAD (upstream-vad/, extracted from
+        // whisper.cpp by scripts/vendor-silero-vad.sh) over a CPU-only ggml
+        // v0.13.0 core (upstream/, scripts/vendor-ggml-core.sh). It only
+        // finds pauses for long-dictation segmentation; speech recognition
+        // runs in the SuperDictateOnnxHost helper and the GPU belongs to
+        // SuperDictateLLMHost, so this target has no Vulkan and links no
+        // MoltenVK. Non-x86 ggml-cpu arch variants are stripped at vendor
+        // time. amx/ is compiled (ggml-cpu.cpp calls
+        // ggml_backend_amx_buffer_type()/ggml_cpu_has_amx_int8()
+        // unconditionally); its AMX code paths stay inert without
+        // __AMX_INT8__/__AVX512VNNI__, which this target does not define.
         .target(
-            name: "parakeet_cpp",
-            // Non-x86 arch variants were already stripped by
-            // scripts/vendor-parakeet-cpp.sh at vendor time (see that
-            // script's `rm -rf` block), so nothing needs excluding there.
-            // amx/ is kept in-tree and compiled (ggml-cpu.cpp calls
-            // ggml_backend_amx_buffer_type()/ggml_cpu_has_amx_int8()
-            // unconditionally — same as this fork's already-proven
-            // whisper_cpp target, which also compiled it in unguarded);
-            // its actual AMX codegen paths stay inert without
-            // __AMX_INT8__/__AVX512VNNI__, which this target does not
-            // define.
-            //
-            // upstream/ggml-vulkan/vulkan-shaders/ IS excluded: it holds
-            // loose pre-compiled `.spv` binaries (not source), loaded at
-            // runtime by explicit file path (see
-            // scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.cpp)
-            // — never through SwiftPM's `resources:` mechanism, which
-            // bundles a `<Package>_<Target>.bundle` directory that
-            // `codesign --deep` won't accept as a signable component
-            // (same rationale as the Parakey executable target's own
-            // `resources:` comment below). scripts/build-app.sh copies this
-            // directory into Contents/Resources/vulkan-shaders/ directly
-            // for the shipped .app; dev-run.sh does the equivalent for
-            // `swift run` builds that need it configured via
-            // ggml_vk_shaders_set_directory().
-            exclude: [
-                "upstream/ggml-vulkan/vulkan-shaders",
-            ],
+            name: "silero_vad",
             cSettings: [
                 .define("GGML_USE_ACCELERATE"),
                 .define("GGML_USE_CPU"),
@@ -68,54 +48,18 @@ let package = Package(
                 .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
-                // Vulkan backend (Phase 5 of the parakeet.cpp migration
-                // plan). Mirrors the deleted whisper_cpp target's own
-                // GGML_USE_VULKAN addition exactly (see `git show
-                // 1bb8ae4^:swift/Package.swift`) — same define, gated the
-                // same way in ggml-backend-reg.cpp
-                // (upstream/ggml-backend-reg.cpp:45,125-128) to register
-                // ggml_backend_vk_reg() into the device registry that
-                // pk::Backend / sd_parakeet_vulkan_available() both walk.
-                .define("GGML_USE_VULKAN"),
                 .define("GGML_VERSION", to: "\"0.13.0\""),
                 .define("GGML_COMMIT", to: "\"e705c5fed490514458bdd2eaddc43bd098fcce9b\""),
-                .define("PARAKEET_VERSION", to: "\"0.0.1\""),
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/include"),
                 .headerSearchPath("upstream/ggml-cpu"),
-                // ggml-vulkan-shaders-runtime.h is included from
-                // include/parakeet_cpp_module.h (the umbrella header) so
-                // Swift can call ggml_vk_shaders_set_directory(); it lives
-                // under upstream/ggml-vulkan/, a directory this search path
-                // makes reachable via quote-include from anywhere in the
-                // target (ggml-vulkan.cpp's own #include
-                // "ggml-vulkan-shaders.hpp" resolves via the
-                // same-directory-as-includer tier and doesn't need this,
-                // but include/parakeet_cpp_module.h does).
-                .headerSearchPath("upstream/ggml-vulkan"),
-                // Silero VAD (scripts/vendor-silero-vad.sh), a SEPARATE,
-                // additive vendor tree from upstream/ above (see
-                // upstream-vad/PROVENANCE.md) -- not yet wired into the
-                // umbrella header/bridge (that's a later task), but its
-                // translation unit (upstream-vad/whisper_vad.cpp) is
-                // auto-discovered and compiled as part of this same target,
-                // so its own quote-includes ("include/whisper_vad.h",
-                // "whisper_vad_arch.h") need to resolve, plus the ggml
-                // headers it depends on (already reachable via the
-                // "upstream/include" search path above).
                 .headerSearchPath("upstream-vad"),
                 .headerSearchPath("upstream-vad/include"),
-                // Same Intel-ISA flags this fork already carries for
-                // whisper_cpp's ggml build (see git history / the removed
-                // whisper_cpp target this replaces) — proven on the real
-                // target machine (Intel Xeon E5-2678 v3). The vulkan-headers
-                // -I flag is the same Homebrew `opt/` symlink path (not a
-                // versioned Cellar path) the deleted whisper_cpp target used,
-                // for brew-upgrade resilience.
+                // Intel ISA flags proven on the target machine (Xeon
+                // E5-2678 v3 / E5-2696 v3).
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
                     "-Wno-ambiguous-macro",
-                    "-I/usr/local/opt/vulkan-headers/include",
                 ]),
             ],
             cxxSettings: [
@@ -126,167 +70,27 @@ let package = Package(
                 .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
-                .define("GGML_USE_VULKAN"),
                 .define("GGML_VERSION", to: "\"0.13.0\""),
                 .define("GGML_COMMIT", to: "\"e705c5fed490514458bdd2eaddc43bd098fcce9b\""),
-                .define("PARAKEET_VERSION", to: "\"0.0.1\""),
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/include"),
                 .headerSearchPath("upstream/ggml-cpu"),
-                // ggml-vulkan-shaders-runtime.h is included from
-                // include/parakeet_cpp_module.h (the umbrella header) so
-                // Swift can call ggml_vk_shaders_set_directory(); it lives
-                // under upstream/ggml-vulkan/, a directory this search path
-                // makes reachable via quote-include from anywhere in the
-                // target (ggml-vulkan.cpp's own #include
-                // "ggml-vulkan-shaders.hpp" resolves via the
-                // same-directory-as-includer tier and doesn't need this,
-                // but include/parakeet_cpp_module.h does).
-                .headerSearchPath("upstream/ggml-vulkan"),
-                // Silero VAD (scripts/vendor-silero-vad.sh) -- see the
-                // matching comment in cSettings above.
                 .headerSearchPath("upstream-vad"),
                 .headerSearchPath("upstream-vad/include"),
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
                     "-Wno-ambiguous-macro",
-                    "-I/usr/local/opt/vulkan-headers/include",
                 ]),
             ],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("Foundation"),
-                // Vulkan/MoltenVK, statically linked — same frameworks +
-                // static-archive approach proven for whisper_cpp (see `git
-                // show 1bb8ae4^:swift/Package.swift`). Linking MoltenVK's
-                // static archive directly (not -lMoltenVK/-lvulkan) means
-                // MoltenVK's own Vulkan-ABI entry points (vkCreateInstance
-                // etc.) resolve straight into this binary — no Khronos
-                // loader, no ICD manifest lookup, no runtime Homebrew
-                // dependency. `otool -L` on the final app binary must show
-                // none of /usr/local/, /opt/homebrew/, Cellar,
-                // libMoltenVK.dylib, libvulkan.dylib — see the Phase 5
-                // integration report for the verification run.
-                .linkedFramework("IOSurface"),
-                .linkedFramework("IOKit"),
-                .linkedFramework("AppKit"),
-                .linkedFramework("QuartzCore"),
-                .linkedFramework("CoreFoundation"),
-                .linkedFramework("CoreGraphics"),
-                .linkedLibrary("objc"),
                 .linkedLibrary("c++"),
-                .unsafeFlags([
-                    "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
-                ]),
             ]
-        ),
-        // whisper_cpp — the vendored whisper.cpp tree restored from commit
-        // a7ceb9e (deleted in 1bb8ae4 during the Parakeet migration; brought
-        // back 2026-08-27 by user decision to run Whisper via whisper.cpp +
-        // GGUF + Vulkan on the RX 6600 instead of CTranslate2 CPU). Target
-        // settings transcribed verbatim from `git show a7ceb9e:swift/Package.swift`
-        // — that exact configuration was proven on this machine (Vulkan via
-        // statically-linked MoltenVK, pre-compiled SPIR-V corpus loaded at
-        // runtime). Consumed ONLY by the SuperDictateWhisperHost executable
-        // below, never by Parakey itself: this is a second independently
-        // vendored ggml copy alongside parakeet_cpp, and two ggml copies in
-        // one linked binary is a guaranteed duplicate-symbol error (same
-        // rationale as the llama_cpp host).
-        .target(
-            name: "whisper_cpp",
-            exclude: [
-                "ggml-cpu/arch/arm",
-                "ggml-cpu/arch/riscv",
-                "ggml-cpu/arch/powerpc",
-                "ggml-cpu/arch/s390",
-                "ggml-cpu/arch/wasm",
-                "ggml-cpu/arch/loongarch",
-                "ggml-cpu/spacemit",
-                // Metal backend excluded — Vulkan is this fork's GPU backend.
-                "ggml-metal-common.cpp",
-                "ggml-metal-context.m",
-                "ggml-metal.cpp",
-                "ggml-metal-device.cpp",
-                "ggml-metal-device.m",
-                "ggml-metal-embed.cpp",
-                "ggml-metal-ops.cpp",
-                // Raw .spv binaries (1785 files) pre-compiled by
-                // scripts/vendor-whisper-cpp.sh; loaded by explicit file
-                // path at runtime, never compiled in / never a SwiftPM
-                // resource. Shipped as Contents/Resources/whisper-vulkan-shaders/
-                // (its OWN directory, distinct from parakeet's
-                // vulkan-shaders/ corpus — different ggml pins).
-                "vulkan-shaders",
-            ],
-            cSettings: [
-                .define("GGML_USE_ACCELERATE"),
-                .define("GGML_USE_CPU"),
-                .define("GGML_USE_BLAS"),
-                .define("GGML_BLAS_USE_ACCELERATE"),
-                .define("ACCELERATE_NEW_LAPACK"),
-                .define("ACCELERATE_LAPACK_ILP64"),
-                .define("GGML_USE_VULKAN"),
-                .define("GGML_VERSION", to: "\"080bbbe8\""),
-                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
-                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
-                .headerSearchPath("."),
-                .headerSearchPath("ggml-cpu"),
-                .unsafeFlags([
-                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
-                    "-I/usr/local/opt/vulkan-headers/include",
-                ]),
-            ],
-            cxxSettings: [
-                .define("GGML_USE_ACCELERATE"),
-                .define("GGML_USE_CPU"),
-                .define("GGML_USE_BLAS"),
-                .define("GGML_BLAS_USE_ACCELERATE"),
-                .define("ACCELERATE_NEW_LAPACK"),
-                .define("ACCELERATE_LAPACK_ILP64"),
-                .define("GGML_USE_VULKAN"),
-                .define("GGML_VERSION", to: "\"080bbbe8\""),
-                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
-                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
-                .headerSearchPath("."),
-                .headerSearchPath("ggml-cpu"),
-                .unsafeFlags([
-                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
-                    "-I/usr/local/opt/vulkan-headers/include",
-                ]),
-            ],
-            linkerSettings: [
-                .linkedFramework("Accelerate"),
-                .linkedFramework("Foundation"),
-                .linkedFramework("IOSurface"),
-                .linkedFramework("IOKit"),
-                .linkedFramework("AppKit"),
-                .linkedFramework("QuartzCore"),
-                .linkedFramework("CoreFoundation"),
-                .linkedFramework("CoreGraphics"),
-                .linkedFramework("Metal"),
-                .linkedLibrary("objc"),
-                .linkedLibrary("c++"),
-                .unsafeFlags([
-                    "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
-                ]),
-            ]
-        ),
-        // SuperDictateWhisperHost — persistent whisper.cpp worker speaking
-        // the same stdio PCM protocol the Python faster-whisper host used
-        // (LE uint32 sample count + raw float32 PCM in, LE uint32 byte
-        // length + UTF-8 text out). Out-of-process on purpose: isolates the
-        // app from ggml/whisper crashes AND sidesteps the duplicate-ggml
-        // symbol clash with parakeet_cpp. Vulkan shaders are located via
-        // the SUPERDICTATE_VULKAN_SHADER_DIR env var (tier 1 of
-        // ggml-vulkan-shaders-runtime's 3-tier fallback).
-        .executableTarget(
-            name: "SuperDictateWhisperHost",
-            dependencies: ["whisper_cpp"],
-            path: "Sources/whisper_cpp_host"
         ),
         .executableTarget(
             name: "Parakey",
-            dependencies: ["parakeet_cpp"],
+            dependencies: ["silero_vad"],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]
@@ -306,7 +110,7 @@ let package = Package(
         // upstream/PROVENANCE.md for the exact pin). Deliberately its OWN
         // executableTarget/product, NEVER a dependency of "Parakey" above:
         // this target vendors its own independent copy of ggml (a
-        // different pin than parakeet_cpp/upstream's own, separately
+        // different pin than silero_vad/upstream's own, separately
         // vendored ggml v0.13.0), and SwiftPM statically links a target's
         // object files straight into whichever executable depends on it —
         // two independently vendored copies of ggml's flat C symbols
@@ -322,8 +126,7 @@ let package = Package(
         .executableTarget(
             name: "SuperDictateLLMHost",
             path: "Sources/llama_cpp_host",
-            // Same rationale as parakeet_cpp's own `exclude` for its
-            // ggml-vulkan/vulkan-shaders/ directory: this holds loose
+            // upstream/ggml-vulkan/vulkan-shaders/ holds loose
             // pre-compiled `.spv` binaries (not source), loaded at runtime
             // by explicit file path (ggml-vulkan-shaders-runtime.cpp), not
             // compiled in -- and never through SwiftPM `resources:`.
@@ -340,13 +143,12 @@ let package = Package(
                 .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
-                // Vulkan backend, same GPU the main Parakeet model uses
-                // (parakeet_cpp target above) -- one user-facing "Use GPU"
-                // switch (Settings.useGPU) governs both models' backend at
-                // runtime via `--gpu-layers` (see
-                // LLMHostProcess.swift/superdictate_llm_host_main.cpp);
-                // this define only makes the Vulkan backend available to
-                // register, same as parakeet_cpp's own use of this define.
+                // Vulkan backend -- the app's only GPU path. The "LLM on
+                // GPU (Vulkan)" toggle (Settings.llmUseGPU) picks it at
+                // runtime via `--gpu-layers`, and `--list-devices` reports
+                // what it can see (LLMHostProcess.swift, LLMGPUProbe.swift,
+                // superdictate_llm_host_main.cpp); this define only makes
+                // the backend available to register.
                 .define("GGML_USE_VULKAN"),
                 .define("LLAMA_VERSION", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
                 .define("LLAMA_COMMIT", to: "\"d59d455fd8ea09e5a2e87ce2a9d668267ffb5ccd\""),
@@ -369,8 +171,9 @@ let package = Package(
                 .headerSearchPath("upstream/ggml-vulkan"),
                 .headerSearchPath("upstream/vendor"),
                 .headerSearchPath("upstream/vendor/cpp-httplib"),
-                // Same Intel-ISA + Vulkan-headers flags as the parakeet_cpp
-                // target — proven on the real target machine.
+                // Intel ISA flags plus the Homebrew Vulkan headers (the
+                // `opt/` symlink, not a versioned Cellar path) — proven on
+                // the real target machine.
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
                     "-Wno-ambiguous-macro",
@@ -416,19 +219,17 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("Foundation"),
-                // Vulkan/MoltenVK, statically linked -- same approach as
-                // parakeet_cpp (see that target's own linkerSettings
-                // comment): links MoltenVK's static archive directly so
-                // its Vulkan-ABI entry points resolve straight into this
-                // binary, no Khronos loader / Homebrew runtime dependency.
+                // Vulkan/MoltenVK, statically linked: MoltenVK's static
+                // archive is linked directly so its Vulkan-ABI entry points
+                // resolve straight into this binary, no Khronos loader /
+                // Homebrew runtime dependency.
                 .linkedFramework("IOSurface"),
                 .linkedFramework("IOKit"),
                 .linkedFramework("AppKit"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("CoreFoundation"),
                 .linkedFramework("CoreGraphics"),
-                // Unlike parakeet_cpp's own linkerSettings (which gets away
-                // without this), this target's link step failed with
+                // The link step failed with
                 // undefined MTLCreateSystemDefaultDevice/MTL* ObjC class
                 // symbols from libMoltenVK.a until Metal was linked
                 // explicitly (verified empirically).
