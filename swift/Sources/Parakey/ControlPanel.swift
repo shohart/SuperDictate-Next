@@ -3413,8 +3413,8 @@ header.addArrangedSubview(panelLabel(
     private func speechModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Движок распознавания", "Speech engine"),
-            detail: t("Parakeet и Whisper работают через Vulkan (GGUF); при сбое GPU — CPU. Parakeet Ultra ONNX — экспериментальный, только CPU.",
-                       "Parakeet and Whisper both run via Vulkan (GGUF); CPU on GPU failure. Parakeet Ultra ONNX is experimental, CPU only."),
+            detail: t("Parakeet работает через Vulkan (GGUF), при сбое GPU — CPU. Whisper — только на дискретной видеокарте с включённым GPU; без неё используется Parakeet. Parakeet Ultra ONNX — экспериментальный, только CPU.",
+                       "Parakeet runs via Vulkan (GGUF), CPU on GPU failure. Whisper runs only on a discrete GPU with Use GPU enabled; otherwise Parakeet is used. Parakeet Ultra ONNX is experimental, CPU only."),
             selectedValue: draft.speechModelProfile.rawValue,
             options: SpeechModelProfile.allCases.map { ($0.displayName, $0.rawValue) },
             action: #selector(selectSpeechModelProfile(_:)),

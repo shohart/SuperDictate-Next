@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 enum WhisperCppEngineError: LocalizedError {
     case helperUnavailable
@@ -14,13 +15,31 @@ enum WhisperCppEngineError: LocalizedError {
     }
 }
 
+/// Whisper runs only on a discrete GPU (a Metal device without unified
+/// memory: no Apple Silicon, no Intel iGPU) with "Use GPU" enabled. On CPU,
+/// large-v3-turbo saturates every core of a many-core Mac for minutes and
+/// froze the whole machine during a benchmark (2026-10-16). The helper
+/// enforces the same rule against ggml's own device list.
+func discreteGPUAvailable() -> Bool {
+    MTLCopyAllDevices().contains { !$0.hasUnifiedMemory }
+}
+
+/// Why a Whisper profile cannot run right now, or nil when it can.
+func whisperUnavailableReason(useGPUSetting: Bool, vulkanFailedThisSession: Bool) -> String? {
+    if !useGPUSetting { return "Use GPU (Vulkan) is off" }
+    if vulkanFailedThisSession { return "Vulkan already failed this session" }
+    if !discreteGPUAvailable() { return "no discrete GPU" }
+    if !parakeetVulkanAvailable() { return "no Vulkan device" }
+    return nil
+}
+
 struct WhisperCppTranscription: Sendable {
     let text: String
     let processingSeconds: Double
 }
 
 /// Owns one persistent SuperDictateWhisperHost subprocess running
-/// whisper.cpp (Vulkan on the RX 6600, CPU fallback). Same stdio PCM
+/// whisper.cpp (Vulkan on a discrete GPU only — see discreteGPUAvailable()). Same stdio PCM
 /// protocol and crash-safety rules as the retired Python faster-whisper
 /// host: strict read loops, throwing-only IO (no ObjC exceptions — see the
 /// 2026-08-27 agent SIGABRT incident), and a pipe-EOF death contract so a
@@ -29,16 +48,15 @@ actor WhisperCppEngine {
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
-    let usedGPU: Bool
 
-    init(modelPath: String, language: String, useGPU: Bool) throws {
+    init(modelPath: String, language: String) throws {
         guard let helper = Self.resolvedHelperBinaryURL(),
               FileManager.default.isExecutableFile(atPath: helper.path) else {
             throw WhisperCppEngineError.helperUnavailable
         }
         let process = Process()
         process.executableURL = helper
-        process.arguments = [modelPath, language, useGPU ? "gpu" : "cpu"]
+        process.arguments = [modelPath, language, "gpu"]
         var environment = ProcessInfo.processInfo.environment
         // Tier-1 of the shader loader's 3-tier fallback: point whisper.cpp's
         // ggml-vulkan at ITS OWN shader corpus (a different ggml pin than
@@ -62,7 +80,6 @@ actor WhisperCppEngine {
         self.process = process
         self.input = inputPipe.fileHandleForWriting
         self.output = outputPipe.fileHandleForReading
-        self.usedGPU = useGPU
     }
 
     /// Same resolution chain as LLMHostProcess.resolvedHelperBinaryURL():

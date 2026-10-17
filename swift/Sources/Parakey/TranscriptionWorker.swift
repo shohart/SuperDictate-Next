@@ -184,7 +184,17 @@ actor TranscriptionWorker {
     }
 
     private var engine: LoadedEngine?
-    private var loadedProfile: SpeechModelProfile?
+    /// The profile actually running, which differs from the requested one
+    /// when a GPU-only Whisper profile fell back to Parakeet.
+    private(set) var loadedProfile: SpeechModelProfile?
+    /// The "Use GPU (Vulkan)" preference. The app reads the saved setting;
+    /// `--benchmark-transcribe` passes its own device choice so it never
+    /// has to write the user's settings.
+    private let useGPUPreference: @Sendable () -> Bool
+
+    init(useGPUPreference: @escaping @Sendable () -> Bool = { Settings.shared.useGPU }) {
+        self.useGPUPreference = useGPUPreference
+    }
     private var loadedUseGPU: Bool?
     private(set) var ready = false
     /// Reentrancy backstop — see the comment above. True for the full
@@ -230,9 +240,18 @@ actor TranscriptionWorker {
 
     func load(profile requestedProfile: SpeechModelProfile,
               progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws {
-        let profile = requestedProfile.productionProfile
+        var profile = requestedProfile.productionProfile
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
+        }
+        // Whisper is GPU-only (WhisperCppEngine.swift): without a usable
+        // discrete GPU this session runs the default Parakeet profile
+        // instead. The saved choice is left untouched.
+        if profile.requiresDiscreteGPU,
+           let reason = whisperUnavailableReason(useGPUSetting: useGPUPreference(),
+                                                 vulkanFailedThisSession: vulkanFailedThisSession) {
+            log("ASR: \(profile.shortName) runs only on a discrete GPU (\(reason)) — using \(SpeechModelProfile.productionDefault.shortName) instead")
+            profile = .productionDefault
         }
         // spec §9.1 loading algorithm: read the GPU preference, and only
         // actually attempt Vulkan if (a) it's enabled AND (b) Vulkan hasn't
@@ -241,12 +260,12 @@ actor TranscriptionWorker {
         // again, since the persisted preference is never auto-mutated).
         // The ONNX backend is CPU-only (spec §6): the GPU preference does
         // not apply to it and must not trigger Vulkan fallback bookkeeping.
-        let requestedGPU = Settings.shared.useGPU && !profile.usesOnnxRuntime
+        let requestedGPU = useGPUPreference() && !profile.usesOnnxRuntime
         let attemptVulkan = requestedGPU && !vulkanFailedThisSession
         if requestedGPU && vulkanFailedThisSession {
             log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan already failed once this session (\(vulkanFailureReason ?? "unknown reason")) — staying on CPU for the rest of this session")
         }
-        let useGPU = attemptVulkan
+        var useGPU = attemptVulkan
         if ready, engine != nil, loadedProfile == profile, loadedUseGPU == useGPU {
             log("ASR: \(profile.shortName) already ready")
             return
@@ -274,24 +293,23 @@ actor TranscriptionWorker {
         case .whisperRussian, .whisperRussianCodeSwitch:
             let modelURL = try await downloadWhisperGGUFModelIfNeeded()
             let language = profile == .whisperRussian ? "ru" : "auto"
-            var effectiveGPU = useGPU
-            var whisper: WhisperCppEngine
             do {
-                whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language, useGPU: useGPU)
+                let whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language)
                 _ = try await whisper.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+                loaded = .whisperCpp(whisper)
+                runtimeStatus = .vulkan(deviceDescription: parakeetVulkanDeviceDescription())
             } catch {
-                // GPU init/warm-up failed — retry once on CPU before giving
-                // up (mirrors the parakeet §9.3 never-lose-dictation policy;
-                // the helper itself also retries CPU on context-init
-                // failure, this catches everything above that).
-                guard useGPU else { throw error }
-                log("ASR: whisper.cpp GPU engine failed to start (\(error.localizedDescription)) — retrying on CPU")
-                whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language, useGPU: false)
-                _ = try await whisper.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
-                effectiveGPU = false
+                // GPU init/warm-up failed. Never Whisper on CPU: count it as
+                // this session's Vulkan failure and run Parakeet on CPU.
+                log("ASR: whisper.cpp GPU engine failed to start (\(error.localizedDescription)) — using \(SpeechModelProfile.productionDefault.shortName) on CPU for the rest of this session")
+                vulkanFailedThisSession = true
+                vulkanFailureReason = error.localizedDescription
+                profile = .productionDefault
+                useGPU = false
+                let result = try await loadParakeetEngine(attemptVulkan: false, progressHandler: progressHandler)
+                loaded = .parakeet(result.engine)
+                runtimeStatus = .cpuFallbackAfterVulkanError
             }
-            loaded = .whisperCpp(whisper)
-            runtimeStatus = effectiveGPU ? .vulkan(deviceDescription: "Vulkan") : .cpu
         }
         engine = loaded
         loadedProfile = profile
@@ -311,8 +329,8 @@ actor TranscriptionWorker {
         if case .parakeet(let parakeet) = loaded {
             let loadedDeviceIsVulkan = parakeet.device == .vulkan
             log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(runtimeStatus == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
-        } else if case .whisperCpp(let whisper) = loaded {
-            log("ASR device selected: \(whisper.usedGPU ? "Vulkan" : "CPU")")
+        } else if case .whisperCpp = loaded {
+            log("ASR device selected: Vulkan")
         } else if case .onnx(let onnx) = loaded {
             let reason = await onnx.providerFallbackReason
             log("ASR device selected: \(await onnx.providerActual)\(reason.isEmpty ? "" : " (\(reason))")")
@@ -442,12 +460,12 @@ actor TranscriptionWorker {
                 isVulkanEngine = parakeet.device == .vulkan
                 result = try await parakeet.transcribe(samples: samples)
             case .whisperCpp(let whisper):
-                isVulkanEngine = whisper.usedGPU
+                isVulkanEngine = true
                 let transcription = try await whisper.transcribe(samples: samples)
                 result = ParakeetTranscriptionResult(text: transcription.text,
                                                      totalSeconds: transcription.processingSeconds,
                                                      inferenceSeconds: transcription.processingSeconds,
-                                                     usedGPU: whisper.usedGPU)
+                                                     usedGPU: true)
             case .onnx(let onnx):
                 isVulkanEngine = false
                 let live = try await liveOnnxEngine(onnx)
@@ -493,31 +511,24 @@ actor TranscriptionWorker {
                 runtimeStatus = .cpuFallbackAfterVulkanError
                 result = try await cpuEngine.transcribe(samples: samples)
             } else if case .whisperCpp(let deadEngine) = engine {
-                // Same §9.3 contract for the whisper.cpp helper: the Vulkan
-                // engine died mid-dictation — shut it down, rebuild a CPU
-                // helper, warm it, and retry THIS dictation once.
+                // Same §9.3 contract for the whisper.cpp helper, except that
+                // Whisper never runs on CPU: shut the dead GPU helper down
+                // and retry THIS dictation once on Parakeet CPU, which then
+                // serves the rest of the session.
                 await deadEngine.shutdown()
-                let cpuEngine: WhisperCppEngine
+                let cpuEngine: ParakeetEngine
                 do {
-                    guard let modelPath = try? await downloadWhisperGGUFModelIfNeeded() else {
-                        throw error
-                    }
-                    let language = (loadedProfile ?? .whisperRussian) == .whisperRussian ? "ru" : "auto"
-                    cpuEngine = try WhisperCppEngine(modelPath: modelPath.path, language: language, useGPU: false)
-                    _ = try await cpuEngine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+                    cpuEngine = try await loadParakeetEngine(attemptVulkan: false, progressHandler: nil).engine
                 } catch {
                     self.engine = nil
                     ready = false
                     throw error
                 }
-                self.engine = .whisperCpp(cpuEngine)
+                self.engine = .parakeet(cpuEngine)
+                loadedProfile = .productionDefault
                 loadedUseGPU = false
                 runtimeStatus = .cpuFallbackAfterVulkanError
-                let transcription = try await cpuEngine.transcribe(samples: samples)
-                result = ParakeetTranscriptionResult(text: transcription.text,
-                                                     totalSeconds: transcription.processingSeconds,
-                                                     inferenceSeconds: transcription.processingSeconds,
-                                                     usedGPU: false)
+                result = try await cpuEngine.transcribe(samples: samples)
             } else {
                 throw error
             }

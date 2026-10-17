@@ -364,6 +364,12 @@ enum SpeechModelProfile: String, CaseIterable {
         true
     }
 
+    /// Whisper runs only on a discrete GPU with "Use GPU" on; otherwise the
+    /// session falls back to `productionDefault` (TranscriptionWorker.load).
+    var requiresDiscreteGPU: Bool {
+        self == .whisperRussian || self == .whisperRussianCodeSwitch
+    }
+
     var productionProfile: SpeechModelProfile {
         isProductionSupported ? self : Self.productionDefault
     }
@@ -384,8 +390,8 @@ enum SpeechModelProfile: String, CaseIterable {
     var aboutModelText: String {
         switch self {
         case .parakeetTDTv3: return "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
-        case .whisperRussian: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: русский"
-        case .whisperRussianCodeSwitch: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: авто (RU/EN)"
+        case .whisperRussian: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · только дискретная GPU (Vulkan) · язык: русский"
+        case .whisperRussianCodeSwitch: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · только дискретная GPU (Vulkan) · язык: авто (RU/EN)"
         case .parakeetUltraOnnx: return "ONNX Runtime · Parakeet Ultra 0.6B (TDT) · ONNX int8 · CPU · CC-BY-4.0: NVIDIA (parakeet-tdt-0.6b-v3), Moondream (parakeet-ultra), mldecode (ONNX int8)"
         }
     }

@@ -95,18 +95,18 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// never fall through to `SuperDictateControlPanelApp`'s normal startup and
 /// clobber the production LaunchAgent plist (exactly the incident the Phase
 /// 4 report documents and warns never to repeat). Runs the REAL production
-/// code paths (`download*ModelIfNeeded()`, `ParakeetEngine`,
-/// `WhisperCppEngine`, `OnnxAsrEngine` with the SuperDictateOnnxHost helper
-/// resolved from Contents/Helpers) — never a mock.
+/// code paths (`TranscriptionWorker` and `transcribeSegmented`, i.e. the
+/// same segmentation a recorded dictation goes through, with each engine's
+/// helper resolved from Contents/Helpers) — never a mock.
 ///
 /// usage: SuperDictate --benchmark-transcribe <whisper|parakeet|onnx> <cpu|vulkan> <threads> <wav1> [wav2 ...]
 ///        (legacy, parakeet-only: SuperDictate --benchmark-transcribe <cpu|vulkan> <threads> <wav1> [wav2 ...])
 ///
-/// `onnx` is CPU-only (spec §11 gate 6); `vulkan` is rejected for it.
-/// Loads the model once (device/threads as given), warms up (parakeet and
-/// onnx; whisper.cpp has no separate warm-up — its first transcribe is the
-/// cold call), then transcribes every listed WAV path IN ORDER through that
-/// one loaded context (repeat a path multiple times in argv to measure
+/// `onnx` is CPU-only (spec §11 gate 6) and `whisper` is GPU-only (a
+/// discrete GPU); the other device is rejected for each.
+/// Loads the model once (device/threads as given), warms up, then
+/// transcribes every listed WAV path IN ORDER through that one loaded
+/// worker (repeat a path multiple times in argv to measure
 /// warm-latency distribution — the calling script does this). Each result
 /// is printed as one machine-parseable line; the calling shell script does
 /// all statistics (median/p95, peak RSS via /usr/bin/time -l wrapping the
@@ -134,6 +134,10 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
         fputs("benchmark: the onnx backend is CPU-only\n", stderr)
         return EXIT_FAILURE
     }
+    if backend == "whisper" && deviceArg != "vulkan" {
+        fputs("benchmark: the whisper backend is GPU-only (vulkan on a discrete GPU)\n", stderr)
+        return EXIT_FAILURE
+    }
 
     // Bare top-level `Task { }` inherits MainActor isolation with no run
     // loop pumping here (no NSApplication yet) — a guaranteed self-deadlock,
@@ -144,21 +148,18 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     Task.detached {
         defer { semaphore.signal() }
         do {
-            switch backend {
-            case "whisper":
-                try await runWhisperBenchmark(deviceArg: deviceArg, wavPaths: wavPaths)
-            case "onnx":
-                try await runOnnxBenchmark(threads: threads, wavPaths: wavPaths)
-            default:
-                try await runParakeetBenchmark(deviceArg: deviceArg, threads: threads, wavPaths: wavPaths)
-            }
+            try await runSegmentedBenchmark(backend: backend, deviceArg: deviceArg, threads: threads, wavPaths: wavPaths)
             exitCode.set(EXIT_SUCCESS)
         } catch {
             fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
             exitCode.set(EXIT_FAILURE)
         }
     }
-    semaphore.wait()
+    // Pump the main run loop while waiting instead of blocking it: any
+    // main-actor hop on the dictation path would otherwise deadlock.
+    while semaphore.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
     return exitCode.value
 }
 
@@ -169,81 +170,71 @@ private func benchmarkEscapedText(_ text: String) -> String {
         .replacingOccurrences(of: "\n", with: " ")
 }
 
-private func runParakeetBenchmark(deviceArg: String, threads: Int, wavPaths: [String]) async throws {
-    let device: ParakeetDevice = deviceArg == "vulkan" ? .vulkan : .cpu
-    let modelURL = try await downloadParakeetModelIfNeeded()
-    let loadStart = ProcessInfo.processInfo.systemUptime
-    let engine = try ParakeetEngine(modelPath: modelURL.path, device: device, threadCount: threads)
-    let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
+/// One backend, one device, every WAV through the REAL dictation path: a
+/// `TranscriptionWorker` loaded like the agent loads it, then
+/// `transcribeSegmented` — PauseSegmenter (≤ 25 s segments), the overlap
+/// windows and seam dedup — exactly as a recorded dictation. Never a raw
+/// whole-file engine call: the app never hands an engine a long
+/// unsegmented clip, and the benchmark must not either.
+private func runSegmentedBenchmark(backend: String, deviceArg: String, threads: Int, wavPaths: [String]) async throws {
+    let profile: SpeechModelProfile
+    switch backend {
+    case "whisper": profile = .whisperRussianCodeSwitch
+    case "onnx": profile = .parakeetUltraOnnx
+    default: profile = .parakeetTDTv3
+    }
+    let wantsVulkan = deviceArg == "vulkan"
+    // The worker reads its thread count from this override (1...32).
+    setenv("SUPERDICTATE_ASR_THREADS", String(threads), 1)
+    let worker = TranscriptionWorker(useGPUPreference: { wantsVulkan })
 
+    let loadStart = ProcessInfo.processInfo.systemUptime
+    try await worker.load(profile: profile)
+    let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
+    // load() already warmed the engine; this second pass mirrors the
+    // agent's own post-load warm-up through the worker. Not worker.warmUp():
+    // that resolves the dictation language from the keyboard layout on the
+    // main actor, which a headless benchmark has no use for.
     let warmStart = ProcessInfo.processInfo.systemUptime
-    try await engine.warmUp()
+    _ = try await worker.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)),
+                                    resolveViaKeyboard: false,
+                                    requestedAt: warmStart)
     let warmSeconds = ProcessInfo.processInfo.systemUptime - warmStart
-    let actualDevice = await engine.backendDescription()
 
-    print("BENCH_LOAD backend=parakeet device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice)")
+    let loadedProfile = await worker.loadedProfile
+    let status = await worker.runtimeStatus
+    var actualDevice = "cpu"
+    if case .vulkan = status { actualDevice = "vulkan" }
+    // A silent fallback (Whisper → Parakeet, Vulkan → CPU) is never a
+    // benchmark result for the requested backend/device.
+    guard loadedProfile == profile else {
+        await worker.unload()
+        throw NSError(domain: "SuperDictateBenchmark", code: 2, userInfo: [NSLocalizedDescriptionKey:
+            "requested \(profile.shortName) but the worker fell back to \(loadedProfile?.shortName ?? "nothing") (Whisper needs a discrete GPU)"])
+    }
+    guard !wantsVulkan || actualDevice == "vulkan" else {
+        await worker.unload()
+        throw NSError(domain: "SuperDictateBenchmark", code: 3, userInfo: [NSLocalizedDescriptionKey:
+            "requested vulkan but the engine runs on \(status)"])
+    }
+
+    print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented")
 
     for path in wavPaths {
         let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))
         let durationSeconds = Double(samples.count) / SAMPLE_RATE
+        let segmentCount = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE).count
         let callStart = ProcessInfo.processInfo.systemUptime
-        let result = try await engine.transcribe(samples: samples)
+        let result = try await transcribeSegmented(samples: samples,
+                                                   worker: worker,
+                                                   language: nil,
+                                                   resolveViaKeyboard: false,
+                                                   requestedAt: callStart)
         let wallSeconds = ProcessInfo.processInfo.systemUptime - callStart
-        let rtf = durationSeconds > 0 ? result.inferenceSeconds / durationSeconds : 0
-        print("BENCH_RESULT backend=parakeet file=\(path) duration_s=\(durationSeconds) wall_s=\(wallSeconds) inference_s=\(result.inferenceSeconds) total_s=\(result.totalSeconds) rtf=\(rtf) used_gpu=\(result.usedGPU) text=\(benchmarkEscapedText(result.text))")
+        let rtf = durationSeconds > 0 ? result.engineProcessingSeconds / durationSeconds : 0
+        print("BENCH_RESULT backend=\(backend) file=\(path) duration_s=\(durationSeconds) segments=\(segmentCount) wall_s=\(wallSeconds) inference_s=\(result.engineProcessingSeconds) total_s=\(wallSeconds) rtf=\(rtf) used_gpu=\(actualDevice == "vulkan") segment_failure=\(result.hadSegmentFailure) text=\(benchmarkEscapedText(result.text))")
     }
-    await engine.shutdown()
-}
-
-/// whisper.cpp runs in the SuperDictateWhisperHost helper with its own
-/// thread policy, so the requested thread count is not forwarded.
-private func runWhisperBenchmark(deviceArg: String, wavPaths: [String]) async throws {
-    let useGPU = deviceArg == "vulkan"
-    let modelURL = try await downloadWhisperGGUFModelIfNeeded()
-    let loadStart = ProcessInfo.processInfo.systemUptime
-    let engine = try WhisperCppEngine(modelPath: modelURL.path, language: "auto", useGPU: useGPU)
-    let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
-    let usedGPU = engine.usedGPU
-
-    // whisper.cpp has no separate warm-up call; the first transcribe below
-    // is the cold first-inference (reported as such by the calling script).
-    print("BENCH_LOAD backend=whisper device=\(deviceArg) requested_threads=host load_s=\(loadSeconds) warmup_s=0.0 actual_device=\(usedGPU ? "vulkan" : "cpu")")
-
-    for path in wavPaths {
-        let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))
-        let durationSeconds = Double(samples.count) / SAMPLE_RATE
-        let callStart = ProcessInfo.processInfo.systemUptime
-        let result = try await engine.transcribe(samples: samples)
-        let wallSeconds = ProcessInfo.processInfo.systemUptime - callStart
-        let rtf = durationSeconds > 0 ? result.processingSeconds / durationSeconds : 0
-        print("BENCH_RESULT backend=whisper file=\(path) duration_s=\(durationSeconds) wall_s=\(wallSeconds) inference_s=\(result.processingSeconds) total_s=\(result.processingSeconds) rtf=\(rtf) used_gpu=\(usedGPU) text=\(benchmarkEscapedText(result.text))")
-    }
-    await engine.shutdown()
-}
-
-private func runOnnxBenchmark(threads: Int, wavPaths: [String]) async throws {
-    let modelDirectory = try await downloadOnnxModelIfNeeded()
-    let loadStart = ProcessInfo.processInfo.systemUptime
-    let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threads)
-    let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
-
-    let warmStart = ProcessInfo.processInfo.systemUptime
-    _ = try await engine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
-    let warmSeconds = ProcessInfo.processInfo.systemUptime - warmStart
-    let provider = await engine.providerActual
-
-    print("BENCH_LOAD backend=onnx device=cpu requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=onnxruntime-\(provider)")
-
-    for path in wavPaths {
-        let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))
-        let durationSeconds = Double(samples.count) / SAMPLE_RATE
-        let callStart = ProcessInfo.processInfo.systemUptime
-        let result = try await engine.transcribe(samples: samples)
-        let wallSeconds = ProcessInfo.processInfo.systemUptime - callStart
-        let rtf = durationSeconds > 0 ? result.processingSeconds / durationSeconds : 0
-        print("BENCH_RESULT backend=onnx file=\(path) duration_s=\(durationSeconds) wall_s=\(wallSeconds) inference_s=\(result.processingSeconds) total_s=\(wallSeconds) rtf=\(rtf) used_gpu=false text=\(benchmarkEscapedText(result.text))")
-    }
-    await engine.shutdown()
+    await worker.unload()
 }
 
 /// Reads a WAV file as mono Float32 PCM at `SAMPLE_RATE` Hz, converting if

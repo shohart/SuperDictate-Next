@@ -6,7 +6,12 @@
 // EOF on stdin ends the process cleanly (which also guarantees no orphaned
 // helper survives a crashed parent — the pipe closes with the parent).
 //
-// Usage: SuperDictateWhisperHost MODEL_PATH LANGUAGE gpu|cpu [N_THREADS]
+// Usage: SuperDictateWhisperHost MODEL_PATH LANGUAGE gpu [N_THREADS]
+// GPU only: Whisper large-v3-turbo on CPU saturates every core of a
+// many-core Mac for minutes and froze the whole machine during a
+// benchmark (2026-10-16), so there is no CPU mode and no CPU fallback —
+// a GPU context that fails to initialize is a hard failure the app turns
+// into a Parakeet fallback.
 // Vulkan shaders are found via the SUPERDICTATE_VULKAN_SHADER_DIR env var
 // (tier 1 of ggml-vulkan-shaders-runtime's 3-tier fallback), which the
 // spawning engine sets to the app bundle's whisper-vulkan-shaders/ corpus.
@@ -16,7 +21,7 @@
 //  - WHISPER_SAMPLING_GREEDY instead of beam search: large-v3-turbo is a
 //    distilled model, for which greedy decoding is the recommended mode
 //    (beam search risks repetition loops and only adds cost).
-//  - GPU init failure falls back to a CPU context instead of exiting.
+//  - (removed 2026-10-17) the old CPU-context fallback on GPU init failure.
 
 import Foundation
 import whisper_cpp
@@ -50,15 +55,29 @@ private func audioContextFrames(sampleCount: Int, modelMaxAudioCtx: Int32) -> In
 
 let arguments = CommandLine.arguments
 guard arguments.count >= 4 else {
-    log("usage: SuperDictateWhisperHost MODEL_PATH LANGUAGE gpu|cpu [N_THREADS]")
+    log("usage: SuperDictateWhisperHost MODEL_PATH LANGUAGE gpu [N_THREADS]")
+    exit(2)
+}
+guard arguments[3] == "gpu" else {
+    log("CPU mode is not supported: Whisper runs only on a GPU")
     exit(2)
 }
 let modelPath = arguments[1]
 let language = arguments[2]
-let useGPU = arguments[3] == "gpu"
+// The CPU side of a GPU run (mel, sampling) needs few threads; never
+// default to every core (36 on the Xeon Mac Pro).
 let threadCount = arguments.count > 4
-    ? max(1, Int(arguments[4]) ?? 1)
-    : max(1, ProcessInfo.processInfo.activeProcessorCount)
+    ? max(1, min(32, Int(arguments[4]) ?? 1))
+    : max(2, min(8, ProcessInfo.processInfo.activeProcessorCount / 2))
+
+// use_gpu alone is not enough: with no GPU backend device whisper.cpp
+// silently computes on the CPU. Require a ggml device of type GPU
+// (dedicated memory — a discrete card; integrated GPUs report IGPU).
+guard let gpuDevice = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) else {
+    log("no discrete GPU device found: Whisper runs only on a discrete GPU")
+    exit(5)
+}
+log("GPU device: \(String(cString: ggml_backend_dev_description(gpuDevice)))")
 
 let started = Date()
 var contextParams = whisper_context_default_params()
@@ -66,19 +85,13 @@ var contextParams = whisper_context_default_params()
 // SLOWER than plain attention under MoltenVK on the RX 6600 — disable
 // unless explicitly requested (arg 5 = "fa").
 contextParams.flash_attn = arguments.count > 5 && arguments[5] == "fa"
-contextParams.use_gpu = useGPU
-var context = whisper_init_from_file_with_params(modelPath, contextParams)
-if context == nil && useGPU {
-    log("GPU context init failed — retrying with CPU")
-    contextParams.use_gpu = false
-    context = whisper_init_from_file_with_params(modelPath, contextParams)
-}
-guard let context else {
-    log("failed to load model at \(modelPath)")
+contextParams.use_gpu = true
+guard let context = whisper_init_from_file_with_params(modelPath, contextParams) else {
+    log("failed to load model on the GPU at \(modelPath)")
     exit(3)
 }
 log("model loaded in \(String(format: "%.2f", Date().timeIntervalSince(started))) s "
-    + "(gpu=\(useGPU), threads=\(threadCount))")
+    + "(gpu=true, threads=\(threadCount))")
 
 while true {
     guard let header = readExactly(4) else { break }

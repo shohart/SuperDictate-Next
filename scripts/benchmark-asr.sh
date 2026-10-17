@@ -20,15 +20,19 @@
 #   scripts/benchmark-asr.sh [--binary PATH] [--corpus-dir DIR]
 #                             [--out DIR] [--repeats N] [--devices "cpu vulkan"]
 #                             [--backends "whisper parakeet onnx"] [--threads N]
+#                             [--run-timeout SECONDS]   (per process, default 600)
 #
 # Notes:
-#   - whisper.cpp is run with language=auto (the app's code-switch profile)
+#   - whisper.cpp (GPU only) is run with language=auto (the app's code-switch profile)
 #     so the mixed RU/EN corpus is scored fairly; it has no separate
 #     warm-up call, so its first transcribe is the cold first-inference.
-#   - The 120s monologue clip is transcribed once (accuracy only) to keep
-#     the CPU runs tractable; all shorter clips get --repeats (1 cold +
-#     N-1 warm) for the warm-latency distribution.
-#   - onnx is CPU-only: its vulkan runs are skipped. It needs the
+#   - Every clip goes through the app's own dictation path
+#     (TranscriptionWorker + transcribeSegmented: PauseSegmenter's <= 25 s
+#     segments, overlap windows, seam dedup), never one whole-file engine
+#     call. The long monologue clip (>= 60 s nominal) is transcribed once
+#     (accuracy only); shorter clips get --repeats (1 cold + N-1 warm).
+#   - onnx is CPU-only and whisper is GPU-only (discrete GPU): their
+#     other-device runs are skipped. It needs the
 #     SuperDictateOnnxHost helper, so the default binary is a packaged
 #     bundle (dist/SuperDictate-test.app, then dist/SuperDictate.app).
 #   - Each backend downloads its model on first use if it is missing.
@@ -50,6 +54,7 @@ REPEATS=3    # first call = "first inference (cold)"; remaining N-1 = warm pool
 DEVICES="cpu vulkan"
 BACKENDS="whisper parakeet onnx"
 THREADS=8
+RUN_TIMEOUT_SECONDS=600
 
 log_msg() { printf 'benchmark-asr: %s\n' "$*"; }
 fail() { printf 'benchmark-asr: %s\n' "$*" >&2; exit 1; }
@@ -63,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --devices) DEVICES="$2"; shift 2 ;;
         --backends) BACKENDS="$2"; shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
+        --run-timeout) RUN_TIMEOUT_SECONDS="$2"; shift 2 ;;
         -h|--help)
             grep '^#' "$0" | sed 's/^#//'
             exit 0
@@ -254,8 +260,17 @@ with wave.open('$clip_path', 'rb') as w:
         repeat_args+=("$clip_path")
     done
 
-    if /usr/bin/time -l "$BINARY" --benchmark-transcribe "$backend" "$device" "$THREADS" "${repeat_args[@]}" \
-        > "$log_file" 2> "$time_file"; then
+    # Per-run timeout (macOS has no coreutils `timeout`): a hung run is
+    # killed, recorded as failed, and the sweep moves on.
+    /usr/bin/time -l "$BINARY" --benchmark-transcribe "$backend" "$device" "$THREADS" "${repeat_args[@]}" \
+        > "$log_file" 2> "$time_file" &
+    local run_pid=$!
+    ( sleep "$RUN_TIMEOUT_SECONDS"; pkill -TERM -P "$run_pid" 2>/dev/null; kill -TERM "$run_pid" 2>/dev/null ) &
+    local timer_pid=$!
+    local run_status=0
+    wait "$run_pid" || run_status=$?
+    kill "$timer_pid" 2>/dev/null; wait "$timer_pid" 2>/dev/null || true
+    if [[ $run_status -eq 0 ]]; then
         echo "$log_file"
     else
         log_msg "  [$backend/$device/$clip_name] FAILED (see $log_file / $time_file) — see BENCH_FAILED line if present"
@@ -277,11 +292,18 @@ REPORT="$OUT_DIR/report.md"
     echo "Backends: $BACKENDS"
     echo "Devices: $DEVICES"
     echo "Threads: $THREADS"
-    echo "Repeats per clip: $REPEATS (first = cold first-inference, rest = warm pool; 120s clip = 1)"
+    echo "Repeats per clip: $REPEATS (first = cold first-inference, rest = warm pool; monologue = 1)"
+    echo "Path: the app's segmented dictation path (PauseSegmenter <= 25 s, overlap windows, seam dedup)."
     echo "Scoring: WER/CER (case-insensitive, punctuation-stripped) and punctuation F1 (multiset of .,!?;:…—–) vs the reference text spoken into the corpus."
     echo "Whisper language: auto (code-switch profile). No LLM correction applied to any backend."
     echo
 } > "$REPORT"
+
+# The three per-clip sections are collected in separate files and joined
+# after the sweep, so each table stays contiguous.
+ACCURACY_PART="$OUT_DIR/.accuracy.md"
+LATENCY_PART="$OUT_DIR/.latency.md"
+TRANSCRIPTS_PART="$OUT_DIR/.transcripts.md"
 
 # Per-clip accuracy table (first transcript of each run).
 {
@@ -289,25 +311,26 @@ REPORT="$OUT_DIR/report.md"
     echo
     echo "| Backend | Device | Clip | WER | CER | Punct F1 |"
     echo "|---|---|---|---:|---:|---:|"
-} >> "$REPORT"
+} > "$ACCURACY_PART"
 
 # Per-clip latency table.
 {
     echo "## Latency"
     echo
-    echo "| Backend | Device | Clip | Dur (s) | Cold load (s) | Warm-up (s) | First-infer (ms) | Warm median (ms) | Warm p95 (ms) | RTF (warm median) | Peak RSS (MB) |"
-    echo "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-} >> "$REPORT"
+    echo "| Backend | Device | Clip | Dur (s) | Cold load (s) | Warm-up (s) | First-infer (ms) | Warm median (ms) | Warm p95 (ms) | RTF (warm median) | Peak RSS, main process only (MB) |"
+    echo "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+} > "$LATENCY_PART"
 
 # Transcripts (reference + hypothesis per backend/device/clip).
 {
     echo "## Transcripts"
     echo
-} >> "$REPORT"
+} > "$TRANSCRIPTS_PART"
 
 for backend in $BACKENDS; do
     for device in $DEVICES; do
         [[ "$backend" == "onnx" && "$device" != "cpu" ]] && continue
+        [[ "$backend" == "whisper" && "$device" != "vulkan" ]] && continue
         log_msg "=== Backend: $backend / Device: $device ==="
         for clip_path in "${CORPUS_FILES[@]}"; do
             clip_name="$(basename "$clip_path" .wav)"
@@ -316,7 +339,7 @@ for backend in $BACKENDS; do
             if ! log_file="$(run_one "$backend" "$device" "$clip_path")"; then
                 {
                     echo "| $backend | $device | $clip_name | - | - | - |"
-                } >> "$REPORT"
+                } >> "$ACCURACY_PART"
                 continue
             fi
 
@@ -364,20 +387,26 @@ for backend in $BACKENDS; do
 
             {
                 echo "| $backend | $device | $clip_name | $wer | $cer | $pf1 |"
-            } >> "$REPORT"
+            } >> "$ACCURACY_PART"
             {
                 echo "| $backend | $device | $clip_name | $duration_s | $load_s | $warm_s | $first_ms | $warm_median_ms | $warm_p95_ms | $rtf | $peak_rss_mb |"
-            } >> "$REPORT"
+            } >> "$LATENCY_PART"
             {
                 echo "### $backend / $device / $clip_name"
                 echo
                 echo "- **Reference:** $reference"
                 echo "- **Transcript:** $transcript"
                 echo
-            } >> "$REPORT"
+            } >> "$TRANSCRIPTS_PART"
         done
     done
 done
+{
+    cat "$ACCURACY_PART"; echo
+    cat "$LATENCY_PART"; echo
+    cat "$TRANSCRIPTS_PART"
+} >> "$REPORT"
+rm -f "$ACCURACY_PART" "$LATENCY_PART" "$TRANSCRIPTS_PART"
 
 # ---------------------------------------------------------------------------
 # 5. Summary tables (aggregated per backend × device)
@@ -392,6 +421,7 @@ done
 for backend in $BACKENDS; do
     for device in $DEVICES; do
         [[ "$backend" == "onnx" && "$device" != "cpu" ]] && continue
+        [[ "$backend" == "whisper" && "$device" != "vulkan" ]] && continue
         wer_vals=(); cer_vals=(); pf1_vals=(); first_vals=(); warm_vals=(); rtf_vals=(); load_vals=()
         for clip_path in "${CORPUS_FILES[@]}"; do
             clip_name="$(basename "$clip_path" .wav)"
