@@ -14,8 +14,10 @@ whisper.cpp, the `SuperDictateWhisperHost` helper and the ASR "Use GPU"
 toggle are removed; `parakeetUltraOnnx` is the only `SpeechModelProfile`
 and the default, and saved GGUF/Whisper selections migrate to it. The GPU
 (Vulkan) is used only by `SuperDictateLLMHost` (correction, rewrite). The
-`parakeet_cpp` C target stays, for the Silero VAD and the Vulkan device
-probe behind "LLM on GPU". Sections §1–§11 below describe the state they
+former `parakeet_cpp` target is now `silero_vad`: the Silero VAD over a
+CPU-only ggml v0.13.0 core, with no Vulkan or MoltenVK in the app process;
+"LLM on GPU" asks `SuperDictateLLMHost --list-devices` what it can see.
+Sections §1–§11 below describe the state they
 were written against and are kept for history; where they say GGUF stays
 the default or ONNX is experimental, revision 3 overrides them.
 

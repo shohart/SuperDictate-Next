@@ -28,7 +28,7 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
+import silero_vad
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -122,6 +122,8 @@ enum ParakeySelfTest {
             return runSuite("text-insertion-routing", testTextInsertionRouting)
         case "asr-thread-policy":
             return runSuite("asr-thread-policy", testASRThreadPolicy)
+        case "llm-gpu-probe":
+            return runSuite("llm-gpu-probe", testLLMGPUProbe)
         case "silero-vad-bridge":
             return runSuite("silero-vad-bridge", testSileroVadBridge)
         case "silero-vad-real":
@@ -264,6 +266,7 @@ enum ParakeySelfTest {
         try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
         try testASRThreadPolicy()
+        try testLLMGPUProbe()
         try testSileroVadBridge()
         try testPauseSegmentation()
         try testOverlapWindowing()
@@ -5685,6 +5688,24 @@ enum ParakeySelfTest {
             language: .russian
         )
         try expect(corrected.text, equals: "мне 25 years old", "ITN should run before user corrections so corrections can match on the digit form")
+    }
+
+    // MARK: - LLM GPU probe
+
+    /// Parsing of `SuperDictateLLMHost --list-devices`, plus (when the
+    /// helper is built next to this binary) a live probe that must agree
+    /// with what the helper prints.
+    private static func testLLMGPUProbe() throws {
+        try expect(parseLLMGPUDeviceList("DEVICE Vulkan0\tAMD Radeon Vega\n"), equals: ["AMD Radeon Vega"],
+                   "one device line yields its description")
+        try expect(parseLLMGPUDeviceList("DEVICE Vulkan0\tAMD Radeon RX 6600\nDEVICE Vulkan1\t\n"),
+                   equals: ["AMD Radeon RX 6600", "Vulkan1"],
+                   "an empty description falls back to the device name")
+        try expect(parseLLMGPUDeviceList("ggml_vulkan: Found 1 Vulkan devices:\n\n"), equals: [],
+                   "anything but DEVICE lines is ignored")
+        try expect(parseLLMGPUDeviceList(""), equals: [], "no output means no GPU")
+        let devices = LLMGPUProbe.shared.devices()
+        print("llm-gpu-probe: \(devices.isEmpty ? "no Vulkan device (or helper not built)" : devices.joined(separator: ", "))")
     }
 
     // MARK: - ASR thread policy

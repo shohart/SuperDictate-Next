@@ -1,20 +1,20 @@
 #!/bin/bash
 # scripts/vendor-silero-vad.sh — deterministically vendor the Silero VAD
 # implementation embedded inside ggml-org/whisper.cpp's src/whisper.cpp (the
-# whisper_vad_* functions) into swift/Sources/parakeet_cpp/upstream-vad/.
+# whisper_vad_* functions) into swift/Sources/silero_vad/upstream-vad/.
 # Re-run this and commit the result to update the pin; never hand-edit files
-# under swift/Sources/parakeet_cpp/upstream-vad/ — this script wipes and
+# under swift/Sources/silero_vad/upstream-vad/ — this script wipes and
 # regenerates that whole directory (see `rm -rf "$DEST"` below).
 #
 # This is a SEPARATE, additive vendor tree from
-# swift/Sources/parakeet_cpp/upstream/ (mudler/parakeet.cpp + its own pinned
-# ggml v0.13.0, vendored by scripts/vendor-parakeet-cpp.sh). This script does
+# swift/Sources/silero_vad/upstream/ (the CPU-only ggml v0.13.0 core,
+# vendored by scripts/vendor-ggml-core.sh). This script does
 # not touch that tree. The VAD code depends only on ggml core APIs already
 # vendored there (ggml.h, ggml-alloc.h, ggml-backend.h, ggml-cpp.h,
 # ggml-cpu.h) via the existing headerSearchPath entries in Package.swift — no
 # whisper.cpp mel-spectrogram/encoder/decoder ASR code is vendored here.
 #
-# Unlike vendor-parakeet-cpp.sh (which copies whole files 1:1 from a pinned
+# Unlike vendor-ggml-core.sh (which copies whole files 1:1 from a pinned
 # upstream project laid out as a library), whisper.cpp's Silero VAD support
 # is NOT a standalone file — it's ~1,150 contiguous lines embedded inside a
 # single ~9,000-line src/whisper.cpp, plus a small non-contiguous set of
@@ -69,7 +69,7 @@ SILERO_VAD_MODEL_SIZE_BYTES=885098
 # branch name to an immutable revision SHA).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="$ROOT_DIR/swift/Sources/parakeet_cpp/upstream-vad"
+DEST="$ROOT_DIR/swift/Sources/silero_vad/upstream-vad"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -204,7 +204,7 @@ rm -f "$DEST/whisper_vad_arch.h.tmp"
 
 # --- public header: self-contained, no dependency on the rest of whisper.h ---
 cat > "$DEST/include/whisper_vad.h" <<'EOF'
-// swift/Sources/parakeet_cpp/upstream-vad/include/whisper_vad.h
+// swift/Sources/silero_vad/upstream-vad/include/whisper_vad.h
 //
 // Public API for the vendored Silero VAD (ggml port), extracted from
 // ggml-org/whisper.cpp's include/whisper.h (the `whisper_vad_*` public
@@ -334,7 +334,7 @@ EOF
 # --- implementation: hand-transcribed shared helpers (verified above to
 #     still match upstream verbatim) + the mechanically extracted VAD block.
 cat > "$DEST/whisper_vad.cpp" <<'EOF'
-// swift/Sources/parakeet_cpp/upstream-vad/whisper_vad.cpp
+// swift/Sources/silero_vad/upstream-vad/whisper_vad.cpp
 //
 // Do not hand-edit — re-run scripts/vendor-silero-vad.sh.
 //
@@ -1064,7 +1064,7 @@ Do not hand-edit anything under this directory — re-run the vendor script.
   references was individually traced to one of the small hand-transcribed
   helpers listed above; none led into ASR-specific code).
 - Depends only on: ggml core APIs already vendored under
-  \`swift/Sources/parakeet_cpp/upstream/\` (\`ggml.h\`, \`ggml-cpp.h\`,
+  \`swift/Sources/silero_vad/upstream/\` (\`ggml.h\`, \`ggml-cpp.h\`,
   \`ggml-alloc.h\`, \`ggml-backend.h\`) via that target's existing
   \`headerSearchPath\` entries, plus the C++ standard library. No new
   external dependencies.

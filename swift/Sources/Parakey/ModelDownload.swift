@@ -6,7 +6,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -163,7 +162,7 @@ let GEC_LORA_SCALE: Double = 4.0
 /// `~/Library/Application Support/SuperDictate/Models/LLM/` — a sibling of
 /// the Parakeet ASR model directory, not inside it: this holds
 /// text-generation GGUF weights for SuperDictateLLMHost, a completely
-/// different runtime (llama_cpp_host) from parakeet_cpp.
+/// different runtime (llama_cpp_host) from the speech engine.
 func llmModelCacheDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil)!
         .appendingPathComponent("Models", isDirectory: true)

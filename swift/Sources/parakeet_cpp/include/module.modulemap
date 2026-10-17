@@ -1,4 +1,0 @@
-module parakeet_cpp {
-    header "parakeet_cpp_module.h"
-    export *
-}

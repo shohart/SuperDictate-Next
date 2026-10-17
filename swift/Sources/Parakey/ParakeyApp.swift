@@ -28,7 +28,6 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
-import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -4730,8 +4729,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(dock)
 
         let gpuLanguage = settings.interfaceLanguage
-        let vulkanAvailable = vulkanGPUAvailable()
-        let deviceDescription = vulkanGPUDeviceDescription()
+        let llmGPUDevices = LLMGPUProbe.shared.devices()
+        let vulkanAvailable = !llmGPUDevices.isEmpty
+        let deviceDescription = llmGPUDevices.joined(separator: ", ")
         let llmGPU = NSMenuItem(
             title: localizedText("LLM на GPU (Vulkan)", "LLM on GPU (Vulkan)", language: gpuLanguage),
             action: #selector(toggleLLMUseGPU(_:)),

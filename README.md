@@ -300,9 +300,10 @@ lipo -info ./dist/SuperDictate.app/Contents/MacOS/SuperDictate
 ```
 
 `otool -L` must not list `/usr/local`, `/opt/homebrew`, `Cellar`,
-`MoltenVK.dylib`, or `libvulkan` (MoltenVK and all of ggml/parakeet.cpp are
-statically linked into the executable — the only runtime dependencies are
-Apple's system frameworks).
+`MoltenVK.dylib`, or `libvulkan`: the app executable carries only a CPU ggml
+core for the Silero VAD and no GPU code at all, and the LLM helper
+(`Contents/Helpers/SuperDictateLLMHost`) links MoltenVK statically — the
+only runtime dependencies are Apple's system frameworks.
 
 GitHub Actions repeats the self-tests, builds the bundle, runs the installer
 on a clean macOS runner, and verifies uninstallation.

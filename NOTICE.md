@@ -9,22 +9,25 @@ SuperDictate includes substantial product, interface, service-management,
 history, statistics, and dictation-workflow modifications by the SuperDictate
 contributors.
 
-Speech recognition (NVIDIA Parakeet TDT 0.6B v3, GGUF q8_0) is performed
-locally through [parakeet.cpp](https://github.com/mudler/parakeet.cpp)
-(pinned commit `e747acdaee69b916cef62263ae5f718bda9ff3f3`), which is
-statically vendored into `swift/Sources/parakeet_cpp/upstream/` by
-`scripts/vendor-parakeet-cpp.sh` and distributed under the MIT License.
-parakeet.cpp itself vendors [ggml](https://github.com/ggml-org/ggml)
-(pinned submodule `e705c5fed490514458bdd2eaddc43bd098fcce9b`, tag
-`v0.13.0`), also MIT-licensed. Exact upstream license texts, captured at
-the pinned commits, are checked in at
-`swift/Sources/parakeet_cpp/upstream/LICENSE-parakeet-cpp.txt` and
-`swift/Sources/parakeet_cpp/upstream/LICENSE-ggml.txt`. Third-party Swift
-package licenses remain available through their respective upstream
-projects.
+Speech recognition runs locally through ONNX Runtime (see the ONNX ASR
+runtime section below). Pause detection uses the Silero VAD port from
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) over a CPU-only
+[ggml](https://github.com/ggml-org/ggml) core (commit
+`e705c5fed490514458bdd2eaddc43bd098fcce9b`, tag `v0.13.0`), vendored into
+`swift/Sources/silero_vad/` by `scripts/vendor-silero-vad.sh` and
+`scripts/vendor-ggml-core.sh`; all three are MIT-licensed, with the exact
+license texts in `swift/Sources/silero_vad/upstream/LICENSE-ggml.txt`,
+`swift/Sources/silero_vad/upstream-vad/LICENSE-whisper-cpp.txt` and
+`swift/Sources/silero_vad/upstream-vad/LICENSE-silero-vad.txt`. Text
+correction and rewrite run through
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), vendored into
+`swift/Sources/llama_cpp_host/` by `scripts/vendor-llama-cpp.sh` (license
+text in `swift/Sources/llama_cpp_host/upstream/LICENSE-llama-cpp.txt`).
+Third-party Swift package licenses remain available through their
+respective upstream projects.
 
 
-## ONNX ASR runtime (`native/asr-runtime/`, experimental)
+## ONNX ASR runtime (`native/asr-runtime/`)
 
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.23.2 (MIT),
   fetched as a pinned, hash-verified prebuilt by

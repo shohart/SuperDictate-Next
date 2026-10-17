@@ -1,5 +1,5 @@
 import Foundation
-import parakeet_cpp
+import silero_vad
 
 /// One probability value per Silero VAD analysis window, plus the window
 /// size (in samples) those probabilities were computed over -- the
@@ -42,8 +42,8 @@ protocol SpeechProbabilitySource {
 }
 
 /// Owns exactly one loaded Silero VAD native context (`SDSileroVadContext`,
-/// from the `parakeet_cpp` SwiftPM target's C bridge -- see
-/// swift/Sources/parakeet_cpp/include/superdictate_silero_vad.h). Mirrors
+/// from the `silero_vad` SwiftPM target's C bridge -- see
+/// swift/Sources/silero_vad/include/superdictate_silero_vad.h). Mirrors
 /// `ParakeetEngine`'s "load once, keep a live context" shape: the model is
 /// loaded exactly once in `init`, and every subsequent `speechProbabilities`
 /// call reuses that same context -- callers (namely `VadBoundaryOracle`,

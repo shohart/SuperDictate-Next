@@ -1,0 +1,4 @@
+module silero_vad {
+    header "silero_vad_module.h"
+    export *
+}

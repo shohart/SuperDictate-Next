@@ -377,14 +377,38 @@ sdlh_json make_error_json(const std::string & message) {
 
 } // namespace
 
+// `--list-devices`: print every GPU/IGPU device this host's own ggml
+// registry enumerates (one `DEVICE <name>\t<description>` line each) and
+// exit. The app uses it to decide whether "LLM on GPU (Vulkan)" can take
+// effect — asking the very Vulkan stack that will run the model, rather
+// than probing some other library's copy.
+static int list_gpu_devices() {
+    llama_backend_init();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        std::printf("DEVICE %s\t%s\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    }
+    std::fflush(stdout);
+    llama_backend_free();
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--list-devices") {
+        return list_gpu_devices();
+    }
     HostConfig cfg;
     std::string arg_error;
     if (!parse_args(argc, argv, cfg, arg_error)) {
         std::fprintf(stderr, "superdictate-llm-host: %s\n", arg_error.c_str());
         std::fprintf(stderr, "usage: superdictate-llm-host --model <path.gguf> --port <port> "
                              "[--host 127.0.0.1] [--ctx-size 4096] [--threads N] [--gpu-layers N] "
-                             "[--lora <path.gguf>] [--lora-scale N]\n");
+                             "[--lora <path.gguf>] [--lora-scale N]\n"
+                             "       superdictate-llm-host --list-devices\n");
         return 1;
     }
 

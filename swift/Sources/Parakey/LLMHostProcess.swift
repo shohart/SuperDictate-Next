@@ -171,7 +171,7 @@ actor LLMHostProcess {
 
     // MARK: - Helper binary resolution
 
-    private static func resolvedHelperBinaryURL() -> URL? {
+    static func resolvedHelperBinaryURL() -> URL? {
         let name = "SuperDictateLLMHost"
         // Packaged .app: scripts/build-app.sh copies the helper into
         // Contents/Helpers/ (NOT Contents/MacOS/ — it is not the app's
