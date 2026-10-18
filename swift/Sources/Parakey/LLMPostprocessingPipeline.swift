@@ -313,31 +313,48 @@ actor LLMPostprocessingCoordinator {
             : override
         let exampleTurns = LLMCorrectionPrompt.exampleTurns(vocabulary: settings.transcriptCorrections,
                                                             model: bundledModel)
-        // Correction output is roughly the same length as the input, never
-        // longer in any meaningful way -- a generous multiple of the raw
-        // UTF-8 byte count is a safe token-budget heuristic without needing
-        // a real tokenizer on the Swift side.
-        let maxTokens = min(2048, max(64, text.utf8.count))
-        let result = await OpenAICompatibleClient.chatCompletion(
-            baseURL: baseURL,
-            apiKey: apiKey,
-            model: model,
-            systemPrompt: systemPrompt,
-            exampleTurns: exampleTurns,
-            userText: text,
-            enableThinking: false,
-            temperature: 0,
-            maxTokens: maxTokens
-        )
-        switch result {
-        case .success(let corrected):
-            let sanitized = LLMCorrectionGuardrail.sanitizedCorrection(input: text, output: corrected)
-            log("LLM postprocessing: applied correction (\(text.count) → \(sanitized.count) chars)")
-            return sanitized
-        case .failure(let error):
-            log("LLM postprocessing: correction request failed (\(error)); passing text through unchanged")
-            return text
+        // One request per sentence-bounded chunk (see
+        // LLMCorrectionGuardrail.correctionChunks): a long dictation in one
+        // request is where the model loses or replaces text, and the
+        // guardrail then reverts each chunk on its own.
+        let chunks = LLMCorrectionGuardrail.correctionChunks(text)
+        var correctedChunks: [String] = []
+        var keptOriginal = 0
+        for (index, chunk) in chunks.enumerated() {
+            // Correction output is roughly the same length as the input,
+            // never longer in any meaningful way -- a generous multiple of
+            // the raw UTF-8 byte count is a safe token-budget heuristic
+            // without needing a real tokenizer on the Swift side.
+            let maxTokens = min(2048, max(64, chunk.utf8.count))
+            let result = await OpenAICompatibleClient.chatCompletion(
+                baseURL: baseURL,
+                apiKey: apiKey,
+                model: model,
+                systemPrompt: systemPrompt,
+                exampleTurns: exampleTurns,
+                userText: chunk,
+                enableThinking: false,
+                temperature: 0,
+                maxTokens: maxTokens
+            )
+            switch result {
+            case .success(let corrected):
+                let sanitized = LLMCorrectionGuardrail.sanitizedCorrection(input: chunk, output: corrected)
+                if sanitized == chunk { keptOriginal += 1 }
+                correctedChunks.append(sanitized)
+            case .failure(let error):
+                // A failed request (host down, timeout) would fail the same
+                // way for every remaining chunk; don't wait it out N times.
+                log("LLM postprocessing: correction request failed (\(error)); passing the remaining \(chunks.count - index) chunk(s) through unchanged")
+                keptOriginal += chunks.count - index
+                correctedChunks.append(contentsOf: chunks[index...])
+            }
+            if correctedChunks.count == chunks.count { break }
         }
+        guard !correctedChunks.isEmpty else { return text }
+        let corrected = correctedChunks.joined(separator: " ")
+        log("LLM postprocessing: applied correction (\(text.count) → \(corrected.count) chars, \(chunks.count) chunk(s), \(keptOriginal) unchanged)")
+        return corrected
     }
 
     // MARK: - Rewrite stage

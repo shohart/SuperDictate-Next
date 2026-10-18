@@ -3093,6 +3093,48 @@ enum ParakeySelfTest {
             input: "текст",
             output: "   "), equals: "текст",
                    "whitespace-only output must fall back to the input")
+
+        // Word-count preservation: the long-dictation failure modes.
+        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
+            input: "залей изменения на гит хаб через пул реквест",
+            output: "Залей изменения на GitHub через pull request"), equals: true,
+                   "term merges (гит хаб → GitHub) must pass")
+        let longInput = (1...40).map { "слово\($0)" }.joined(separator: " ")
+        let truncated = (1...30).map { "слово\($0)" }.joined(separator: " ")
+        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
+            input: longInput, output: truncated), equals: false,
+                   "a dropped tail (40 → 30 words) must be rejected")
+        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
+            input: longInput, output: truncated), equals: longInput,
+                   "guardrail must revert to the input when words are lost")
+        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
+            input: "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем",
+            output: "Сегодня. Сочини рассказ про кота"), equals:
+                "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем",
+                   "a few-shot echo instead of the text must be rejected")
+        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
+            input: truncated, output: longInput), equals: false,
+                   "added words (30 → 40) must be rejected")
+
+        // Chunking for one correction request per piece.
+        try expect(LLMCorrectionGuardrail.correctionChunks("  короткий текст. "), equals: ["короткий текст."],
+                   "short text must stay one chunk")
+        try expect(LLMCorrectionGuardrail.correctionChunks("   "), equals: [],
+                   "blank text must give no chunks")
+        let sentences = (1...60).map { "Это предложение номер \($0)." }
+        let longText = sentences.joined(separator: " ")
+        let chunks = LLMCorrectionGuardrail.correctionChunks(longText, maxCharacters: 200)
+        try expect(chunks.count > 1, equals: true, "long text must be split")
+        try expect(chunks.allSatisfy { $0.count <= 200 }, equals: true, "every chunk must fit the limit")
+        try expect(chunks.allSatisfy { $0.hasSuffix(".") }, equals: true,
+                   "chunks must end on a sentence boundary")
+        try expect(chunks.joined(separator: " "), equals: longText, "chunks must rejoin to the input")
+        let runOn = (1...100).map { "слово\($0)" }.joined(separator: " ")
+        let runOnChunks = LLMCorrectionGuardrail.correctionChunks(runOn, maxCharacters: 120)
+        try expect(runOnChunks.allSatisfy { $0.count <= 120 }, equals: true,
+                   "an over-long sentence must be cut to the limit")
+        try expect(runOnChunks.joined(separator: " "), equals: runOn,
+                   "a cut sentence must rejoin to the input")
     }
 
     /// Full pipeline through a REAL downloaded GEC model and a REAL

@@ -33,11 +33,31 @@ enum LLMCorrectionGuardrail {
     static func sanitizedCorrection(input: String, output: String) -> String {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return input }
-        if correctionPreservesLeadingWord(input: input, output: trimmed) {
-            return trimmed
+        guard correctionPreservesLeadingWord(input: input, output: trimmed) else {
+            log("LLM postprocessing: guardrail rejected correction (leading word lost); keeping original text")
+            return input
         }
-        log("LLM postprocessing: guardrail rejected correction (leading word lost); keeping original text")
-        return input
+        guard correctionPreservesWordCount(input: input, output: trimmed) else {
+            log("LLM postprocessing: guardrail rejected correction (word count \(normalizedWords(input).count) → \(normalizedWords(trimmed).count)); keeping original text")
+            return input
+        }
+        return trimmed
+    }
+
+    /// True when `output` has roughly as many words as `input`: within
+    /// `max(2, 10 %)` either way. The correction prompt forbids adding or
+    /// removing words, so a larger drift is never a legitimate edit — it is
+    /// the model's long-input failure: silently dropping a tail or a middle
+    /// (an observed 70 s dictation came back 825 → 663 chars), echoing a
+    /// few-shot answer («Сочини рассказ про кота») or a fragment of its own
+    /// input instead of the whole text. The floor of 2 words absorbs
+    /// legitimate term merges («гит хаб» → «GitHub», «пул реквест» →
+    /// «pull request») on short inputs.
+    static func correctionPreservesWordCount(input: String, output: String) -> Bool {
+        let inputCount = normalizedWords(input).count
+        let outputCount = normalizedWords(output).count
+        let tolerance = max(2, inputCount / 10)
+        return abs(outputCount - inputCount) <= tolerance
     }
 
     /// True when the first significant word of `input` survives at the
@@ -102,6 +122,60 @@ enum LLMCorrectionGuardrail {
             }
         }
         return false
+    }
+
+    /// Splits a dictation into sentence-bounded pieces of at most
+    /// `maxCharacters` each, for one correction request per piece. The
+    /// corrector adapter was trained on short utterances; on long inputs it
+    /// fails far more often (measured on a 4-minute dictation: 0 rejected
+    /// pieces at 500 chars vs whole-text garbage at 1500), and a failed
+    /// piece falls back to its own raw text instead of the whole
+    /// dictation's. A single sentence longer than the limit is cut at the
+    /// last space before it. Joining the pieces with " " restores the text
+    /// up to whitespace runs.
+    static func correctionChunks(_ text: String, maxCharacters: Int = 500) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > maxCharacters else { return trimmed.isEmpty ? [] : [trimmed] }
+
+        var sentences: [String] = []
+        var sentence = ""
+        var previous: Character?
+        for character in trimmed {
+            if character.isWhitespace, let previous, ".!?…".contains(previous) {
+                sentences.append(sentence)
+                sentence = ""
+            } else if !(character.isWhitespace && sentence.isEmpty) {
+                sentence.append(character)
+            }
+            previous = character
+        }
+        if !sentence.isEmpty { sentences.append(sentence) }
+
+        var chunks: [String] = []
+        var current = ""
+        func flush() {
+            if !current.isEmpty { chunks.append(current) }
+            current = ""
+        }
+        for var piece in sentences {
+            while piece.count > maxCharacters {
+                flush()
+                let limit = piece.index(piece.startIndex, offsetBy: maxCharacters)
+                let cut = piece[..<limit].lastIndex(where: { $0.isWhitespace }) ?? limit
+                chunks.append(String(piece[..<cut]).trimmingCharacters(in: .whitespaces))
+                piece = String(piece[cut...]).trimmingCharacters(in: .whitespaces)
+            }
+            if current.isEmpty {
+                current = piece
+            } else if current.count + 1 + piece.count <= maxCharacters {
+                current += " " + piece
+            } else {
+                flush()
+                current = piece
+            }
+        }
+        flush()
+        return chunks.filter { !$0.isEmpty }
     }
 
     // MARK: - Internals
