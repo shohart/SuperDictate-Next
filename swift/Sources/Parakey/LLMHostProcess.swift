@@ -51,6 +51,10 @@ enum LLMHostProcessError: Error, Equatable, Sendable {
 actor LLMHostProcess {
     private var process: Process?
     private(set) var port: Int = 0
+    /// A launch still waiting for /health. A second `start` (the startup
+    /// pre-warm racing the first dictation) awaits this instead of seeing
+    /// `isRunning` and talking to a host that is not listening yet.
+    private var pendingStart: Task<Result<Void, LLMHostProcessError>, Never>?
     let host = "127.0.0.1"
 
     var isRunning: Bool { process?.isRunning ?? false }
@@ -90,10 +94,30 @@ actor LLMHostProcess {
                useGPU: Bool = false,
                chatTemplateFile: String? = nil,
                healthCheckTimeout: TimeInterval = 60) async -> Result<Void, LLMHostProcessError> {
+        if let pendingStart {
+            return await pendingStart.value
+        }
         if isRunning {
             return .success(())
         }
+        let launch = Task {
+            await self.launch(modelPath: modelPath, loraPath: loraPath, loraScale: loraScale, ctxSize: ctxSize,
+                              useGPU: useGPU, chatTemplateFile: chatTemplateFile,
+                              healthCheckTimeout: healthCheckTimeout)
+        }
+        pendingStart = launch
+        let result = await launch.value
+        pendingStart = nil
+        return result
+    }
 
+    private func launch(modelPath: String,
+                        loraPath: String,
+                        loraScale: Double,
+                        ctxSize: Int32,
+                        useGPU: Bool,
+                        chatTemplateFile: String?,
+                        healthCheckTimeout: TimeInterval) async -> Result<Void, LLMHostProcessError> {
         guard let binaryURL = Self.resolvedHelperBinaryURL(),
               FileManager.default.isExecutableFile(atPath: binaryURL.path) else {
             return .failure(.helperBinaryNotFound)

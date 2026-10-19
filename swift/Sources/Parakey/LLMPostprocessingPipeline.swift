@@ -158,6 +158,51 @@ actor LLMPostprocessingCoordinator {
         }
     }
 
+    /// Starts, ahead of any dictation, the bundled hosts the enabled stages
+    /// use, so a model stays resident from agent launch (or a live settings
+    /// save) until its stage is switched off or the model is changed —
+    /// never loaded on the first dictation. Each fresh host also gets one
+    /// tiny request so the first real correction does not pay for the GPU
+    /// warm-up. Silent and best-effort: a failure here just leaves the
+    /// lazy start in `finalizedText` to try again.
+    func prewarmNeededHosts(settings: Settings) async {
+        await unloadHostsNoLongerNeeded(settings: settings)
+        var models: [(identity: String, model: BundledLLMModel)] = []
+        if settings.textPostprocessingMode == .correction, settings.llmEngineBackend == .bundledLocal {
+            let model = settings.correctionBundledModel
+            models.append((Self.correctionHostIdentity(model: model), model))
+        }
+        if settings.rewriteEnabled, settings.rewriteEngineBackend == .bundledLocal {
+            let model = settings.rewriteBundledModel
+            let identity = Self.rewriteHostIdentity(model: model)
+            if !models.contains(where: { $0.identity == identity }) {
+                models.append((identity, model))
+            }
+        }
+        for (identity, model) in models where bundledLLMModelExists(model) {
+            let hostProcess = hostProcess(forIdentity: identity)
+            guard !(await hostProcess.isRunning) else { continue }
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let startResult = await hostProcess.start(modelPath: bundledLLMModelPath(model).path,
+                                                      loraPath: bundledLLMLoraPath(model),
+                                                      loraScale: bundledLLMLoraScale(model),
+                                                      ctxSize: model.hostContextSize,
+                                                      useGPU: settings.llmUseGPU,
+                                                      chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
+            guard case .success = startResult, let baseURL = await hostProcess.baseURL else {
+                log("LLM postprocessing: pre-warm of \(model.displayName) failed (\(startResult)); will retry on first use")
+                continue
+            }
+            _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
+                                                            apiKey: nil,
+                                                            model: "warmup-\(model.rawValue)",
+                                                            systemPrompt: "",
+                                                            userText: "Привет.",
+                                                            maxTokens: 4)
+            log("LLM postprocessing: pre-warmed \(model.displayName) in \(String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startedAt)) s")
+        }
+    }
+
     /// Test-only hooks: register a never-started host under `identity`, and
     /// list the identities currently held.
     func registerIdleHostForTest(identity: String) {

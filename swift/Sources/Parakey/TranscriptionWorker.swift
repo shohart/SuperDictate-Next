@@ -122,20 +122,36 @@ actor TranscriptionWorker {
     }
     #endif
 
-    /// Default thread policy from docs/parakeet-intel-backend.md §10:
-    /// `max(2, min(8, activeProcessorCount / 2))`, with an optional
-    /// `SUPERDICTATE_ASR_THREADS` diagnostic override validated to `1...32`.
-    /// An out-of-range or non-numeric override is ignored (falls back to the
-    /// computed default) rather than crashing a debug/test run.
+    /// Default thread policy: every physical core but two (left for audio
+    /// capture and the UI), clamped to `2...16`. ONNX encoder throughput
+    /// keeps improving up to the physical core count (GigaAM v3, 4 min RU,
+    /// Xeon E5-2696 v3 with 18 cores: 8 threads 18.9 s, 12 → 16.1 s,
+    /// 16 → 14.7 s, 18 → 13.6 s) and nothing else needs the CPU while a
+    /// dictation is transcribed — the LLM runs on the GPU. Hyper-threads
+    /// do not help a matmul-bound encoder, hence physical cores. An
+    /// optional `SUPERDICTATE_ASR_THREADS` diagnostic override is
+    /// validated to `1...32`; an out-of-range or non-numeric override is
+    /// ignored (falls back to the computed default) rather than crashing a
+    /// debug/test run.
     static func resolvedASRThreadCount(
-        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
+        physicalCoreCount: Int = physicalCPUCoreCount(),
         environmentOverride: String? = ProcessInfo.processInfo.environment["SUPERDICTATE_ASR_THREADS"]
     ) -> Int {
-        let defaultCount = max(2, min(8, activeProcessorCount / 2))
+        let defaultCount = max(2, min(16, physicalCoreCount - 2))
         guard let environmentOverride, let parsed = Int(environmentOverride), (1...32).contains(parsed) else {
             return defaultCount
         }
         return parsed
+    }
+
+    /// `hw.physicalcpu`; half the logical count if sysctl fails.
+    static func physicalCPUCoreCount() -> Int {
+        var count: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.physicalcpu", &count, &size, nil, 0) == 0, count > 0 {
+            return Int(count)
+        }
+        return max(1, ProcessInfo.processInfo.activeProcessorCount / 2)
     }
 
     func load(profile requestedProfile: SpeechModelProfile,

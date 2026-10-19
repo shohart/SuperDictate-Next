@@ -176,6 +176,8 @@ enum ParakeySelfTest {
             return runSuite("disabled-custom-filler-words", testDisabledCustomFillerWords)
         case "recording-hud-accent-color-resolved":
             return runSuite("recording-hud-accent-color-resolved", testRecordingHUDAccentColorResolvedColor)
+        case "asr-thread-policy":
+            return runSuite("asr-thread-policy", testASRThreadPolicy)
         case "llm-unload-delay":
             return runSuite("llm-unload-delay", testLLMPostprocessingDelayedUnload)
         case "llm-guardrail":
@@ -5777,43 +5779,50 @@ enum ParakeySelfTest {
     // MARK: - ASR thread policy
 
     private static func testASRThreadPolicy() throws {
-        // Thread-count policy (spec §10): max(2, min(8, active/2)), with a
+        // Thread-count policy: max(2, min(16, physical - 2)), with a
         // validated SUPERDICTATE_ASR_THREADS override (1...32).
         try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 4, environmentOverride: nil),
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 2, environmentOverride: nil),
             equals: 2,
-            "4 active processors should floor to the minimum of 2 threads"
+            "2 physical cores should floor to the minimum of 2 threads"
         )
         try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 32, environmentOverride: nil),
-            equals: 8,
-            "a high processor count should cap at the maximum of 8 threads"
-        )
-        try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: nil),
-            equals: 4,
-            "8 active processors should use half (4) within the 2...8 band"
-        )
-        try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "6"),
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 8, environmentOverride: nil),
             equals: 6,
+            "8 physical cores should leave two cores free (6 threads)"
+        )
+        try expect(
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 18, environmentOverride: nil),
+            equals: 16,
+            "18 physical cores should use 16 threads"
+        )
+        try expect(
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 44, environmentOverride: nil),
+            equals: 16,
+            "a high core count should cap at the maximum of 16 threads"
+        )
+        try expect(
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 8, environmentOverride: "4"),
+            equals: 4,
             "a valid SUPERDICTATE_ASR_THREADS override should take precedence over the default policy"
         )
         try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "0"),
-            equals: 4,
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 8, environmentOverride: "0"),
+            equals: 6,
             "an out-of-range (below 1) override should be ignored, falling back to the default"
         )
         try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "64"),
-            equals: 4,
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 8, environmentOverride: "64"),
+            equals: 6,
             "an out-of-range (above 32) override should be ignored, falling back to the default"
         )
         try expect(
-            TranscriptionWorker.resolvedASRThreadCount(activeProcessorCount: 8, environmentOverride: "not-a-number"),
-            equals: 4,
+            TranscriptionWorker.resolvedASRThreadCount(physicalCoreCount: 8, environmentOverride: "not-a-number"),
+            equals: 6,
             "a non-numeric override should be ignored, falling back to the default"
         )
+        try expect(TranscriptionWorker.physicalCPUCoreCount() >= 1, equals: true,
+                   "hw.physicalcpu should report at least one core")
     }
 
     /// NULL-argument / invalid-path coverage for the `sd_silero_vad_*` C

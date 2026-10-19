@@ -503,11 +503,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// The settings window saved LLM choices that apply without a restart:
-    /// free the VRAM of hosts the new choices no longer use right away.
+    /// free the VRAM of hosts the new choices no longer use right away and
+    /// load the ones they now need.
     @objc private func settingsDidChangeLive(_ notification: Notification) {
         settings.refreshFromDisk()
         Task { [llmPostprocessing, settings] in
-            await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
+            await llmPostprocessing.prewarmNeededHosts(settings: settings)
         }
     }
 
@@ -707,6 +708,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 fallbackSpeechModelProfileAfterStartupFailure = nil
                 isSpeechModelReady = true
                 speechModelStartupProgressFraction = nil
+
+                // Keep the LLM resident from launch instead of loading it on
+                // the first dictation; it runs on the GPU, alongside startup.
+                Task { [llmPostprocessing, settings] in
+                    await llmPostprocessing.prewarmNeededHosts(settings: settings)
+                }
 
                 await recoverPendingDictationsAfterStartup()
                 guard !Task.isCancelled, !isTerminating else { return }
@@ -3055,10 +3062,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 Sounds.playDone()
             }
         }
-        if next != .correction {
-            Task { [llmPostprocessing, settings] in
-                await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
-            }
+        // Off: free the host now. On: load it before the next dictation.
+        Task { [llmPostprocessing, settings] in
+            await llmPostprocessing.prewarmNeededHosts(settings: settings)
         }
     }
 
@@ -3085,10 +3091,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if settings.playFeedbackSounds {
             if next { Sounds.playStart() } else { Sounds.playDone() }
         }
-        if !next {
-            Task { [llmPostprocessing, settings] in
-                await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
-            }
+        // Off: free the host now. On: load it before the next dictation.
+        Task { [llmPostprocessing, settings] in
+            await llmPostprocessing.prewarmNeededHosts(settings: settings)
         }
     }
 
@@ -6244,12 +6249,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             // The bundled LLM host, if already running, was launched with the
             // OLD --gpu-layers value baked into its process arguments
-            // (LLMHostProcess has no live-reconfigure path). Stop it so the
-            // next correction/rewrite request lazily respawns it with the new
-            // llmUseGPU value. ASR is untouched — it has its own toggle.
+            // (LLMHostProcess has no live-reconfigure path). Stop it and
+            // start it again with the new llmUseGPU value. ASR is untouched
+            // — it has its own toggle.
             await self.llmPostprocessing.stop()
             log("LLM: stopped bundled host after LLM-GPU setting change (llmUseGPU=\(self.settings.llmUseGPU))")
             self.rebuildMenu()
+            await self.llmPostprocessing.prewarmNeededHosts(settings: self.settings)
         }
         rebuildMenu()
     }
