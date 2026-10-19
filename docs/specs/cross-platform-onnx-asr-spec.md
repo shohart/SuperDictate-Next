@@ -143,7 +143,7 @@ SuperDictateOnnxHost  ------------>  libsd_asr (C++17, C ABI sd_asr.h)
                                        |-- ORT env/session factory, providers
                                        |-- audio canonicalization
                                        |-- families/nemo_tdt   (P0: Parakeet Ultra)
-                                       |-- families/ctc        (later: GigaAM v3)
+                                       |-- families/gigaam_rnnt (P1: GigaAM v3 e2e RNN-T)
                                        `-- ONNX Runtime 1.23.2 C/C++ API
 ```
 
@@ -264,9 +264,13 @@ Families, incrementally:
 - **P0 — Parakeet Ultra int8 (TDT)**, exact parity with the Python
   reference, sanity versus sherpa-onnx, quality comparison versus GGUF
   parakeet-tdt-0.6b-v3 q8_0 on the RU corpus before it may become default.
-- **P1 — GigaAM v3 e2e CTC** (`istupakov/gigaam-v3-onnx`, MIT;
-  `gigaam_v3.onnx` preprocessor; the CTC join regex is Unicode-word-aware
-  and must be hand-implemented, not ported to `std::regex`).
+- **P1 — GigaAM v3 e2e RNN-T** — implemented 2026-10-19 (family
+  `gigaam_rnnt`, catalog `gigaam-v3-e2e-rnnt-int8`, `istupakov/gigaam-v3-onnx`,
+  MIT; bundled `gigaam_v3.onnx` preprocessor; greedy RNN-T as onnx-asr
+  0.12.0, ≤ 3 symbols per frame; the Unicode-word-aware space rule is
+  hand-implemented, not `std::regex`). Chosen over e2e CTC (originally
+  planned) on measurement — see §12. Plan:
+  `docs/superpowers/plans/2026-10-19-gigaam-v3-onnx.md`.
 - **P2 — cache-aware streaming RNN-T** as a separate API extension.
 
 ## 6. Platform provider policy
@@ -503,6 +507,24 @@ GGUF Parakeet and whisper.cpp are removed (revision 3 above). Raw results:
 `dist/bench-safe/run2-*` and `run3-whisper-vulkan` on the Intel Mac (not
 committed).
 
+**GigaAM v3 (2026-10-19, P1).** Real dictations through Parakeet Ultra
+showed Russian word-form errors the LLM corrector cannot repair. 4-min RU
+TTS (`ref.txt`), onnx-asr 0.12.0, CPU, int8, 8 threads on the Intel Mac:
+
+| Model | WER | 4 min audio, s |
+|---|---:|---:|
+| Parakeet Ultra (app, segmented) | 0.075 | 30 |
+| GigaAM v3 e2e RNN-T | **0.015** | 18 |
+| GigaAM v3 e2e CTC | 0.025 | 17 |
+
+e2e = punctuation, capitalization, ё and digits. The native `gigaam_rnnt`
+family matches `tools/reference_gigaam.py` (itself cross-checked against
+onnx-asr) **exactly** (text and token ids/frames). Swift: profile
+`gigaam_v3_onnx` («GigaAM v3 (ONNX, русский)») in Settings next to the
+default `parakeet_ultra_onnx`; each profile downloads into its own
+`onnx/<model_id>/` cache, only the selected model is loaded;
+`--benchmark-transcribe gigaam cpu <threads> <wav...>`.
+
 ## 13. Waves
 
 | Wave | Content | Verifiable where |
@@ -514,7 +536,7 @@ committed).
 | W4 | Swift: catalog + multi-file downloader, `OnnxAsrEngine`, new `SpeechModelProfile.parakeetUltraOnnx` (every `==` site handled), TranscriptionWorker wiring, diagnostics | Intel Mac only |
 | W5 | Packaging: `build-app.sh` builds host via CMake, embeds dylib, signs, `otool` check; CI job | Intel Mac / CI |
 | W6 | Quality & perf gates vs GGUF; optional CoreML/DirectML behind flags | Intel Mac, Windows |
-| W7 | GigaAM v3 CTC family; consolidation of selectors/diagnostics | all |
+| W7 | GigaAM v3 e2e RNN-T family (`gigaam_rnnt`) + Settings profile — done 2026-10-19; consolidation of selectors/diagnostics | all |
 
 ## 14. Non-goals
 
