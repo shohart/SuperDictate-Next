@@ -122,7 +122,13 @@ actor LLMHostProcess {
         proc.standardError = errorPipe
         errorPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            // EOF: the host exited. Left installed, the handler fires on
+            // the closed pipe forever and pins a core at 100 %.
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let text = String(data: data, encoding: .utf8) else { return }
             for line in text.split(separator: "\n") {
                 log("SuperDictateLLMHost: \(line)")
             }
