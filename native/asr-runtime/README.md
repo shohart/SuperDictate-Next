@@ -81,12 +81,16 @@ native/asr-runtime/build/sd_asr_cli --model "$MODEL" --assets native/asr-runtime
 `build-test-app.sh`) builds the host in `build-bundle/` with
 `CMAKE_BUILD_WITH_INSTALL_RPATH=ON` and stages `Contents/Helpers/SuperDictateOnnxHost`,
 `Contents/Frameworks/libonnxruntime.1.23.2.dylib` and
-`Contents/Resources/onnx-asr/` (catalog, `nemo128.onnx`, ORT notices). The Swift
-side is `OnnxAsrEngine.swift` / `OnnxModelDownload.swift`; the speech profile
-`parakeet_ultra_onnx` is experimental and CPU-only. Diagnostics without
+`Contents/Resources/onnx-asr/` (catalog, `nemo128.onnx`, `gigaam_v3.onnx`, ORT and
+onnx-asr licences). The Swift side is `OnnxAsrEngine.swift` / `OnnxModelDownload.swift`;
+the speech profiles `parakeet_ultra_onnx` (default) and `gigaam_v3_onnx` (Russian)
+are CPU-only. Diagnostics without
 launching the app:
 
 ```sh
 SuperDictate --benchmark-transcribe onnx cpu 8 file.wav... # packaged or swift build binary
+SuperDictate --benchmark-transcribe gigaam cpu 8 file.wav... # same, GigaAM v3
 SUPERDICTATE_ONNX_TEST_WAV=file.wav Parakey --self-test onnx-asr-real   # debug build
+SUPERDICTATE_ONNX_TEST_PROFILE=gigaam_v3_onnx SUPERDICTATE_ONNX_TEST_MODEL_DIR=<installed dir> \
+  SUPERDICTATE_ONNX_TEST_WAV=file.wav Parakey --self-test onnx-asr-real   # any installed model dir
 ```

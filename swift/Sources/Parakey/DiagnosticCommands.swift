@@ -98,8 +98,11 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// same segmentation a recorded dictation goes through, with each engine's
 /// helper resolved from Contents/Helpers) — never a mock.
 ///
-/// usage: SuperDictate --benchmark-transcribe [onnx] cpu <threads> <wav1> [wav2 ...]
+/// usage: SuperDictate --benchmark-transcribe [onnx|gigaam] cpu <threads> <wav1> [wav2 ...]
 ///
+/// `onnx` (or no backend word) = Parakeet Ultra, as before; `gigaam` =
+/// GigaAM v3 e2e RNN-T. Either model is downloaded into the app cache if
+/// missing, exactly like the agent does.
 /// Speech recognition is ONNX on the CPU only; the retired `whisper` and
 /// `parakeet` (GGUF) backends and `vulkan` are rejected with a message.
 /// Loads the model once (device/threads as given), warms up, then
@@ -112,13 +115,17 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// a message on stderr for any failure.
 func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     guard arguments.first == "--benchmark-transcribe" else { return nil }
-    let usage = "usage: SuperDictate --benchmark-transcribe [onnx] cpu <threads> <wav1> [wav2 ...]\n"
+    let usage = "usage: SuperDictate --benchmark-transcribe [onnx|gigaam] cpu <threads> <wav1> [wav2 ...]\n"
     var rest = Array(arguments.dropFirst())
     if let first = rest.first, first == "whisper" || first == "parakeet" {
         fputs("benchmark: the \(first) backend was removed; speech recognition is ONNX on the CPU only\n", stderr)
         return EXIT_FAILURE
     }
+    var profile = SpeechModelProfile.parakeetUltraOnnx
     if rest.first == "onnx" {
+        rest.removeFirst()
+    } else if rest.first == "gigaam" {
+        profile = .gigaamV3Onnx
         rest.removeFirst()
     }
     if rest.first == "vulkan" {
@@ -143,7 +150,7 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     Task.detached {
         defer { semaphore.signal() }
         do {
-            try await runSegmentedBenchmark(threads: threads, wavPaths: wavPaths)
+            try await runSegmentedBenchmark(profile: profile, threads: threads, wavPaths: wavPaths)
             exitCode.set(EXIT_SUCCESS)
         } catch {
             fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
@@ -171,8 +178,7 @@ private func benchmarkEscapedText(_ text: String) -> String {
 /// exactly as a recorded dictation. Never a raw whole-file engine call: the
 /// app never hands the engine a long unsegmented clip, and the benchmark
 /// must not either.
-private func runSegmentedBenchmark(threads: Int, wavPaths: [String]) async throws {
-    let profile = SpeechModelProfile.productionDefault
+private func runSegmentedBenchmark(profile: SpeechModelProfile, threads: Int, wavPaths: [String]) async throws {
     // The worker reads its thread count from this override (1...32).
     setenv("SUPERDICTATE_ASR_THREADS", String(threads), 1)
     let worker = TranscriptionWorker()
@@ -193,7 +199,7 @@ private func runSegmentedBenchmark(threads: Int, wavPaths: [String]) async throw
     let deviceArg = "cpu"
     let actualDevice = "cpu"
 
-    print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented")
+    print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented model=\(profile.onnxModelID)")
 
     for path in wavPaths {
         let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))

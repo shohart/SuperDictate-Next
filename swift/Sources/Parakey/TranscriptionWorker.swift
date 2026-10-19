@@ -105,9 +105,22 @@ actor TranscriptionWorker {
     private var engine: OnnxAsrEngine?
     private(set) var loadedProfile: SpeechModelProfile?
     private(set) var ready = false
+    /// model_id reported by the ONNX host for the loaded engine.
+    var loadedModelID: String? {
+        get async { await engine?.modelID }
+    }
     /// Reentrancy backstop — see the comment above. True for the full
     /// duration of transcribe(), including across its await.
     private var inFlight = false
+    #if DEBUG
+    /// Self-test hook (`onnx-asr-real`): load this already-installed model
+    /// directory instead of the profile's app cache. Never set in the app.
+    private var modelDirectoryOverride: URL?
+
+    init(modelDirectoryOverride: URL? = nil) {
+        self.modelDirectoryOverride = modelDirectoryOverride
+    }
+    #endif
 
     /// Default thread policy from docs/parakeet-intel-backend.md §10:
     /// `max(2, min(8, activeProcessorCount / 2))`, with an optional
@@ -140,13 +153,13 @@ actor TranscriptionWorker {
             await unload()
         }
 
-        if speechModelCacheExists(for: profile) {
+        if modelDirectoryOverrideForLoad != nil || speechModelCacheExists(for: profile) {
             log("ASR: verifying + loading cached \(profile.shortName) weights…")
         } else {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        let loaded = try await loadOnnxEngine(progressHandler: progressHandler)
+        let loaded = try await loadOnnxEngine(profile: profile, progressHandler: progressHandler)
         engine = loaded
         loadedProfile = profile
         ready = true
@@ -168,11 +181,28 @@ actor TranscriptionWorker {
         }
     }
 
-    private func loadOnnxEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> OnnxAsrEngine {
-        let modelDirectory = try await downloadOnnxModelIfNeeded(progressHandler: progressHandler)
+    private var modelDirectoryOverrideForLoad: URL? {
+        #if DEBUG
+        return modelDirectoryOverride
+        #else
+        return nil
+        #endif
+    }
+
+    /// Only the selected profile's model is downloaded and loaded; the other
+    /// profile's cache, if any, stays on disk untouched for a later switch.
+    private func loadOnnxEngine(profile: SpeechModelProfile,
+                                progressHandler: SpeechModelDownloadProgressHandler?) async throws -> OnnxAsrEngine {
+        let modelDirectory: URL
+        if let override = modelDirectoryOverrideForLoad {
+            modelDirectory = override
+        } else {
+            modelDirectory = try await downloadOnnxModelIfNeeded(profile: profile, progressHandler: progressHandler)
+        }
         let threadCount = Self.resolvedASRThreadCount()
         log("ASR threads: \(threadCount)")
-        let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threadCount)
+        let engine = try await OnnxAsrEngine.launch(modelDirectory: modelDirectory, threadCount: threadCount,
+                                                    expectedModelID: profile.onnxModelID)
         log("ASR ONNX model load: \(String(format: "%.2f", await engine.loadSeconds)) s")
         let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
         _ = try await engine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
@@ -183,10 +213,10 @@ actor TranscriptionWorker {
     /// The ONNX helper is killed on a hard timeout or dies on a crash; the
     /// next request gets a fresh one (spec §8) instead of a dead engine.
     private func liveEngine() async throws -> OnnxAsrEngine {
-        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard let engine, let loadedProfile else { throw NSError(domain: "Parakey", code: -2) }
         if await engine.isAlive { return engine }
         log("ASR: ONNX helper is gone — relaunching")
-        let fresh = try await loadOnnxEngine(progressHandler: nil)
+        let fresh = try await loadOnnxEngine(profile: loadedProfile, progressHandler: nil)
         self.engine = fresh
         return fresh
     }

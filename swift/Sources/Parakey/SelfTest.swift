@@ -8659,7 +8659,7 @@ enum ParakeySelfTest {
         guard let resources = resolvedOnnxAsrResources() else {
             throw SelfTestFailure.failed("ONNX ASR resources not found (bundle or source tree)")
         }
-        let entry = try loadOnnxCatalogEntry(catalogURL: resources.catalogURL)
+        let entry = try loadOnnxCatalogEntry(modelID: PARAKEET_ULTRA_ONNX_MODEL_ID, catalogURL: resources.catalogURL)
         try expect(entry.modelID, equals: PARAKEET_ULTRA_ONNX_MODEL_ID, "catalog model id")
         try expect(entry.files.map(\.role), equals: ["decoder", "encoder", "joiner", "tokens"],
                    "downloadable roles (bundled preprocessor excluded)")
@@ -8684,13 +8684,41 @@ enum ParakeySelfTest {
         }
         try expect(isSafeOnnxModelFileName("encoder.int8.onnx"), equals: true, "plain file name")
 
+        let giga = try loadOnnxCatalogEntry(modelID: GIGAAM_V3_ONNX_MODEL_ID, catalogURL: resources.catalogURL)
+        try expect(giga.files.map(\.role), equals: ["decoder", "encoder", "joiner", "tokens"],
+                   "GigaAM downloadable roles (bundled preprocessor excluded)")
+        try expect(giga.totalBytes, equals: GIGAAM_V3_ONNX_SIZE_BYTES, "GigaAM catalog byte total matches the UI constant")
+        try expect(giga.files.allSatisfy { $0.url.host == "huggingface.co" && $0.url.absoluteString.contains(giga.revision) },
+                   equals: true, "every GigaAM URL is pinned to the catalog revision")
+        let gigaManifestData = try onnxManifestData(for: giga)
+        guard let gigaManifest = try JSONSerialization.jsonObject(with: gigaManifestData) as? [String: Any],
+              let gigaFiles = gigaManifest["files"] as? [String: [String: Any]] else {
+            throw SelfTestFailure.failed("GigaAM manifest is not a JSON object with files")
+        }
+        try expect(gigaManifest["family"] as? String, equals: "gigaam_rnnt", "GigaAM manifest family")
+        try expect(gigaFiles["preprocessor"]?["bundled"] as? String, equals: "gigaam_v3.onnx", "GigaAM bundled preprocessor")
+        try expect(FileManager.default.fileExists(
+                       atPath: resources.assetsDirectory.appendingPathComponent("gigaam_v3.onnx").path),
+                   equals: true, "gigaam_v3.onnx is shipped next to nemo128.onnx")
+
         try expect(productionSpeechModelProfile(rawValue: "parakeet_ultra_onnx"), equals: .parakeetUltraOnnx,
                    "ONNX profile persists")
-        try expect(SpeechModelProfile.productionDefault, equals: .parakeetUltraOnnx, "ONNX is the only speech engine")
-        try expect(SpeechModelProfile.allCases, equals: [.parakeetUltraOnnx], "no GGUF or Whisper profile remains")
+        try expect(productionSpeechModelProfile(rawValue: "gigaam_v3_onnx"), equals: .gigaamV3Onnx,
+                   "GigaAM profile persists")
+        try expect(SpeechModelProfile.productionDefault, equals: .parakeetUltraOnnx, "Parakeet Ultra stays the default")
+        try expect(SpeechModelProfile.allCases, equals: [.parakeetUltraOnnx, .gigaamV3Onnx],
+                   "only ONNX profiles (no GGUF or Whisper profile remains)")
+        try expect(SpeechModelProfile.parakeetUltraOnnx.onnxModelID, equals: PARAKEET_ULTRA_ONNX_MODEL_ID, "Parakeet model id")
+        try expect(SpeechModelProfile.gigaamV3Onnx.onnxModelID, equals: GIGAAM_V3_ONNX_MODEL_ID, "GigaAM model id")
+        try expect(SpeechModelProfile.gigaamV3Onnx.estimatedDownloadBytes, equals: GIGAAM_V3_ONNX_SIZE_BYTES,
+                   "GigaAM disk-space estimate")
         let cacheDir = speechModelCacheDirectory(for: .parakeetUltraOnnx)
         try expect(cacheDir.path.hasSuffix("/SuperDictate/onnx/parakeet-ultra-int8"), equals: true, "ONNX cache location")
         try expect(isSafeSpeechModelCacheDirectory(cacheDir), equals: true, "ONNX cache is removable by cache reset")
+        let gigaCacheDir = speechModelCacheDirectory(for: .gigaamV3Onnx)
+        try expect(gigaCacheDir.path.hasSuffix("/SuperDictate/onnx/gigaam-v3-e2e-rnnt-int8"), equals: true,
+                   "GigaAM cache location")
+        try expect(isSafeSpeechModelCacheDirectory(gigaCacheDir), equals: true, "GigaAM cache is removable by cache reset")
 
         let empty = FileManager.default.temporaryDirectory.appendingPathComponent("onnx-selftest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
@@ -8704,20 +8732,31 @@ enum ParakeySelfTest {
     /// Real model through the production path: TranscriptionWorker.load
     /// (installed-cache check + SuperDictateOnnxHost), plain and token
     /// transcription, and the multi-segment overlap path.
-    /// Needs the model installed in the app cache and SUPERDICTATE_ONNX_TEST_WAV.
+    /// Needs SUPERDICTATE_ONNX_TEST_WAV and the model: the profile from
+    /// SUPERDICTATE_ONNX_TEST_PROFILE (default parakeet_ultra_onnx; or
+    /// gigaam_v3_onnx), installed in the app cache — or any installed model
+    /// directory given by SUPERDICTATE_ONNX_TEST_MODEL_DIR (its
+    /// manifest.json must name that profile's model id).
     private static func testOnnxAsrRealModel() throws {
-        guard speechModelCacheExists(for: .parakeetUltraOnnx),
-              let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_ONNX_TEST_WAV"],
+        let environment = ProcessInfo.processInfo.environment
+        let profile = productionSpeechModelProfile(rawValue: environment["SUPERDICTATE_ONNX_TEST_PROFILE"])
+        let modelDirectory = environment["SUPERDICTATE_ONNX_TEST_MODEL_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let modelPresent = modelDirectory.map { isPlainRegularFile($0.appendingPathComponent("manifest.json").path) }
+            ?? speechModelCacheExists(for: profile)
+        guard modelPresent,
+              let wavPath = environment["SUPERDICTATE_ONNX_TEST_WAV"],
               FileManager.default.fileExists(atPath: wavPath) else {
-            print("SKIP onnx-asr-real: needs the installed ONNX model + SUPERDICTATE_ONNX_TEST_WAV")
+            print("SKIP onnx-asr-real: needs the installed \(profile.shortName) model (app cache or SUPERDICTATE_ONNX_TEST_MODEL_DIR) + SUPERDICTATE_ONNX_TEST_WAV")
             return
         }
         let (samples, rate) = try loadWavMonoFloat32(path: wavPath)
         try expect(rate, equals: UInt32(SAMPLE_RATE), "fixture sample rate")
-        let worker = TranscriptionWorker()
+        let worker = TranscriptionWorker(modelDirectoryOverride: modelDirectory)
         defer { _ = try? runParakeetEngineSynchronously { await worker.unload() } }
-        try runParakeetEngineSynchronously { try await worker.load(profile: .parakeetUltraOnnx) }
-        try expect(try runParakeetEngineSynchronously { await worker.loadedProfile }, equals: .parakeetUltraOnnx, "ONNX profile loaded")
+        try runParakeetEngineSynchronously { try await worker.load(profile: profile) }
+        try expect(try runParakeetEngineSynchronously { await worker.loadedProfile }, equals: Optional(profile), "ONNX profile loaded")
+        try expect(try runParakeetEngineSynchronously { await worker.loadedModelID }, equals: Optional(profile.onnxModelID),
+                   "the host loaded the profile's model")
 
         let short = Array(samples.prefix(Int(SAMPLE_RATE * 8)))
         let now = ProcessInfo.processInfo.systemUptime
@@ -8730,7 +8769,8 @@ enum ParakeySelfTest {
         print("ONNX REAL plain: \(plain.text)")
         try expect(plain.text.isEmpty, equals: false, "plain transcript")
         try expect(tokens.transcription.text, equals: plain.text, "token path text equals plain path text")
-        try expect(tokens.transcription.frameSec, equals: 0.08, "TDT frame stride")
+        try expect(tokens.transcription.frameSec, equals: profile == .gigaamV3Onnx ? 0.04 : 0.08,
+                   "encoder frame stride (TDT 0.08 s, GigaAM 0.04 s)")
         try expect(tokens.transcription.words.isEmpty, equals: false, "word timestamps present")
         try expect(zip(tokens.transcription.words, tokens.transcription.words.dropFirst()).allSatisfy { $0.start <= $1.start },
                    equals: true, "word timestamps are monotonic")

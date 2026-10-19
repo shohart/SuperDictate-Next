@@ -6,8 +6,10 @@
 #   Contents/Helpers/SuperDictateOnnxHost          rpath @executable_path/../Frameworks
 #   Contents/Frameworks/libonnxruntime.1.23.2.dylib
 #   Contents/Resources/onnx-asr/onnx-models.json   pinned model catalog
-#   Contents/Resources/onnx-asr/nemo128.onnx       bundled feature graph
-#   Contents/Resources/onnx-asr/ThirdPartyNotices.txt, onnxruntime-LICENSE.txt
+#   Contents/Resources/onnx-asr/nemo128.onnx       bundled feature graph (Parakeet)
+#   Contents/Resources/onnx-asr/gigaam_v3.onnx     bundled feature graph (GigaAM v3)
+#   Contents/Resources/onnx-asr/ThirdPartyNotices.txt, onnxruntime-LICENSE.txt,
+#                               onnx-asr-LICENSE.txt (MIT, gigaam_v3.onnx)
 #
 # The host comes from a separate CMake tree built with
 # CMAKE_BUILD_WITH_INSTALL_RPATH, so it never carries the SDK's build rpath.
@@ -59,6 +61,8 @@ cp "$DYLIB" "$APP/Contents/Frameworks/"
 chmod 644 "$APP/Contents/Frameworks/libonnxruntime.$ORT_VERSION.dylib"
 cp "$RUNTIME_DIR/catalog/onnx-models.json" "$APP/Contents/Resources/onnx-asr/onnx-models.json"
 cp "$RUNTIME_DIR/assets/nemo128.onnx" "$APP/Contents/Resources/onnx-asr/nemo128.onnx"
+cp "$RUNTIME_DIR/assets/gigaam_v3.onnx" "$APP/Contents/Resources/onnx-asr/gigaam_v3.onnx"
+cp "$RUNTIME_DIR/assets/onnx-asr-LICENSE.txt" "$APP/Contents/Resources/onnx-asr/onnx-asr-LICENSE.txt"
 cp "$ORT_ROOT/ThirdPartyNotices.txt" "$APP/Contents/Resources/onnx-asr/ThirdPartyNotices.txt"
 cp "$ORT_ROOT/LICENSE" "$APP/Contents/Resources/onnx-asr/onnxruntime-LICENSE.txt"
 

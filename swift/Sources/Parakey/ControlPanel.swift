@@ -3412,8 +3412,8 @@ header.addArrangedSubview(panelLabel(
     private func speechModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Движок распознавания", "Speech engine"),
-            detail: t("Parakeet через ONNX Runtime, только CPU. Видеокарта используется лишь для LLM-коррекции и рерайта.",
-                       "Parakeet via ONNX Runtime, CPU only. The GPU is used only for LLM correction and rewrite."),
+            detail: t("ONNX Runtime, только CPU. Parakeet Ultra — многоязычная; GigaAM v3 — только русский, точнее на русском. Видеокарта используется лишь для LLM-коррекции и рерайта.",
+                       "ONNX Runtime, CPU only. Parakeet Ultra is multilingual; GigaAM v3 is Russian-only and more accurate in Russian. The GPU is used only for LLM correction and rewrite."),
             selectedValue: draft.speechModelProfile.rawValue,
             options: SpeechModelProfile.allCases.map { ($0.displayName, $0.rawValue) },
             action: #selector(selectSpeechModelProfile(_:)),
@@ -4265,6 +4265,9 @@ header.addArrangedSubview(panelLabel(
     @objc private func saveSettingsClicked(_ sender: NSButton) {
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
+        // Decided against the PERSISTED values, so before anything is
+        // written: afterwards the draft always equals the settings.
+        let restartRequired = settingsRestartRequired(draft)
         settings.setConfiguredHotkey(draft.dictationHotkey)
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
@@ -4325,7 +4328,6 @@ header.addArrangedSubview(panelLabel(
         settings.rewriteCustomModelName = draft.rewriteCustomModelName
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
-        let restartRequired = settingsRestartRequired(draft)
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         if restartRequired {
             beginServiceOperation(.applyingSettings)

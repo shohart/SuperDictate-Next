@@ -4,7 +4,7 @@
 // Unlike the single-file GGUF pins in ModelDownload.swift, an ONNX model is
 // a directory of graphs plus a tokenizer. The pinned catalog
 // (native/asr-runtime/catalog/onnx-models.json) and the bundled
-// preprocessor graph (nemo128.onnx) ship inside the app at
+// preprocessor graphs (nemo128.onnx, gigaam_v3.onnx) ship inside the app at
 // Contents/Resources/onnx-asr/, so URLs, sizes and SHA-256 digests are
 // versioned with the code, never taken from the environment. Each file is
 // downloaded to a same-volume temp file, size- and SHA-256-verified, then
@@ -18,6 +18,11 @@ let PARAKEET_ULTRA_ONNX_MODEL_ID = "parakeet-ultra-int8"
 /// decoder, joiner, tokens) — used for the disk-space precheck and UI text
 /// before the catalog is read.
 let PARAKEET_ULTRA_ONNX_SIZE_BYTES: Int64 = 611_879_344 + 12_257_685 + 5_281_747 + 93_939
+
+let GIGAAM_V3_ONNX_MODEL_ID = "gigaam-v3-e2e-rnnt-int8"
+/// Same for the GigaAM v3 e2e RNN-T entry (its gigaam_v3.onnx preprocessor
+/// is bundled, not downloaded).
+let GIGAAM_V3_ONNX_SIZE_BYTES: Int64 = 224_570_477 + 1_159_170 + 687_791 + 13_354
 
 enum OnnxModelDownloadError: LocalizedError {
     case resourcesUnavailable
@@ -88,13 +93,13 @@ func resolvedOnnxAsrResources() -> OnnxAsrResources? {
 }
 
 /// `~/Library/Application Support/SuperDictate/onnx/<model_id>/` (spec §7).
-func onnxModelCacheDirectory(modelID: String = PARAKEET_ULTRA_ONNX_MODEL_ID) -> URL {
+func onnxModelCacheDirectory(modelID: String) -> URL {
     speechModelCacheBaseDirectory()
         .appendingPathComponent("onnx", isDirectory: true)
         .appendingPathComponent(modelID, isDirectory: true)
 }
 
-func onnxModelManifestURL(modelID: String = PARAKEET_ULTRA_ONNX_MODEL_ID) -> URL {
+func onnxModelManifestURL(modelID: String) -> URL {
     onnxModelCacheDirectory(modelID: modelID).appendingPathComponent("manifest.json", isDirectory: false)
 }
 
@@ -126,7 +131,7 @@ func isSafeOnnxModelFileName(_ name: String) -> Bool {
         && !name.hasPrefix(".") && name != "manifest.json"
 }
 
-func loadOnnxCatalogEntry(modelID: String = PARAKEET_ULTRA_ONNX_MODEL_ID,
+func loadOnnxCatalogEntry(modelID: String,
                           catalogURL: URL) throws -> OnnxCatalogEntry {
     let data = try Data(contentsOf: catalogURL)
     guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -287,12 +292,13 @@ private func downloadOnnxFile(_ file: OnnxCatalogFile,
     }
 }
 
-/// Ensures the pinned ONNX model is installed and verified; returns its
-/// directory. Files already present with the right size AND hash are kept
+/// Ensures the profile's pinned ONNX model is installed and verified;
+/// returns its directory. Files already present with the right size AND hash are kept
 /// (an interrupted install resumes per file); everything else is fetched.
 @discardableResult
-func downloadOnnxModelIfNeeded(modelID: String = PARAKEET_ULTRA_ONNX_MODEL_ID,
+func downloadOnnxModelIfNeeded(profile: SpeechModelProfile,
                                progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws -> URL {
+    let modelID = profile.onnxModelID
     guard let resources = resolvedOnnxAsrResources() else {
         throw OnnxModelDownloadError.resourcesUnavailable
     }
@@ -329,7 +335,7 @@ func downloadOnnxModelIfNeeded(modelID: String = PARAKEET_ULTRA_ONNX_MODEL_ID,
     }
 
     if !missing.isEmpty {
-        try assertSufficientDiskSpaceForSpeechModelDownload(profile: .parakeetUltraOnnx)
+        try assertSufficientDiskSpaceForSpeechModelDownload(profile: profile)
         let totalBytes = Double(max(1, missing.reduce(0) { $0 + $1.size }))
         var completedBytes: Int64 = 0
         log("ASR: downloading ONNX model \(modelID) (\(missing.map(\.path).joined(separator: ", ")))")

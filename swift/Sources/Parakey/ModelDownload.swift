@@ -737,10 +737,7 @@ func downloadSileroVadModelIfNeeded() async throws -> URL {
 }
 
 func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
-    switch profile {
-    case .parakeetUltraOnnx:
-        return onnxModelCacheDirectory()
-    }
+    onnxModelCacheDirectory(modelID: profile.onnxModelID)
 }
 
 func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
@@ -778,11 +775,8 @@ func availableImportantDiskSpaceBytes(containing url: URL) -> Int64? {
 }
 
 func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
-    switch profile {
-    case .parakeetUltraOnnx:
-        // manifest.json is written last, only after every file verified.
-        return isPlainRegularFile(onnxModelManifestURL().path)
-    }
+    // manifest.json is written last, only after every file verified.
+    isPlainRegularFile(onnxModelManifestURL(modelID: profile.onnxModelID).path)
 }
 
 func assertSufficientDiskSpaceForSpeechModelDownload(profile: SpeechModelProfile) throws {

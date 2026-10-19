@@ -125,14 +125,18 @@ actor OnnxAsrEngine {
     let threadCount: Int
 
     /// Spawns the helper and loads the model (CREATE). `modelDirectory`
-    /// must hold a verified install (downloadOnnxModelIfNeeded).
-    static func launch(modelDirectory: URL, threadCount: Int) async throws -> OnnxAsrEngine {
+    /// must hold a verified install (downloadOnnxModelIfNeeded). A non-nil
+    /// `expectedModelID` makes the host refuse a directory whose manifest
+    /// names another model.
+    static func launch(modelDirectory: URL, threadCount: Int,
+                       expectedModelID: String? = nil) async throws -> OnnxAsrEngine {
         guard let resources = resolvedOnnxAsrResources() else {
             throw OnnxAsrEngineError.resourcesUnavailable
         }
         let engine = try OnnxAsrEngine(threadCount: threadCount)
         do {
-            try await engine.create(modelDirectory: modelDirectory, assetsDirectory: resources.assetsDirectory)
+            try await engine.create(modelDirectory: modelDirectory, assetsDirectory: resources.assetsDirectory,
+                                    expectedModelID: expectedModelID)
         } catch {
             await engine.shutdown()
             throw error
@@ -180,14 +184,17 @@ actor OnnxAsrEngine {
         return nil
     }
 
-    private func create(modelDirectory: URL, assetsDirectory: URL) throws {
-        let config: [String: Any] = [
+    private func create(modelDirectory: URL, assetsDirectory: URL, expectedModelID: String?) throws {
+        var config: [String: Any] = [
             "engine": "onnxruntime",
             "model_directory": modelDirectory.path,
             "assets_directory": assetsDirectory.path,
             "provider": "auto",
             "intra_op_threads": threadCount,
         ]
+        if let expectedModelID {
+            config["model_id"] = expectedModelID
+        }
         let started = ProcessInfo.processInfo.systemUptime
         let status = try roundTrip(type: .create, json: try JSONSerialization.data(withJSONObject: config),
                                    timeoutSeconds: 120)

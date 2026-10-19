@@ -353,6 +353,9 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
 // through `productionSpeechModelProfile(rawValue:)`.
 enum SpeechModelProfile: String, CaseIterable {
     case parakeetUltraOnnx = "parakeet_ultra_onnx"
+    /// Russian-only GigaAM v3 e2e RNN-T (punctuation, capitalization, ё,
+    /// digits) — far fewer Russian word-form errors than Parakeet.
+    case gigaamV3Onnx = "gigaam_v3_onnx"
 
     static let productionDefault: SpeechModelProfile = .parakeetUltraOnnx
 
@@ -367,6 +370,16 @@ enum SpeechModelProfile: String, CaseIterable {
     var displayName: String {
         switch self {
         case .parakeetUltraOnnx: return "Parakeet Ultra 0.6B (ONNX)"
+        case .gigaamV3Onnx: return "GigaAM v3 (ONNX, русский)"
+        }
+    }
+
+    /// The pinned entry in native/asr-runtime/catalog/onnx-models.json;
+    /// also names the cache directory `onnx/<model_id>/`.
+    var onnxModelID: String {
+        switch self {
+        case .parakeetUltraOnnx: return PARAKEET_ULTRA_ONNX_MODEL_ID
+        case .gigaamV3Onnx: return GIGAAM_V3_ONNX_MODEL_ID
         }
     }
 
@@ -377,6 +390,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var aboutModelText: String {
         switch self {
         case .parakeetUltraOnnx: return "ONNX Runtime · Parakeet Ultra 0.6B (TDT) · ONNX int8 · CPU · CC-BY-4.0: NVIDIA (parakeet-tdt-0.6b-v3), Moondream (parakeet-ultra), mldecode (ONNX int8)"
+        case .gigaamV3Onnx: return "ONNX Runtime · GigaAM v3 e2e RNN-T · ONNX int8 · CPU · MIT: SberDevices (ai-sage/GigaAM v3), Ilya Stupakov (istupakov/gigaam-v3-onnx, onnx-asr)"
         }
     }
 
@@ -391,12 +405,14 @@ enum SpeechModelProfile: String, CaseIterable {
     var estimatedDownloadBytes: Int64 {
         switch self {
         case .parakeetUltraOnnx: return PARAKEET_ULTRA_ONNX_SIZE_BYTES
+        case .gigaamV3Onnx: return GIGAAM_V3_ONNX_SIZE_BYTES
         }
     }
 
     var downloadSizeText: String {
         switch self {
         case .parakeetUltraOnnx: return "about 630 MB"
+        case .gigaamV3Onnx: return "about 226 MB"
         }
     }
 }
