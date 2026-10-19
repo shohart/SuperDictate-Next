@@ -496,6 +496,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                            selector: #selector(externalHotkeyCaptureDidEnd(_:)),
                            name: HOTKEY_CAPTURE_END_NOTIFICATION,
                            object: nil)
+        center.addObserver(self,
+                           selector: #selector(settingsDidChangeLive(_:)),
+                           name: SETTINGS_LIVE_CHANGED_NOTIFICATION,
+                           object: nil)
+    }
+
+    /// The settings window saved LLM choices that apply without a restart:
+    /// free the VRAM of hosts the new choices no longer use right away.
+    @objc private func settingsDidChangeLive(_ notification: Notification) {
+        settings.refreshFromDisk()
+        Task { [llmPostprocessing, settings] in
+            await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
+        }
     }
 
     private func removeHotkeyCaptureObservers() {
@@ -504,6 +517,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let center = DistributedNotificationCenter.default()
         center.removeObserver(self, name: HOTKEY_CAPTURE_BEGIN_NOTIFICATION, object: nil)
         center.removeObserver(self, name: HOTKEY_CAPTURE_END_NOTIFICATION, object: nil)
+        center.removeObserver(self, name: SETTINGS_LIVE_CHANGED_NOTIFICATION, object: nil)
     }
 
     @objc private func externalHotkeyCaptureDidBegin(_ notification: Notification) {
@@ -3021,9 +3035,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// fresh on every call, so this takes effect on the very next dictation
     /// with no other propagation needed. The REWRITE toggle is deliberately
     /// independent (docs/specs/rewrite-tiered-correction-spec.md §1.4) and
-    /// is NOT flipped here; the delayed unload below only stops hosts no
-    /// still-enabled function needs (e.g. a shared YandexGPT host stays
-    /// warm while rewrite remains on).
+    /// is NOT flipped here; turning correction off immediately stops hosts
+    /// no still-enabled function needs (e.g. a shared YandexGPT host stays
+    /// loaded while rewrite remains on).
     private func toggleTextCorrectionMode() {
         let next: TextPostprocessingMode = settings.textPostprocessingMode == .correction ? .off : .correction
         settings.textPostprocessingMode = next
@@ -3041,18 +3055,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 Sounds.playDone()
             }
         }
-        Task { [llmPostprocessing, settings] in
-            if next == .correction {
-                await llmPostprocessing.cancelScheduledUnload()
-            } else {
-                await llmPostprocessing.scheduleDelayedUnload(settings: settings)
+        if next != .correction {
+            Task { [llmPostprocessing, settings] in
+                await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
             }
         }
     }
 
     /// Rewrite on/off from the global hotkey — same restart-free contract
     /// as toggleTextCorrectionMode: writes the setting directly, manages
-    /// the delayed host unload, shows the state toast.
+    /// the host unload on disable, shows the state toast.
     private func toggleRewriteModeViaHotkey() {
         let next = !settings.rewriteEnabled
         settings.rewriteEnabled = next
@@ -3073,11 +3085,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if settings.playFeedbackSounds {
             if next { Sounds.playStart() } else { Sounds.playDone() }
         }
-        Task { [llmPostprocessing, settings] in
-            if next {
-                await llmPostprocessing.cancelScheduledUnload()
-            } else {
-                await llmPostprocessing.scheduleDelayedUnload(settings: settings)
+        if !next {
+            Task { [llmPostprocessing, settings] in
+                await llmPostprocessing.unloadHostsNoLongerNeeded(settings: settings)
             }
         }
     }
@@ -3095,9 +3105,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.setRewriteStyleSelection(next)
         if !settings.rewriteEnabled {
             settings.rewriteEnabled = true
-            Task { [llmPostprocessing] in
-                await llmPostprocessing.cancelScheduledUnload()
-            }
         }
         log("text rewrite style: \(next.id) via hotkey (rewrite on)")
         showStateToast(
@@ -3125,9 +3132,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.setRewriteStyleSelection(selection)
         if !settings.rewriteEnabled {
             settings.rewriteEnabled = true
-            Task { [llmPostprocessing] in
-                await llmPostprocessing.cancelScheduledUnload()
-            }
         }
         log("text rewrite style: \(id) via its own hotkey (rewrite on)")
         showStateToast(

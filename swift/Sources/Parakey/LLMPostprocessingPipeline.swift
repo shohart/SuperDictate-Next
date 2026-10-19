@@ -46,7 +46,6 @@ import Foundation
 // view.
 actor LLMPostprocessingCoordinator {
     private var hostProcesses: [String: LLMHostProcess] = [:]
-    private var pendingUnloadTask: Task<Void, Never>?
 
     /// UI feedback for COLD host starts: loading a multi-GB model takes
     /// tens of seconds on first use, and without this the user stares at
@@ -113,6 +112,9 @@ actor LLMPostprocessingCoordinator {
     /// comment for why a second, parallel, hardcoded dictionary was
     /// tried and explicitly rejected here.
     func finalizedText(_ text: String, settings: Settings) async -> String {
+        // Settings saved in the other process apply here first; drop hosts
+        // for models or stages that are no longer selected.
+        await unloadHostsNoLongerNeeded(settings: settings)
         guard !text.isEmpty else { return text }
         var result = text
         if settings.textPostprocessingMode == .correction {
@@ -130,87 +132,39 @@ actor LLMPostprocessingCoordinator {
         onHostLoadFinished = finished
     }
 
-    /// Stops every bundled host subprocess immediately, if running, and
-    /// cancels any pending delayed unload. Call on app termination or the
-    /// GPU toggle — the background service restarting after a Settings-
-    /// window save already tears down the whole process (and these
-    /// subprocesses with it) on its own, so this is only reached for those
-    /// two immediate cases; the hotkey toggle path uses
-    /// scheduleDelayedUnload()/cancelScheduledUnload() below instead.
+    /// Stops every bundled host subprocess immediately, if running. Call
+    /// on app termination or the GPU toggle (hosts bake --gpu-layers into
+    /// their arguments).
     func stop() async {
-        pendingUnloadTask?.cancel()
-        pendingUnloadTask = nil
         for host in hostProcesses.values {
             await host.stop()
         }
         hostProcesses.removeAll()
     }
 
-    /// Schedules the delayed unload of every bundled host that no
-    /// enabled function still needs under `settings` — called from the
-    /// correction hotkey's toggle-OFF path (ParakeyApp.
-    /// toggleTextCorrectionMode), NOT from the Settings window's Save
-    /// button (that already restarts the whole background service, killing
-    /// these subprocesses immediately, on every save). The delay exists
-    /// so quick hotkey on/off toggles reuse an already-warm model
-    /// (avoiding its multi-second Vulkan reload) instead of paying that
-    /// cost on every re-enable, while still freeing the memory/VRAM after
-    /// sustained disuse. Superseding a still-pending unload (rapid off/off)
-    /// just restarts the clock, matching "10 minutes after the [most
-    /// recent] disable." Hosts still needed at fire time — e.g. the shared
-    /// YandexGPT host while rewrite stays enabled — are left running.
-    /// Bumped on every schedule/cancel so a completed task can tell
-    /// whether it's still the current one before clearing pendingUnloadTask
-    /// -- Task itself isn't Equatable, so this is the disambiguator.
-    private var unloadGeneration = 0
-
-    func scheduleDelayedUnload(after seconds: UInt64 = 10 * 60,
-                               settings: Settings) {
-        pendingUnloadTask?.cancel()
-        unloadGeneration += 1
-        let generation = unloadGeneration
-        pendingUnloadTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.unloadUnneededHosts(settings: settings,
-                                            generation: generation)
-        }
-    }
-
-    /// Cancels a pending scheduleDelayedUnload(), keeping every host
-    /// process (and its already-loaded model) alive. Called from the
-    /// correction hotkey's toggle-ON path before the model is warm again.
-    func cancelScheduledUnload() {
-        pendingUnloadTask?.cancel()
-        pendingUnloadTask = nil
-        unloadGeneration += 1
-    }
-
-    /// Stops every host whose identity is not in
-    /// neededHostIdentities(settings:) and drops it from the table, then
-    /// clears the pending flag if this task is still the current
-    /// generation.
-    private func unloadUnneededHosts(settings: Settings, generation: Int) async {
+    /// Stops, right now, every host the current `settings` don't use: a
+    /// correction or rewrite stage that was switched off, or a model that
+    /// was swapped for another. Each bundled host holds its whole model in
+    /// VRAM, so a stale one is never kept warm. Called from the hotkey
+    /// toggles, from a live settings save (SETTINGS_LIVE_CHANGED_NOTIFICATION)
+    /// and before every dictation's postprocessing. Hosts still needed —
+    /// e.g. a shared host while the other stage stays on — keep running.
+    func unloadHostsNoLongerNeeded(settings: Settings) async {
         let needed = Self.neededHostIdentities(settings: settings)
         for (identity, host) in hostProcesses where !needed.contains(identity) {
             await host.stop()
             hostProcesses[identity] = nil
             log("LLM postprocessing: unloaded model host no longer in use (\(identity))")
         }
-        clearPendingUnloadTask(ifGeneration: generation)
     }
 
-    private func clearPendingUnloadTask(ifGeneration generation: Int) {
-        // A newer scheduleDelayedUnload()/cancelScheduledUnload() call may
-        // have already bumped unloadGeneration and replaced/cleared
-        // pendingUnloadTask by the time this (now-finished) task gets back
-        // on the actor -- only clear it if it's still the same generation.
-        guard generation == unloadGeneration else { return }
-        pendingUnloadTask = nil
+    /// Test-only hooks: register a never-started host under `identity`, and
+    /// list the identities currently held.
+    func registerIdleHostForTest(identity: String) {
+        _ = hostProcess(forIdentity: identity)
     }
 
-    /// Test-only hook: whether a delayed unload is currently scheduled.
-    var hasPendingUnloadForTest: Bool { pendingUnloadTask != nil }
+    var hostIdentitiesForTest: Set<String> { Set(hostProcesses.keys) }
 
     /// Test-only hook: whether any bundled host subprocess is currently
     /// running.

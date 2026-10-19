@@ -4333,6 +4333,12 @@ header.addArrangedSubview(panelLabel(
             // Nothing the agent reads at launch changed — persisting is
             // enough; the agent picks the values up live on the next
             // dictation. No service restart, no HUD interruption.
+            DistributedNotificationCenter.default().postNotificationName(
+                SETTINGS_LIVE_CHANGED_NOTIFICATION,
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
             refreshSettingsWindow()
         }
     }

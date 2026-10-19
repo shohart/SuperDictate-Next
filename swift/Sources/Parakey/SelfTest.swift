@@ -2973,46 +2973,34 @@ enum ParakeySelfTest {
         )
     }
 
-    /// Covers LLMPostprocessingCoordinator's scheduleDelayedUnload/
-    /// cancelScheduledUnload (the "unload the correction model 10 minutes
-    /// after it's disabled" feature, ParakeyApp.toggleTextCorrectionMode's
-    /// hotkey path). No real model/host subprocess needed -- LLMHostProcess.
-    /// stop() is a safe no-op when nothing was ever started, so this
-    /// exercises the actor's own scheduling/cancellation/generation logic
-    /// in isolation, using a short overridden delay instead of the real
-    /// 10-minute default. Hermetic and fast enough for `all`.
+    /// Covers LLMPostprocessingCoordinator.unloadHostsNoLongerNeeded: a
+    /// host for a model that is no longer selected, or for a stage that was
+    /// switched off, is dropped at once; the selected one stays. Uses
+    /// never-started hosts (LLMHostProcess.stop() is a no-op for them), so
+    /// it is hermetic and fast enough for `all`.
     private static func testLLMPostprocessingDelayedUnload() throws {
         let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-unload-delay")!,
                                 vocabularyStore: .inMemoryFallback())
-        settings.textPostprocessingMode = .off
+        settings.textPostprocessingMode = .correction
+        settings.llmEngineBackend = .bundledLocal
+        settings.correctionBundledModel = .voiceScribe
         settings.rewriteEnabled = false
+        let selected = LLMPostprocessingCoordinator.correctionHostIdentity(model: .voiceScribe)
+        let previous = LLMPostprocessingCoordinator.correctionHostIdentity(model: .yandexGPT)
         try runParakeetEngineSynchronously {
             let coordinator = LLMPostprocessingCoordinator()
+            await coordinator.registerIdleHostForTest(identity: selected)
+            await coordinator.registerIdleHostForTest(identity: previous)
 
-            // Scheduling sets the pending flag.
-            await coordinator.scheduleDelayedUnload(after: 3600, settings: settings)
-            let scheduled = await coordinator.hasPendingUnloadForTest
-            try expect(scheduled, equals: true, "scheduling an unload should mark one as pending")
+            await coordinator.unloadHostsNoLongerNeeded(settings: settings)
+            let afterSwitch = await coordinator.hostIdentitiesForTest
+            try expect(afterSwitch, equals: [selected],
+                       "a model switch must unload the previous model's host and keep the selected one")
 
-            // Cancelling clears it immediately, before the delay elapses.
-            await coordinator.cancelScheduledUnload()
-            let cancelled = await coordinator.hasPendingUnloadForTest
-            try expect(cancelled, equals: false, "cancelling should clear the pending unload")
-
-            // Re-scheduling while a previous one is still pending ("rapid
-            // off/off") must restart the clock, not accumulate a second
-            // in-flight unload racing the first.
-            await coordinator.scheduleDelayedUnload(after: 3600, settings: settings)
-            await coordinator.scheduleDelayedUnload(after: 1, settings: settings)
-            let rescheduled = await coordinator.hasPendingUnloadForTest
-            try expect(rescheduled, equals: true, "re-scheduling should still report a pending unload")
-
-            // Let the short-delayed one actually fire and clear itself.
-            try await Task.sleep(nanoseconds: 1_500_000_000)
-            let firedAndCleared = await coordinator.hasPendingUnloadForTest
-            try expect(firedAndCleared, equals: false, "a fired unload should clear the pending flag on its own")
-            let hostRunning = await coordinator.isHostProcessRunningForTest()
-            try expect(hostRunning, equals: false, "stop() on a never-started host process should be a safe no-op")
+            settings.textPostprocessingMode = .off
+            await coordinator.unloadHostsNoLongerNeeded(settings: settings)
+            let afterDisable = await coordinator.hostIdentitiesForTest
+            try expect(afterDisable, equals: [], "turning correction off must unload its host")
 
             await coordinator.stop()
         }

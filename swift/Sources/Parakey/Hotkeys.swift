@@ -456,9 +456,8 @@ enum HotkeyTransitionAction: Equatable, Sendable {
     /// app play feedback so the user knows the press was received.
     case rejectedBusyPress
     /// Global shortcut to flip LLM text correction on/off without opening
-    /// Settings (which would trigger a full background-service restart —
-    /// see LLMPostprocessingCoordinator.scheduleDelayedUnload's own doc
-    /// comment for why this hotkey exists as a separate, restart-free path).
+    /// Settings; turning it off unloads the model host right away
+    /// (LLMPostprocessingCoordinator.unloadHostsNoLongerNeeded).
     case toggleCorrection
     /// Global shortcut to flip text rewriting on/off — same restart-free
     /// rationale as toggleCorrection.

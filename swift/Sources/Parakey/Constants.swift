@@ -112,6 +112,10 @@ let RECORDING_HUD_CORRECTING_PHASE_SPEED: CGFloat = 6.4
 let RECORDING_HUD_CORRECTING_SWEEP_RADIANS: CGFloat = 20.48
 let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-begin")
 let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-end")
+// Posted by the settings window after a save that needs no service restart
+// (LLM model/stage choices apply live), so the agent re-reads its settings
+// and stops LLM hosts the new choices no longer use.
+let SETTINGS_LIVE_CHANGED_NOTIFICATION = Notification.Name("com.local.superdictate.settings-live-changed")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
