@@ -295,9 +295,32 @@ final class PostInsertionEditWatcher {
             log("PostInsertionEditWatcher: aborted — secure text field")
             return
         }
+        armWhenAnchored(insertedText: insertedText, target: target, generation: generation, attempt: 1)
+    }
+
+    /// The target app updates its accessibility tree asynchronously after
+    /// a paste (Chrome reported the pre-paste placeholder or a cursor one
+    /// character short), so a failed anchor is retried a few times before
+    /// the watch is abandoned.
+    private static let anchorAttempts = 6
+    private static let anchorRetryNanoseconds: UInt64 = 250_000_000
+
+    private func armWhenAnchored(insertedText: String, target: FocusedTextTarget, generation: Int, attempt: Int) {
+        guard watchGeneration == generation else { return }
         guard let anchor = computeAnchor(insertedText: insertedText, element: target.element) else {
-            log("PostInsertionEditWatcher: aborted — could not compute a trustworthy anchor (see computeAnchor log line above)")
+            guard attempt < Self.anchorAttempts else {
+                log("PostInsertionEditWatcher: aborted — could not compute a trustworthy anchor after \(attempt) attempts (see computeAnchor log line above)")
+                return
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: Self.anchorRetryNanoseconds)
+                self?.armWhenAnchored(insertedText: insertedText, target: target,
+                                      generation: generation, attempt: attempt + 1)
+            }
             return
+        }
+        if attempt > 1 {
+            log("PostInsertionEditWatcher: anchored on attempt \(attempt)")
         }
 
         var createdObserver: AXObserver?
@@ -331,7 +354,7 @@ final class PostInsertionEditWatcher {
         self.observer = observer
         self.observedElement = target.element
         self.observedApplication = target.application
-        self.insertedText = insertedText
+        self.insertedText = anchor.region
         self.anchorPrefix = anchor.prefix
         self.anchorSuffix = anchor.suffix
         log("PostInsertionEditWatcher: armed (generation=\(generation)), watching up to \(Int(Self.watchWindowSeconds))s")
@@ -371,37 +394,63 @@ final class PostInsertionEditWatcher {
     /// expressed as the surrounding text that must stay unchanged for a
     /// later diff to be trusted. Returns nil if the field's attributes
     /// aren't readable or the math doesn't add up (never guess).
-    private func computeAnchor(insertedText: String, element: AXUIElement) -> (prefix: String, suffix: String)? {
+    private func computeAnchor(insertedText: String,
+                               element: AXUIElement) -> (prefix: String, region: String, suffix: String)? {
         guard let fieldValue = stringAttribute(element, kAXValueAttribute as CFString) else {
             log("PostInsertionEditWatcher: computeAnchor — kAXValueAttribute not readable on this element")
             return nil
         }
-        guard let cursorRange = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString) else {
-            log("PostInsertionEditWatcher: computeAnchor — kAXSelectedTextRangeAttribute not readable on this element")
+        let cursorRange = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString)
+        guard let range = Self.insertedRange(of: insertedText, in: fieldValue, cursorLocation: cursorRange?.location) else {
+            let fieldLength = (fieldValue as NSString).length
+            let cursor = cursorRange.map { "(\($0.location),\($0.length))" } ?? "unreadable"
+            log("PostInsertionEditWatcher: computeAnchor — inserted text (length \((insertedText as NSString).length)) not found in field (length \(fieldLength), cursor \(cursor)); refusing to guess")
             return nil
         }
-
         let fieldNSString = fieldValue as NSString
-        let insertedLength = (insertedText as NSString).length
-        let insertionEnd = cursorRange.location
-        let insertionStart = insertionEnd - insertedLength
-        guard insertionStart >= 0, insertionEnd <= fieldNSString.length else {
-            log("PostInsertionEditWatcher: computeAnchor — cursor range (\(cursorRange.location),\(cursorRange.length)) doesn't fit insertedLength=\(insertedLength) within fieldLength=\(fieldNSString.length)")
-            return nil
-        }
+        return (fieldNSString.substring(to: range.location),
+                fieldNSString.substring(with: range),
+                fieldNSString.substring(from: range.location + range.length))
+    }
 
-        let insertedRange = NSRange(location: insertionStart, length: insertedLength)
-        guard fieldNSString.substring(with: insertedRange) == insertedText else {
-            // The selection/cursor position doesn't actually bracket the
-            // text we just inserted (e.g. a stale kAXSelectedTextRangeAttribute
-            // left over from before insertion) — don't guess at the anchor.
-            log("PostInsertionEditWatcher: computeAnchor — text at the cursor-derived range doesn't match what was inserted; refusing to guess")
-            return nil
+    /// Where the just-inserted text sits in the field. First the exact
+    /// span ending at the cursor; otherwise the text is searched for, with
+    /// its outer whitespace trimmed and no-break spaces treated as spaces
+    /// (rich editors such as ChatGPT's store a trailing space as U+00A0 or
+    /// drop it), taking the occurrence nearest the cursor. Both mappings
+    /// keep UTF-16 lengths, so the range indexes the original field text.
+    /// Nil when the text is not in the field at all — never guess.
+    nonisolated static func insertedRange(of insertedText: String, in fieldValue: String, cursorLocation: Int?) -> NSRange? {
+        let field = fieldValue as NSString
+        let inserted = insertedText as NSString
+        if let cursor = cursorLocation {
+            let start = cursor - inserted.length
+            if start >= 0, cursor <= field.length,
+               field.substring(with: NSRange(location: start, length: inserted.length)) == insertedText {
+                return NSRange(location: start, length: inserted.length)
+            }
         }
-
-        let prefix = fieldNSString.substring(to: insertionStart)
-        let suffix = fieldNSString.substring(from: insertionEnd)
-        return (prefix, suffix)
+        let needle = insertedText.replacingOccurrences(of: "\u{00A0}", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return nil }
+        let haystack = fieldValue.replacingOccurrences(of: "\u{00A0}", with: " ") as NSString
+        var best: NSRange?
+        var searchFrom = 0
+        while searchFrom < haystack.length {
+            let found = haystack.range(of: needle, options: [.literal],
+                                       range: NSRange(location: searchFrom, length: haystack.length - searchFrom))
+            guard found.location != NSNotFound else { break }
+            if let cursor = cursorLocation, let current = best {
+                if abs(found.location + found.length - cursor) < abs(current.location + current.length - cursor) {
+                    best = found
+                }
+            } else {
+                // No cursor: the latest occurrence is the freshest insertion.
+                best = found
+            }
+            searchFrom = found.location + 1
+        }
+        return best
     }
 
     private func handleNotification(_ notification: String, element: AXUIElement) {

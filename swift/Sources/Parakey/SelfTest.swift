@@ -76,6 +76,8 @@ enum ParakeySelfTest {
             return runSuite("vocabulary-store", testVocabularyStore)
         case "vocabulary-learning":
             return runSuite("vocabulary-learning", testLearnCandidateDetector)
+        case "insertion-anchor":
+            return runSuite("insertion-anchor", testInsertionAnchor)
         case "fillers":
             return runSuite("fillers", testFillerWordRemoval)
         case "filler-word-presets-custom-words":
@@ -5777,6 +5779,25 @@ enum ParakeySelfTest {
         try expect(parseLLMGPUDeviceList(""), equals: [], "no output means no GPU")
         let devices = LLMGPUProbe.shared.devices()
         print("llm-gpu-probe: \(devices.isEmpty ? "no Vulkan device (or helper not built)" : devices.joined(separator: ", "))")
+    }
+
+    // MARK: - Post-insertion anchor
+
+    private static func testInsertionAnchor() throws {
+        let find = PostInsertionEditWatcher.insertedRange
+        try expect(find("привет мир", "Текст: привет мир", 17), equals: NSRange(location: 7, length: 10),
+                   "exact span ending at the cursor")
+        // ChatGPT-style editor: trailing space dropped, cursor one short.
+        try expect(find("Привет мир. ", "Привет мир.", 11), equals: NSRange(location: 0, length: 11),
+                   "a dropped trailing space still anchors on the trimmed text")
+        try expect(find("Привет мир ", "Привет\u{00A0}мир\u{00A0}", 10), equals: NSRange(location: 0, length: 10),
+                   "no-break spaces match plain spaces")
+        try expect(find("да", "да или да", 9), equals: NSRange(location: 7, length: 2),
+                   "the occurrence nearest the cursor wins")
+        try expect(find("да", "да или да", nil), equals: NSRange(location: 7, length: 2),
+                   "without a cursor the latest occurrence wins")
+        try expect(find("привет мир", "Спросить ChatGPT\n", 0) == nil, equals: true,
+                   "a stale placeholder value never anchors")
     }
 
     // MARK: - ASR thread policy
