@@ -165,6 +165,150 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     return exitCode.value
 }
 
+/// Recording-time transcription benchmark (IncrementalTranscription.swift).
+///
+/// usage: SuperDictate --benchmark-transcribe-streaming [onnx|gigaam] cpu <threads> <speed> <wav1> [wav2 ...]
+///
+/// Same model loading as `--benchmark-transcribe`, no UI, no agent, no
+/// audio device. For each WAV it first runs the batch path
+/// (`transcribeSegmented` on the whole file) as the reference, then feeds
+/// the file into `IncrementalOverlapTranscriber` at `speed`× real time (a
+/// growing buffer standing in for the microphone), "releases" when the
+/// whole file has been fed and runs the release path
+/// (`transcribeSegmentedAfterRecording`). Prints post-release seconds,
+/// recording-time ASR seconds, windows reused, and whether the text is
+/// byte-identical to the batch reference.
+func runStreamingASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--benchmark-transcribe-streaming" else { return nil }
+    let usage = "usage: SuperDictate --benchmark-transcribe-streaming [onnx|gigaam] cpu <threads> <speed> <wav1> [wav2 ...]\n"
+    var rest = Array(arguments.dropFirst())
+    var profile = SpeechModelProfile.parakeetUltraOnnx
+    if rest.first == "onnx" {
+        rest.removeFirst()
+    } else if rest.first == "gigaam" {
+        profile = .gigaamV3Onnx
+        rest.removeFirst()
+    }
+    guard rest.count >= 4,
+          rest[0] == "cpu",
+          let threads = Int(rest[1]), (1...32).contains(threads),
+          let speed = Double(rest[2]), speed > 0, speed <= 100
+    else {
+        fputs(usage, stderr)
+        return EXIT_FAILURE
+    }
+    let wavPaths = Array(rest.dropFirst(3))
+
+    // Same detached-task + pumped-run-loop shape as runASRBenchmarkDiagnostic.
+    let semaphore = DispatchSemaphore(value: 0)
+    let exitCode = DiagnosticExitCode()
+    Task.detached {
+        defer { semaphore.signal() }
+        do {
+            let allIdentical = try await runStreamingBenchmark(profile: profile, threads: threads,
+                                                               speed: speed, wavPaths: wavPaths)
+            exitCode.set(allIdentical ? EXIT_SUCCESS : EXIT_FAILURE)
+        } catch {
+            fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
+            exitCode.set(EXIT_FAILURE)
+        }
+    }
+    while semaphore.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    return exitCode.value
+}
+
+/// A WAV standing in for the microphone: the "captured so far" prefix grows
+/// with wall time at `speed`× real time from `begin()`.
+private final class BenchmarkRecordingFeed: @unchecked Sendable {
+    private let samples: [Float]
+    private let speed: Double
+    private let lock = NSLock()
+    private var startedAt: TimeInterval?
+
+    init(samples: [Float], speed: Double) {
+        self.samples = samples
+        self.speed = speed
+    }
+
+    func begin() {
+        lock.lock(); startedAt = ProcessInfo.processInfo.systemUptime; lock.unlock()
+    }
+
+    func capturedCount() -> Int {
+        lock.lock(); let started = startedAt; lock.unlock()
+        guard let started else { return 0 }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        return min(samples.count, Int(elapsed * speed * SAMPLE_RATE))
+    }
+
+    func prefix() -> [Float] {
+        Array(samples[0..<capturedCount()])
+    }
+}
+
+private func runStreamingBenchmark(profile: SpeechModelProfile, threads: Int, speed: Double,
+                                   wavPaths: [String]) async throws -> Bool {
+    setenv("SUPERDICTATE_ASR_THREADS", String(threads), 1)
+    let worker = TranscriptionWorker()
+    let loadStart = ProcessInfo.processInfo.systemUptime
+    try await worker.load(profile: profile)
+    let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
+    _ = try await worker.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)),
+                                    resolveViaKeyboard: false,
+                                    requestedAt: ProcessInfo.processInfo.systemUptime)
+    print("BENCH_LOAD backend=onnx device=cpu requested_threads=\(threads) load_s=\(loadSeconds) path=streaming speed=\(speed) model=\(profile.onnxModelID)")
+
+    var allIdentical = true
+    for path in wavPaths {
+        let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))
+        let durationSeconds = Double(samples.count) / SAMPLE_RATE
+
+        let batchStart = ProcessInfo.processInfo.systemUptime
+        let batch = try await transcribeSegmented(samples: samples, worker: worker, language: nil,
+                                                  resolveViaKeyboard: false, requestedAt: batchStart)
+        let batchSeconds = ProcessInfo.processInfo.systemUptime - batchStart
+
+        let feed = BenchmarkRecordingFeed(samples: samples, speed: speed)
+        let driver = IncrementalOverlapTranscriber(
+            engineGeneration: await worker.engineGeneration,
+            pollInterval: 1.5 / speed,
+            snapshot: { feed.prefix() },
+            sampleCount: { feed.capturedCount() },
+            transcribeWindow: { windowSamples in
+                try await worker.transcribeWithTokens(samples: windowSamples,
+                                                      requestedAt: ProcessInfo.processInfo.systemUptime)
+            }
+        )
+        await driver.start()
+        feed.begin()
+        try await Task.sleep(nanoseconds: UInt64(durationSeconds / speed * 1_000_000_000))
+
+        let releaseAt = ProcessInfo.processInfo.systemUptime
+        let streamed = try await transcribeSegmentedAfterRecording(samples: samples, speculative: driver,
+                                                                   worker: worker, language: nil,
+                                                                   resolveViaKeyboard: false,
+                                                                   requestedAt: releaseAt)
+        let postReleaseSeconds = ProcessInfo.processInfo.systemUptime - releaseAt
+        let recordingTime = await driver.finish()
+        let windowCount = OverlapWindower.addOverlap(
+            to: PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE),
+            sampleRate: SAMPLE_RATE).count
+        let identical = streamed.text == batch.text
+        allIdentical = allIdentical && identical
+        print("BENCH_STREAM file=\(path) duration_s=\(durationSeconds) speed=\(speed) batch_s=\(batchSeconds) post_release_s=\(postReleaseSeconds) release_wait_s=\(streamed.speculativeWaitSeconds) post_release_engine_s=\(streamed.engineCallSeconds) speculative_asr_s=\(recordingTime?.totalEngineCallSeconds ?? 0) speculative_windows=\(recordingTime?.count ?? 0) windows=\(windowCount) windows_reused=\(streamed.speculativeWindowsReused) identical=\(identical)")
+        if !identical {
+            print("BENCH_STREAM_TEXT batch=\(benchmarkEscapedText(batch.text))")
+            print("BENCH_STREAM_TEXT streamed=\(benchmarkEscapedText(streamed.text))")
+        } else {
+            print("BENCH_STREAM_TEXT text=\(benchmarkEscapedText(streamed.text))")
+        }
+    }
+    await worker.unload()
+    return allIdentical
+}
+
 private func benchmarkEscapedText(_ text: String) -> String {
     text
         .replacingOccurrences(of: "\\", with: "\\\\")

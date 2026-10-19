@@ -303,6 +303,13 @@ struct DictationLatencyMetrics: Equatable {
     let releaseToPasteDispatchSeconds: Double
     let enterDelaySeconds: Double?
     let pasteSucceeded: Bool
+    /// Recording-time ASR (IncrementalTranscription.swift): seconds of ASR
+    /// that ran DURING the recording for the windows reused at release, the
+    /// release-side wait for the window still in flight, and how many
+    /// windows were reused. `engine_call` stays post-release work only.
+    var speculativeASRSeconds: Double = 0
+    var speculativeWaitSeconds: Double = 0
+    var speculativeWindowsReused: Int = 0
 
     var logLine: String {
         let enter = enterDelaySeconds.map(millisecondsLabel) ?? "off"
@@ -330,6 +337,9 @@ struct DictationLatencyMetrics: Equatable {
             "decoder_setup=\(millisecondsLabel(asrTiming.decoderPreparationSeconds))",
             "engine_call=\(millisecondsLabel(asrTiming.engineCallSeconds))",
             "engine_processing=\(millisecondsLabel(asrTiming.engineProcessingSeconds))",
+            "speculative_asr=\(millisecondsLabel(speculativeASRSeconds))",
+            "speculative_wait=\(millisecondsLabel(speculativeWaitSeconds))",
+            "speculative_windows=\(speculativeWindowsReused)",
             "framework_overhead=\(millisecondsLabel(asrTiming.frameworkOverheadSeconds))",
             "asr_total=\(millisecondsLabel(asrTiming.totalSeconds))",
             "postprocess=\(millisecondsLabel(postprocessingSeconds))",

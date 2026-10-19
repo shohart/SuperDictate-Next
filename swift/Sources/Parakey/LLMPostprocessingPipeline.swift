@@ -98,6 +98,13 @@ actor LLMPostprocessingCoordinator {
         return created
     }
 
+    #if DEBUG
+    /// Every text `finalizedText` was called with, in order — lets the
+    /// `incremental-transcription` self-test pin that the LLM sees only
+    /// the final assembled dictation, once.
+    private(set) var finalizedTextInputsForTest: [String] = []
+    #endif
+
     /// Applies the configured postprocessing stages to already-
     /// deterministically-corrected text. A no-op (returns `text`
     /// unchanged, no async work) when neither stage is enabled or the
@@ -112,6 +119,9 @@ actor LLMPostprocessingCoordinator {
     /// comment for why a second, parallel, hardcoded dictionary was
     /// tried and explicitly rejected here.
     func finalizedText(_ text: String, settings: Settings) async -> String {
+        #if DEBUG
+        finalizedTextInputsForTest.append(text)
+        #endif
         // Settings saved in the other process apply here first; drop hosts
         // for models or stages that are no longer selected.
         await unloadHostsNoLongerNeeded(settings: settings)

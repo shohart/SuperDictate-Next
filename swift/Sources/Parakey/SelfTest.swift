@@ -130,6 +130,8 @@ enum ParakeySelfTest {
             return runSuite("silero-vad-real", testSileroVadRealModel)
         case "pause-segmentation":
             return runSuite("pause-segmentation", testPauseSegmentation)
+        case "incremental-transcription":
+            return runSuite("incremental-transcription", testIncrementalTranscription)
         case "overlap-windowing":
             return runSuite("overlap-windowing", testOverlapWindowing)
         case "segmented-transcription":
@@ -274,6 +276,7 @@ enum ParakeySelfTest {
         try testSileroVadBridge()
         try testPauseSegmentation()
         try testOverlapWindowing()
+        try testIncrementalTranscription()
         try testSegmentedTranscription()
         try testSeamDedup()
         try testOverlapAssembly()
@@ -6220,6 +6223,289 @@ enum ParakeySelfTest {
         try expect(sustainedSegments.count, equals: 1, "the sustained-signal buffer stays a single segment")
         try expect(sustainedSegments[0].hasSignal, equals: true,
                    "a run at the minimum-signal threshold is flagged as having signal")
+    }
+
+    // MARK: - Recording-time (incremental) transcription
+
+    /// Lock-guarded counters shared with fake ASR closures.
+    private final class IncrementalTestProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _calls = 0
+        private var _active = 0
+        private var _maxActive = 0
+        func enter() { lock.lock(); _calls += 1; _active += 1; _maxActive = max(_maxActive, _active); lock.unlock() }
+        func leave() { lock.lock(); _active -= 1; lock.unlock() }
+        var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+        var active: Int { lock.lock(); defer { lock.unlock() }; return _active }
+        var maxActive: Int { lock.lock(); defer { lock.unlock() }; return _maxActive }
+    }
+
+    /// A growing "recording": each `sampleCount()` poll lets `step` more
+    /// samples in, so the driver sees the buffer grow deterministically
+    /// regardless of wall time.
+    private final class IncrementalTestFeed: @unchecked Sendable {
+        private let samples: [Float]
+        private let step: Int
+        private let lock = NSLock()
+        private var available = 0
+        init(samples: [Float], step: Int) { self.samples = samples; self.step = step }
+        func poll() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            available = min(samples.count, available + step)
+            return available
+        }
+        func prefix() -> [Float] {
+            lock.lock(); let count = available; lock.unlock()
+            return Array(samples[0..<count])
+        }
+        var isFullyFed: Bool { lock.lock(); defer { lock.unlock() }; return available == samples.count }
+    }
+
+    /// Synthetic long dictation: deterministic noise "speech" (RMS ≈ 0.17)
+    /// and near-silent pauses. The pattern covers ordinary pause cuts, a
+    /// 25 s hard-cap cut, and a long pause that starts before the segment
+    /// reaches the 15 s minimum — the case where the open segment is later
+    /// cut BACK at the pause start, so a naive "it is already this long"
+    /// stability rule would be wrong.
+    private static func incrementalTestRecording() -> [Float] {
+        let pattern: [(speech: Bool, seconds: Double)] = [
+            (true, 16), (false, 0.5), (true, 1), (false, 15), (true, 12), (false, 0.6),
+            (true, 5), (false, 0.3), (true, 30), (false, 1), (true, 3), (false, 0.5),
+            (true, 20), (false, 0.45), (true, 16), (false, 2), (true, 9),
+        ]
+        var state: UInt64 = 0x2545_f491_4f6c_dd1d
+        var out: [Float] = []
+        for part in pattern {
+            let count = Int(part.seconds * SAMPLE_RATE)
+            let amplitude: Float = part.speech ? 0.3 : 0.001
+            for _ in 0..<count {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17
+                let unit = Float(state % 20_001) / 10_000 - 1
+                out.append(unit * amplitude)
+            }
+        }
+        return out
+    }
+
+    /// Deterministic fake word-timestamp ASR: one word per non-silent
+    /// 0.5 s block of the window, its text derived from the block's audio.
+    private static func incrementalFakeWords(_ samples: [Float]) -> [TranscribedWord] {
+        let block = Int(0.5 * SAMPLE_RATE)
+        var words: [TranscribedWord] = []
+        var offset = 0
+        while offset < samples.count {
+            let end = min(samples.count, offset + block)
+            let slice = Array(samples[offset..<end])
+            let rms = sqrt(slice.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(1, slice.count)))
+            if rms > 0.02 {
+                let start = Double(offset) / SAMPLE_RATE
+                words.append(TranscribedWord(w: "w\(speculativeWindowChecksum(slice) % 9973)",
+                                             start: start, end: start + 0.4, conf: 0.9))
+            }
+            offset = end
+        }
+        return words
+    }
+
+    private static func incrementalFakeResult(_ samples: [Float]) -> TokenTranscriptionWorkerResult {
+        let words = incrementalFakeWords(samples)
+        return TokenTranscriptionWorkerResult(
+            transcription: TokenTranscription(text: words.map(\.w).joined(separator: " "),
+                                              frameSec: 0.08, tokens: [], words: words),
+            workerQueueSeconds: 0, engineCallSeconds: 0.01, engineProcessingSeconds: 0.01)
+    }
+
+    /// Hermetic coverage for IncrementalTranscription.swift: no model, no
+    /// audio device, no LLM host (the coordinator below runs with every
+    /// stage off). Seam placement is forced onto the mel-energy oracle so
+    /// a Silero model on this Mac cannot make the test non-hermetic.
+    private static func testIncrementalTranscription() throws {
+        let previousVad = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"]
+        setenv("SUPERDICTATE_SILERO_VAD_MODEL", "/nonexistent/silero-vad-for-self-test.onnx", 1)
+        defer {
+            if let previousVad { setenv("SUPERDICTATE_SILERO_VAD_MODEL", previousVad, 1) }
+            else { unsetenv("SUPERDICTATE_SILERO_VAD_MODEL") }
+        }
+
+        let full = incrementalTestRecording()
+        let segments = PauseSegmenter.segment(samples: full, sampleRate: SAMPLE_RATE)
+        let finalWindows = OverlapWindower.addOverlap(to: segments, sampleRate: SAMPLE_RATE)
+        try expect(finalWindows.count >= 5, equals: true, "the synthetic recording takes the multi-window overlap path")
+
+        // 1) Growing buffer: every window declared stable on a prefix equals
+        // the full buffer's window at the same index, for odd chunk sizes too.
+        for chunk in [Int(2.3 * SAMPLE_RATE), 59_123] {
+            var length = 0
+            var lastStableCount = 0
+            while length < full.count {
+                length = min(full.count, length + chunk)
+                let stable = SpeculativeWindowPlanner.stableWindows(prefix: Array(full[0..<length]))
+                for (index, window) in stable.enumerated() {
+                    guard index < finalWindows.count, window == finalWindows[index] else {
+                        throw SelfTestFailure.failed("stable window \(index) at prefix \(length) (chunk \(chunk)) differs from the full-buffer window")
+                    }
+                }
+                try expect(stable.count >= lastStableCount, equals: true,
+                           "the stable prefix never shrinks as the buffer grows (chunk \(chunk), prefix \(length))")
+                lastStableCount = stable.count
+            }
+            try expect(lastStableCount >= finalWindows.count - 2, equals: true,
+                       "at release at most the last two windows are left (chunk \(chunk))")
+        }
+        // The pending-pause case: at 20 s the open segment is 4 s long but
+        // will be cut back to 1.5 s, so window 0's trailing overlap is not
+        // known yet.
+        try expect(SpeculativeWindowPlanner.stableWindows(prefix: Array(full[0..<Int(20 * SAMPLE_RATE)])).count, equals: 0,
+                   "a window whose next segment can still be cut back at an open pause is not stable")
+        try expect(SpeculativeWindowPlanner.stableWindows(prefix: Array(full[0..<Int(14 * SAMPLE_RATE)])).count, equals: 0,
+                   "nothing is stable before the first cut (short dictations get no recording-time work)")
+
+        // Reference: the batch overlap path without any cache.
+        let referenceProbe = IncrementalTestProbe()
+        let reference = try runParakeetEngineSynchronously {
+            try await transcribeWithOverlapWindows(samples: full, segments: segments,
+                                                   speculativeCache: nil, engineGeneration: 1) { samples in
+                referenceProbe.enter(); defer { referenceProbe.leave() }
+                return incrementalFakeResult(samples)
+            }
+        }
+        try expect(referenceProbe.calls, equals: finalWindows.count, "the batch path transcribes every window")
+
+        // 2) The driver over a growing feed builds a cache; the release path
+        // with it yields byte-identical text and transcribes only the rest.
+        // 5) ...and the LLM stage sees only the final text, once.
+        let llmSettings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.incremental-transcription")!,
+                                   vocabularyStore: .inMemoryFallback())
+        llmSettings.textPostprocessingMode = .off
+        llmSettings.rewriteEnabled = false
+        let pipeline = try runParakeetEngineSynchronously { () -> (TranscriptionWorkerResult, Int, Int, Int, [String], [String], String) in
+            let feed = IncrementalTestFeed(samples: full, step: Int(2 * SAMPLE_RATE))
+            let recordingProbe = IncrementalTestProbe()
+            let coordinator = LLMPostprocessingCoordinator()
+            let driver = IncrementalOverlapTranscriber(
+                engineGeneration: 1, pollInterval: 0.01,
+                snapshot: { feed.prefix() },
+                sampleCount: { feed.poll() },
+                transcribeWindow: { samples in
+                    recordingProbe.enter(); defer { recordingProbe.leave() }
+                    return incrementalFakeResult(samples)
+                })
+            await driver.start()
+            while !feed.isFullyFed { try await Task.sleep(nanoseconds: 5_000_000) }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let llmCallsDuringRecording = await coordinator.finalizedTextInputsForTest
+
+            let releaseProbe = IncrementalTestProbe()
+            let result = try await transcribeAfterRecording(speculative: driver) { cache in
+                try await transcribeWithOverlapWindows(samples: full, segments: segments,
+                                                       speculativeCache: cache, engineGeneration: 1) { samples in
+                    releaseProbe.enter(); defer { releaseProbe.leave() }
+                    return incrementalFakeResult(samples)
+                }
+            }
+            let processed = processedDictationText(rawTranscript: result.text, corrections: [],
+                                                   removeFillerWords: false)
+            _ = await coordinator.finalizedText(processed.text, settings: llmSettings)
+            let llmCalls = await coordinator.finalizedTextInputsForTest
+            await coordinator.stop()
+            return (result, releaseProbe.calls, recordingProbe.calls, recordingProbe.maxActive,
+                    llmCallsDuringRecording, llmCalls, processed.text)
+        }
+        let (streamed, releaseCalls, recordingCalls, recordingMaxActive, llmDuringRecording, llmCalls, finalText) = pipeline
+        try expect(streamed.text, equals: reference.text,
+                   "text with the recording-time cache is byte-identical to the batch path")
+        try expect(streamed.speculativeWindowsReused >= finalWindows.count - 2, equals: true,
+                   "all but the last one or two windows come from the recording-time cache")
+        try expect(releaseCalls, equals: finalWindows.count - streamed.speculativeWindowsReused,
+                   "the release path transcribes exactly the windows the cache did not cover")
+        try expect(recordingCalls >= streamed.speculativeWindowsReused, equals: true,
+                   "every reused window was transcribed during the recording")
+        try expect(recordingMaxActive, equals: 1, "recording-time ASR is one call at a time")
+        try expect(llmDuringRecording, equals: [], "the LLM stage is never called during the recording")
+        try expect(llmCalls, equals: [finalText],
+                   "the LLM stage runs exactly once, after release, on the full assembled text")
+        try expect(finalText.contains(reference.text.prefix(20)) && finalText.hasSuffix(String(reference.text.suffix(20))),
+                   equals: true, "the text handed to the LLM stage is the whole dictation, not a window")
+
+        // 3) A cache entry with different audio, a different length, or from
+        // a reloaded engine is ignored and the window re-transcribed.
+        var tampered = full
+        for window in finalWindows {
+            tampered[window.startSample + window.samples.count / 2] += 0.25
+        }
+        var mismatched = SpeculativeWindowCache(engineGeneration: 1)
+        for (index, window) in finalWindows.enumerated() {
+            let shortened = index % 2 == 0
+            let samples = shortened
+                ? Array(full[window.startSample..<(window.startSample + window.samples.count - 320)])
+                : Array(tampered[window.startSample..<(window.startSample + window.samples.count)])
+            mismatched.insert(SpeculativeWindowResult(startSample: window.startSample,
+                                                      sampleCount: samples.count,
+                                                      checksum: speculativeWindowChecksum(samples),
+                                                      words: [TranscribedWord(w: "WRONG", start: 0.1, end: 0.3, conf: 1)],
+                                                      engineCallSeconds: 1))
+        }
+        var exact = SpeculativeWindowCache(engineGeneration: 1)
+        for window in finalWindows {
+            exact.insert(SpeculativeWindowResult(startSample: window.startSample, sampleCount: window.samples.count,
+                                                 checksum: speculativeWindowChecksum(window.samples),
+                                                 words: [TranscribedWord(w: "WRONG", start: 0.1, end: 0.3, conf: 1)],
+                                                 engineCallSeconds: 1))
+        }
+        for (label, cache, generation) in [("mismatched audio/length", mismatched, UInt64(1)),
+                                           ("a reloaded engine", exact, UInt64(2))] {
+            let probe = IncrementalTestProbe()
+            let rerun = try runParakeetEngineSynchronously {
+                try await transcribeWithOverlapWindows(samples: full, segments: segments,
+                                                       speculativeCache: cache, engineGeneration: generation) { samples in
+                    probe.enter(); defer { probe.leave() }
+                    return incrementalFakeResult(samples)
+                }
+            }
+            try expect(rerun.speculativeWindowsReused, equals: 0, "no cache entry from \(label) is reused")
+            try expect(probe.calls, equals: finalWindows.count, "every window is re-transcribed for \(label)")
+            try expect(rerun.text, equals: reference.text, "text is unchanged for \(label)")
+        }
+
+        // 4) Cancellation mid-recording: cancel() returns only once the
+        // in-flight call is done, nothing runs afterwards, nothing is kept.
+        let cancelled = try runParakeetEngineSynchronously { () -> (Int, Int, Int, Bool) in
+            let probe = IncrementalTestProbe()
+            let driver = IncrementalOverlapTranscriber(
+                engineGeneration: 1, pollInterval: 0.01,
+                snapshot: { full },
+                sampleCount: { full.count },
+                transcribeWindow: { samples in
+                    probe.enter(); defer { probe.leave() }
+                    try await Task.sleep(nanoseconds: 60_000_000)
+                    return incrementalFakeResult(samples)
+                })
+            await driver.start()
+            try await Task.sleep(nanoseconds: 90_000_000)
+            await driver.cancel()
+            let activeAfterCancel = probe.active
+            let callsAtCancel = probe.calls
+            try await Task.sleep(nanoseconds: 200_000_000)
+            let cache = await driver.finish()
+            return (activeAfterCancel, callsAtCancel, probe.calls, cache == nil)
+        }
+        try expect(cancelled.0, equals: 0, "cancel() waits for the in-flight recording-time window")
+        try expect(cancelled.1 >= 1, equals: true, "the cancellation test really had recording-time work in flight")
+        try expect(cancelled.2, equals: cancelled.1, "no recording-time ASR starts after cancel()")
+        try expect(cancelled.3, equals: true, "a cancelled recording hands no cache to the release path")
+
+        // A throw from recording-time ASR drops the cache instead of
+        // failing anything.
+        let failedCache = try runParakeetEngineSynchronously { () -> Bool in
+            let driver = IncrementalOverlapTranscriber(
+                engineGeneration: 1, pollInterval: 0.01,
+                snapshot: { full }, sampleCount: { full.count },
+                transcribeWindow: { _ in throw NSError(domain: "selftest", code: 1) })
+            await driver.start()
+            try await Task.sleep(nanoseconds: 80_000_000)
+            return await driver.finish() == nil
+        }
+        try expect(failedCache, equals: true, "a recording-time ASR failure drops the cache")
     }
 
     /// Direct regression coverage for `OverlapWindower.addOverlap`, and in

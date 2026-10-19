@@ -46,6 +46,8 @@ let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
 if let benchmarkResult = runASRBenchmarkDiagnostic(arguments: launchArguments) {
     exit(benchmarkResult)
+} else if let streamingResult = runStreamingASRBenchmarkDiagnostic(arguments: launchArguments) {
+    exit(streamingResult)
 } else if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {

@@ -353,6 +353,47 @@ then answers with status `CANCELLED` under its own id.
   `Contents/Helpers`). A failed segment keeps already completed segments
   and propagates `hadSegmentFailure` through the existing segmentation code.
 
+### 8.1 Transcribing while recording (2026-10-19)
+
+Long dictations no longer wait for all of their audio after release.
+`IncrementalOverlapTranscriber` (`swift/Sources/Parakey/IncrementalTranscription.swift`)
+starts at press and, every 1.5 s once the recording holds ≥ 15 s, snapshots
+the samples captured so far (`AudioCapture.activeRecordingSnapshot`),
+computes the overlap windows that are already final and transcribes the
+next uncached one through `TranscriptionWorker.transcribeWithTokens` — one
+call at a time. Plan: `docs/superpowers/plans/2026-10-19-transcribe-while-recording.md`.
+
+- **Stability.** `PauseSegmenter` is a greedy left-to-right pass over 20 ms
+  windows aligned at sample 0, so on the prefix trimmed to whole windows it
+  makes exactly the full buffer's cuts; every segment but the open last one
+  is final. Window i is final when segments i−1, i are final and segment
+  i+1 is final or can no longer become shorter than `min(4 s, halfBudget(i))`
+  — the open segment can only be cut back to the start of the silent run
+  still open at the end of the prefix
+  (`PauseSegmenter.segmentWithPendingPause`).
+- **Exact-match cache, same text.** At release the segments and windows are
+  computed from the full buffer exactly as before; a window reuses its
+  recording-time words only if start sample, sample count, audio checksum
+  and `TranscriptionWorker.engineGeneration` (bumped on every load/unload)
+  all match. Everything else is transcribed again, and Phase B assembly is
+  unchanged — the text is byte-identical to the batch path.
+- **Release ordering.** `transcribeSegmentedAfterRecording` stops the
+  driver and awaits its in-flight window before the release path uses the
+  worker. The cache holds words only; correction/rewrite
+  (`LLMPostprocessingCoordinator.finalizedText`) still runs once, after
+  release, on the assembled text. Cancel, termination and startup restarts
+  discard the cache (awaiting the in-flight window where the worker is used
+  next). A throw during the recording just drops the cache.
+- **Short dictations** (< 15 s) get no recording-time work at all.
+- **Diagnostics.** The overlap log line reports `N windows (K from
+  recording-time cache)`; the latency line keeps `engine_call` post-release
+  only and adds `speculative_asr`, `speculative_wait`,
+  `speculative_windows`. `--benchmark-transcribe-streaming [onnx|gigaam]
+  cpu <threads> <speed> <wav...>` feeds a WAV at `speed`× real time,
+  releases, and prints `post_release_s`, `windows_reused` and
+  `identical=` versus the batch path. Self-test group:
+  `incremental-transcription`.
+
 ## 9. UI and diagnostics
 
 Expose model, backend, provider requested/actual, quantization, language,

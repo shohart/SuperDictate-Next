@@ -40,6 +40,14 @@ struct TranscriptionWorkerResult: Sendable {
     /// `TranscriptionWorker.transcribe(...)` result — only
     /// `transcribeSegmented` ever sets it true.
     var hadSegmentFailure: Bool = false
+    /// Overlap windows whose words came from the recording-time cache
+    /// (IncrementalTranscription.swift) instead of a post-release ASR call,
+    /// and the ASR seconds those calls took DURING the recording. Not part
+    /// of `engineCallSeconds`, which is post-release work only.
+    var speculativeWindowsReused: Int = 0
+    var speculativeEngineCallSeconds: Double = 0
+    /// Release-side wait for the recording-time window still in flight.
+    var speculativeWaitSeconds: Double = 0
 
     func timing(totalSeconds: Double) -> ASRTimingBreakdown {
         ASRTimingBreakdown(
@@ -112,6 +120,10 @@ actor TranscriptionWorker {
     /// Reentrancy backstop — see the comment above. True for the full
     /// duration of transcribe(), including across its await.
     private var inFlight = false
+    /// Bumped on every load/unload: recording-time window results carry
+    /// the generation they were made with and are dropped at release if
+    /// the engine was replaced in between.
+    private(set) var engineGeneration: UInt64 = 0
     #if DEBUG
     /// Self-test hook (`onnx-asr-real`): load this already-installed model
     /// directory instead of the profile's app cache. Never set in the app.
@@ -179,6 +191,7 @@ actor TranscriptionWorker {
         engine = loaded
         loadedProfile = profile
         ready = true
+        engineGeneration &+= 1
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
         log("ASR model: \(profile.displayName)")
         log("ASR runtime: ONNX Runtime (SuperDictateOnnxHost)")
@@ -324,6 +337,7 @@ actor TranscriptionWorker {
         engine = nil
         loadedProfile = nil
         ready = false
+        engineGeneration &+= 1
         log("ASR: unloaded")
     }
 }
@@ -345,7 +359,8 @@ func transcribeSegmented(
     worker: TranscriptionWorker,
     language: DictationLanguage?,
     resolveViaKeyboard: Bool,
-    requestedAt: TimeInterval
+    requestedAt: TimeInterval,
+    speculativeCache: SpeculativeWindowCache? = nil
 ) async throws -> TranscriptionWorkerResult {
     let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
 
@@ -364,7 +379,8 @@ func transcribeSegmented(
                 samples: samples,
                 segments: segments,
                 worker: worker,
-                requestedAt: requestedAt
+                requestedAt: requestedAt,
+                speculativeCache: speculativeCache
             )
             log("overlap transcription path: succeeded")
             return result
@@ -442,7 +458,31 @@ func transcribeWithOverlapWindows(
     samples: [Float],
     segments: [AudioSegment],
     worker: TranscriptionWorker,
-    requestedAt: TimeInterval
+    requestedAt: TimeInterval,
+    speculativeCache: SpeculativeWindowCache? = nil
+) async throws -> TranscriptionWorkerResult {
+    let engineGeneration = await worker.engineGeneration
+    return try await transcribeWithOverlapWindows(
+        samples: samples,
+        segments: segments,
+        speculativeCache: speculativeCache,
+        engineGeneration: engineGeneration
+    ) { windowSamples in
+        try await worker.transcribeWithTokens(samples: windowSamples, requestedAt: requestedAt)
+    }
+}
+
+/// The overlap path proper, with the window ASR call injected (the
+/// `incremental-transcription` self-test drives it with a fake). A window
+/// whose exact audio is in `speculativeCache` (same start, count and
+/// checksum, same `engineGeneration`) reuses those words; every other
+/// window is transcribed here, exactly as without a cache.
+func transcribeWithOverlapWindows(
+    samples: [Float],
+    segments: [AudioSegment],
+    speculativeCache: SpeculativeWindowCache?,
+    engineGeneration: UInt64,
+    transcribeWindow: ([Float]) async throws -> TokenTranscriptionWorkerResult
 ) async throws -> TranscriptionWorkerResult {
     // `segments` MUST be `PauseSegmenter.segment(...)`'s direct output —
     // never filtered or reordered — or every `AudioSegment.startSample`,
@@ -456,10 +496,22 @@ func transcribeWithOverlapWindows(
     var totalEngineCallSeconds = 0.0
     var totalEngineProcessingSeconds = 0.0
     var firstWorkerQueueSeconds = 0.0
+    var haveFirstTiming = false
+    var reusedCount = 0
+    var speculativeEngineCallSeconds = 0.0
 
-    for (index, window) in windows.enumerated() {
-        let result = try await worker.transcribeWithTokens(samples: window.samples, requestedAt: requestedAt)
-        if index == 0 { firstWorkerQueueSeconds = result.workerQueueSeconds }
+    for window in windows {
+        if let cached = speculativeCache?.result(for: window, engineGeneration: engineGeneration) {
+            reusedCount += 1
+            speculativeEngineCallSeconds += cached.engineCallSeconds
+            perWindowWords.append(cached.words)
+            continue
+        }
+        let result = try await transcribeWindow(window.samples)
+        if !haveFirstTiming {
+            firstWorkerQueueSeconds = result.workerQueueSeconds
+            haveFirstTiming = true
+        }
         totalEngineCallSeconds += result.engineCallSeconds
         totalEngineProcessingSeconds += result.engineProcessingSeconds
         perWindowWords.append(result.transcription.words)
@@ -469,7 +521,7 @@ func transcribeWithOverlapWindows(
     let assembled = try assembleOverlapWindows(windows: windows,
                                                perWindowWords: perWindowWords,
                                                fullSamples: samples)
-    log("overlap transcription: \(windows.count) windows, seam splits \(assembled.seamSplitSamples), \(assembled.droppedAtSeams) word(s) deduped at seams")
+    log("overlap transcription: \(windows.count) windows (\(reusedCount) from recording-time cache), seam splits \(assembled.seamSplitSamples), \(assembled.droppedAtSeams) word(s) deduped at seams")
 
     return TranscriptionWorkerResult(
         text: assembled.text,
@@ -482,7 +534,9 @@ func transcribeWithOverlapWindows(
         // nothing, so this path only ever RETURNS when nothing was lost.
         // Every real loss is handled by the plain path's shipped
         // retry/`hadSegmentFailure`/retain-on-loss net, untouched here.
-        hadSegmentFailure: false
+        hadSegmentFailure: false,
+        speculativeWindowsReused: reusedCount,
+        speculativeEngineCallSeconds: speculativeEngineCallSeconds
     )
 }
 

@@ -57,6 +57,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let audio = AudioCapture()
     private let hotkey = HotkeyListener()
     private let asr = TranscriptionWorker()
+    /// Recording-time transcription of the current recording's stable
+    /// overlap windows (IncrementalTranscription.swift). Created at press,
+    /// taken by whichever path ends the recording.
+    private var speculativeTranscription: Task<IncrementalOverlapTranscriber, Never>?
     private let insertionTargetTracker = FocusedInsertionTargetTracker()
     private let settings = Settings.shared
     private let llmPostprocessing = LLMPostprocessingCoordinator()
@@ -828,6 +832,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 log("startup restart: active dictation preserved for recovery")
             }
         }
+        discardSpeculativeTranscription(takeSpeculativeTranscription())
         stopRecordingLevelMeter()
         unmuteIfWeMuted()
 
@@ -2167,6 +2172,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         isRecording = true
+        startSpeculativeTranscription()
         if setupChecklistWindow?.isVisible == true {
             hotkeyTestSucceeded = true
             updateSetupChecklist()
@@ -2305,11 +2311,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let audioFinalizeStartedAt = ProcessInfo.processInfo.systemUptime
         let captured = audio.endRecording()
         let audioFinalizedAt = ProcessInfo.processInfo.systemUptime
+        let speculative = takeSpeculativeTranscription()
         let samples = captured.samples
         let dur: Double
         switch recordingReleaseAction(capturedSampleCount: samples.count) {
         case .discardTooShort(let duration):
             dur = duration
+            discardSpeculativeTranscription(speculative)
             log("release: clip too short (\(String(format: "%.2f", dur)) s), discarding")
             PendingDictationRecovery.remove(captured.recoveryURL)
             hideRecordingHUD()
@@ -2331,8 +2339,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcribeSegmented(
+            // Stops recording-time work and awaits its in-flight window
+            // before the full buffer goes through the normal path; the LLM
+            // (finalizedText, below) only ever sees the assembled result.
+            let transcription = try await transcribeSegmentedAfterRecording(
                 samples: samples,
+                speculative: await speculative?.value,
                 worker: transcriptionWorker,
                 language: language,
                 resolveViaKeyboard: true,
@@ -2552,7 +2564,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             insertionDispatchSeconds: insertionCompletedAt - insertionStartedAt,
                             releaseToPasteDispatchSeconds: insertionCompletedAt - releaseReceivedAt,
                             enterDelaySeconds: enterDelaySeconds,
-                            pasteSucceeded: inserted
+                            pasteSucceeded: inserted,
+                            speculativeASRSeconds: transcription.speculativeEngineCallSeconds,
+                            speculativeWaitSeconds: transcription.speculativeWaitSeconds,
+                            speculativeWindowsReused: transcription.speculativeWindowsReused
                         ).logLine)
                     } else if completed.transcription.hadSegmentFailure {
                         // At least one segment that DID contain real speech
@@ -2604,6 +2619,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         cancelMaxDurationAutoRelease()
         let captured = audio.endRecording()
+        let speculative = takeSpeculativeTranscription()
         let duration = Double(captured.samples.count) / SAMPLE_RATE
         isRecording = false
         stopRecordingLevelMeter(hideHUD: false)
@@ -2611,6 +2627,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         unmuteIfWeMuted()
 
         guard !captured.samples.isEmpty else {
+            discardSpeculativeTranscription(speculative)
             PendingDictationRecovery.remove(captured.recoveryURL)
             hideRecordingHUD()
             setMenuBarState(.idle)
@@ -2628,6 +2645,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         Task { @MainActor in
             var recoveryFailed = false
+            // A cancelled recording drops its recording-time results, but
+            // the in-flight window must finish before the worker is used.
+            await speculative?.value.cancel()
             do {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await transcribeSegmented(
@@ -2707,6 +2727,31 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                         runDeferredRefresh: runDeferredRefresh)
     }
 
+    /// Starts recording-time transcription for the recording that just
+    /// began. It does nothing until the recording is long enough to be
+    /// segmented, so short dictations never get any extra work.
+    private func startSpeculativeTranscription() {
+        discardSpeculativeTranscription(takeSpeculativeTranscription())
+        guard let generation = audio.activeRecordingGeneration else { return }
+        speculativeTranscription = Task { [audio, asr] in
+            await IncrementalOverlapTranscriber.forRecording(audio: audio, generation: generation, worker: asr)
+        }
+    }
+
+    /// Every path that ends a recording takes the driver exactly once.
+    private func takeSpeculativeTranscription() -> Task<IncrementalOverlapTranscriber, Never>? {
+        defer { speculativeTranscription = nil }
+        return speculativeTranscription
+    }
+
+    /// For paths that do not transcribe right away: stop and drop the
+    /// recording-time work in the background (its in-flight window, if
+    /// any, still runs to completion inside the driver).
+    private func discardSpeculativeTranscription(_ task: Task<IncrementalOverlapTranscriber, Never>?) {
+        guard let task else { return }
+        Task { await task.value.cancel() }
+    }
+
     // Termination cannot await transcription, so it only flushes the
     // recovery journal. The next launch transcribes it into history.
     private func cancelRecordingForTermination() {
@@ -2730,6 +2775,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 log("terminate: active dictation preserved for next-launch recovery")
             }
         }
+        discardSpeculativeTranscription(takeSpeculativeTranscription())
         stopRecordingLevelMeter()
         stopAudioEngineImmediately()
         isRecording = false

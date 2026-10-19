@@ -62,7 +62,35 @@ enum PauseSegmenter {
         silenceRMSThreshold: Float = defaultSilenceRMSThreshold,
         signalMinWindows: Int = defaultSignalMinWindows
     ) -> [AudioSegment] {
-        guard !samples.isEmpty else { return [] }
+        segmentWithPendingPause(samples: samples,
+                                sampleRate: sampleRate,
+                                maxSegmentSeconds: maxSegmentSeconds,
+                                minSegmentSeconds: minSegmentSeconds,
+                                pauseThresholdSeconds: pauseThresholdSeconds,
+                                windowSeconds: windowSeconds,
+                                silenceRMSThreshold: silenceRMSThreshold,
+                                signalMinWindows: signalMinWindows).segments
+    }
+
+    /// `segment(...)` plus the one piece of loop state the recording-time
+    /// path (IncrementalTranscription.swift) needs: the absolute sample
+    /// where the silent run still open at the END of `samples` began (nil
+    /// when the buffer ends on a non-silent window or right after a cut).
+    /// A later pause cut of the trailing segment can land there at the
+    /// earliest — never before it — so it bounds how short that segment
+    /// can still become once more audio arrives. The cuts themselves are
+    /// exactly `segment(...)`'s: this IS that function's body.
+    static func segmentWithPendingPause(
+        samples: [Float],
+        sampleRate: Double,
+        maxSegmentSeconds: Double = defaultMaxSegmentSeconds,
+        minSegmentSeconds: Double = defaultMinSegmentSeconds,
+        pauseThresholdSeconds: Double = defaultPauseThresholdSeconds,
+        windowSeconds: Double = defaultWindowSeconds,
+        silenceRMSThreshold: Float = defaultSilenceRMSThreshold,
+        signalMinWindows: Int = defaultSignalMinWindows
+    ) -> (segments: [AudioSegment], pendingSilentRunStartSample: Int?) {
+        guard !samples.isEmpty else { return ([], nil) }
 
         let windowSize = max(1, Int(windowSeconds * sampleRate))
         let maxSegmentSamples = max(windowSize, Int(maxSegmentSeconds * sampleRate))
@@ -156,6 +184,6 @@ enum PauseSegmenter {
         }
 
         _ = makeSegment(endSample: samples.count)
-        return segments
+        return (segments, silentRunStart.map(sampleIndex(forWindow:)))
     }
 }

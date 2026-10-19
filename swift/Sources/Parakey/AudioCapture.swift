@@ -291,6 +291,13 @@ struct AudioSampleAccumulator {
         sampleCount = 0
     }
 
+    /// The chunks captured so far, without draining them. The chunk
+    /// arrays are copy-on-write, so this is a reference copy under the
+    /// caller's lock; flattening happens outside it.
+    func snapshot() -> CapturedAudioSegments {
+        CapturedAudioSegments(segments: segments, sampleCount: sampleCount)
+    }
+
     mutating func drain() -> CapturedAudioSegments {
         let captured = CapturedAudioSegments(segments: segments,
                                              sampleCount: sampleCount)
@@ -558,6 +565,38 @@ final class AudioCapture: @unchecked Sendable {
             journalFlushSeconds: journalFlushedAt - detachedAt,
             flattenSeconds: flattenedAt - journalFlushedAt
         )
+    }
+
+    /// Identifies the recording in progress (nil when none): every
+    /// begin/end bumps `recordingGeneration`, so a reader that keeps this
+    /// value can tell its recording apart from any later one.
+    var activeRecordingGeneration: UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        return _isRunning ? recordingGeneration : nil
+    }
+
+    /// Samples captured so far by recording `generation`, or nil once that
+    /// recording ended (or another began). Cheap under the lock — the
+    /// chunks are only reference-copied there — and flattened on the
+    /// caller's thread, never the render thread's. The buffer is
+    /// append-only within one recording, so this is always a prefix of
+    /// what `endRecording()` will return for it.
+    func activeRecordingSnapshot(generation: UInt64) -> [Float]? {
+        lock.lock()
+        guard _isRunning, recordingGeneration == generation else {
+            lock.unlock()
+            return nil
+        }
+        let captured = samples.snapshot()
+        lock.unlock()
+        return captured.flattened()
+    }
+
+    /// Sample count of recording `generation` so far; nil once it ended.
+    func activeRecordingSampleCount(generation: UInt64) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        guard _isRunning, recordingGeneration == generation else { return nil }
+        return samples.sampleCount
     }
 
     func latestRecordingLevelSnapshot() -> (level: Float, sequence: UInt64) {
