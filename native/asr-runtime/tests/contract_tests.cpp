@@ -8,6 +8,7 @@
 
 #include "audio.h"
 #include "common.h"
+#include "families/family_util.h"
 #include "manifest.h"
 #include "nlohmann/json.hpp"
 #include "sd_asr.h"
@@ -22,6 +23,7 @@ namespace {
 fs::path g_assets;
 
 const char *kNemoSha = "5b4a84c52eeaa615dc46d781cc7e4598f9b432184831d57493c48adcd01371a9";
+const char *kGigaamPreprocessorSha = "919c3bc8a434b6e733e5fe5dcd247974d0a7b1f2bc5b6995b6ad55f7225e014d";
 
 struct TempDir {
     fs::path path;
@@ -268,6 +270,62 @@ TEST_CASE("sha256 known answers") {
     two_blocks.update(msg.data(), msg.size());
     CHECK_EQ(two_blocks.hex_digest(), std::string("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
     CHECK_EQ(sdasr::sha256_file(g_assets / "nemo128.onnx"), std::string(kNemoSha));
+    CHECK_EQ(sdasr::sha256_file(g_assets / "gigaam_v3.onnx"), std::string(kGigaamPreprocessorSha));
+}
+
+TEST_CASE("gigaam_rnnt is a supported family; missing params are invalid_model") {
+    TempDir dir;
+    json m = fake_manifest();
+    m["family"] = "gigaam_rnnt";
+    m["files"]["preprocessor"] = {{"bundled", "gigaam_v3.onnx"}, {"sha256", kGigaamPreprocessorSha}};
+    populate(dir.path, m);
+    CHECK_EQ(create(config_for(dir.path)), std::make_pair(SD_ASR_INVALID_MODEL, std::string("invalid_model")));
+    CHECK(sdasr::is_supported_family("gigaam_rnnt"));
+}
+
+// Expected strings come from onnx-asr's DECODE_SPACE_PATTERN in Python:
+//   re.sub(r"\A\s|\s\B|(\s)\b", lambda m: " " if m.group(1) else "", "".join(pieces).replace("\u2581", " "))
+TEST_CASE("gigaam space rule matches onnx-asr text, words re-join to it") {
+    const std::vector<std::string> pieces = {"\u2581при", "вет", ",", "\u2581мир", "\u2581", ".", "\u2581«",
+                                             "да",          "»",   "\u258150", "\u2581—", "1", "ü_x"};
+    auto run = [&](const std::vector<int> &ids) {
+        sdasr::FamilyResult result;
+        result.frame_sec = 0.04;
+        for (size_t i = 0; i < ids.size(); ++i) result.tokens.push_back({ids[i], double(i) * 0.04, 0.5 + 0.01 * double(i)});
+        sdasr::build_text_and_words_space_rule(result, pieces, 10.0);
+        return result;
+    };
+    auto words_of = [](const sdasr::FamilyResult &r) {
+        std::vector<std::string> out;
+        for (const auto &w : r.words) out.push_back(w.w);
+        return out;
+    };
+
+    sdasr::FamilyResult a = run({0, 1, 2, 3, 4, 5});
+    CHECK_EQ(a.text, std::string("привет, мир."));
+    CHECK_EQ(words_of(a), (std::vector<std::string>{"привет,", "мир."}));
+    CHECK_EQ(a.words.size(), size_t(2));
+    if (a.words.size() == 2) {
+        CHECK(std::fabs(a.words[0].start - 0.0) < 1e-12 && std::fabs(a.words[0].end - 0.12) < 1e-12);
+        CHECK(std::fabs(a.words[1].start - 0.12) < 1e-12 && std::fabs(a.words[1].end - 0.24) < 1e-12);
+        CHECK(std::fabs(a.words[0].conf - 0.5) < 1e-12 && std::fabs(a.words[1].conf - 0.53) < 1e-12);
+    }
+
+    sdasr::FamilyResult b = run({6, 7, 8, 10, 3, 4, 11});
+    CHECK_EQ(b.text, std::string("«да»— мир 1"));
+    CHECK_EQ(words_of(b), (std::vector<std::string>{"«да»—", "мир", "1"}));
+    if (b.words.size() == 3) CHECK(std::fabs(b.words[2].start - 0.20) < 1e-12);  // the bare U+2581 token
+
+    CHECK_EQ(run({9, 4, 2, 12, 4}).text, std::string("50,ü_x"));
+    CHECK_EQ(run({4, 4, 7}).text, std::string(" да"));  // only the very first space is "\A\s"
+    CHECK_EQ(run({}).text, std::string());
+
+    CHECK(sdasr::is_word_code_point(U'ё') && sdasr::is_word_code_point(U'Я') && sdasr::is_word_code_point(U'_'));
+    CHECK(sdasr::is_word_code_point(U'²') && sdasr::is_word_code_point(U'ß'));
+    for (char32_t cp : {U'«', U'»', U'—', U'€', U'₽', U'°', U'\u2581', U'-', U'.', U'×'}) {
+        CHECK(!sdasr::is_word_code_point(cp));
+    }
+    CHECK(sdasr::is_space_code_point(U' ') && sdasr::is_space_code_point(U'\u00A0') && !sdasr::is_space_code_point(U'\u2581'));
 }
 
 int main(int argc, char **argv) {

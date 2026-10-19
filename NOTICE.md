@@ -36,9 +36,18 @@ respective upstream projects.
 - `native/asr-runtime/assets/nemo128.onnx` — NeMo-compatible 128-bin log-mel
   feature graph from [onnx-asr](https://github.com/istupakov/onnx-asr) 0.12.0
   by Ilya Stupakov (MIT).
+- `native/asr-runtime/assets/gigaam_v3.onnx` — GigaAM v3 64-bin log-mel
+  feature graph from the same onnx-asr 0.12.0 wheel
+  (`onnx_asr/preprocessors/data/gigaam_v3.onnx`, sha256
+  `919c3bc8a434b6e733e5fe5dcd247974d0a7b1f2bc5b6995b6ad55f7225e014d`), MIT;
+  licence text in `native/asr-runtime/assets/onnx-asr-LICENSE.txt`.
 - `native/asr-runtime/third_party/nlohmann/json.hpp` —
   [nlohmann/json](https://github.com/nlohmann/json) 3.11.3 (MIT).
 - Parakeet Ultra ONNX int8 weights (downloaded at runtime, not bundled):
   [mldecode/parakeet-ultra-onnx-int8](https://huggingface.co/mldecode/parakeet-ultra-onnx-int8),
   CC-BY-4.0 — based on [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra),
   a retrain of NVIDIA [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
+- GigaAM v3 e2e RNN-T ONNX int8 weights (downloaded at runtime, not bundled):
+  [istupakov/gigaam-v3-onnx](https://huggingface.co/istupakov/gigaam-v3-onnx)
+  (MIT), an ONNX export of [GigaAM](https://github.com/salute-developers/GigaAM)
+  v3 by SberDevices / GigaChat Team (MIT).

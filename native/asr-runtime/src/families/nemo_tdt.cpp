@@ -10,84 +10,14 @@
 #include <fstream>
 #include <limits>
 
-#include "family.h"
+#include "family_util.h"
 
 namespace sdasr {
 
 namespace {
 
-constexpr const char *kWordStart = "\xE2\x96\x81";  // U+2581 "▁"
-
-int64_t int_param(const Manifest &manifest, const char *key) {
-    auto it = manifest.params.find(key);
-    if (it == manifest.params.end() || !it->is_number_integer()) {
-        throw Error(SD_ASR_INVALID_MODEL, std::string("manifest: nemo_tdt requires integer params.") + key);
-    }
-    return it->get<int64_t>();
-}
-
-double number_param(const Manifest &manifest, const char *key) {
-    auto it = manifest.params.find(key);
-    if (it == manifest.params.end() || !it->is_number()) {
-        throw Error(SD_ASR_INVALID_MODEL, std::string("manifest: nemo_tdt requires numeric params.") + key);
-    }
-    return it->get<double>();
-}
-
 bool starts_with(const std::string &value, const char *prefix) {
     return value.rfind(prefix, 0) == 0;
-}
-
-// Pieces such as <unk>, <pad>, <|nospeech|> never reach the transcript.
-bool is_control_piece(const std::string &piece) {
-    return piece.size() >= 2 && piece.front() == '<' && piece.back() == '>';
-}
-
-std::vector<std::string> load_tokens(const std::filesystem::path &path, int64_t expected_count) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw Error(SD_ASR_INVALID_MODEL, "cannot open tokens file");
-    std::vector<std::string> pieces(static_cast<size_t>(expected_count));
-    std::vector<bool> seen(static_cast<size_t>(expected_count), false);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        const size_t space = line.rfind(' ');
-        if (space == std::string::npos || space == 0) throw Error(SD_ASR_INVALID_MODEL, "malformed tokens line: " + line);
-        long long id = -1;
-        try {
-            id = std::stoll(line.substr(space + 1));
-        } catch (...) {
-            throw Error(SD_ASR_INVALID_MODEL, "malformed token id: " + line);
-        }
-        if (id < 0 || id >= expected_count) throw Error(SD_ASR_INVALID_MODEL, "token id out of range: " + line);
-        pieces[size_t(id)] = line.substr(0, space);
-        seen[size_t(id)] = true;
-    }
-    for (int64_t i = 0; i < expected_count; ++i) {
-        if (!seen[size_t(i)]) throw Error(SD_ASR_INVALID_MODEL, "tokens file is missing id " + std::to_string(i));
-    }
-    return pieces;
-}
-
-std::vector<int64_t> output_shape(Ort::Session &session, size_t index) {
-    return session.GetOutputTypeInfo(index).GetTensorTypeAndShapeInfo().GetShape();
-}
-
-void expect_names(Ort::Session &session, bool inputs, const std::vector<std::string> &expected, const char *graph) {
-    Ort::AllocatorWithDefaultOptions allocator;
-    const size_t count = inputs ? session.GetInputCount() : session.GetOutputCount();
-    if (count != expected.size()) {
-        throw Error(SD_ASR_INVALID_MODEL, std::string(graph) + ": unexpected " + (inputs ? "input" : "output") +
-                                              " count " + std::to_string(count));
-    }
-    for (size_t i = 0; i < count; ++i) {
-        auto name = inputs ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
-        if (expected[i] != name.get()) {
-            throw Error(SD_ASR_INVALID_MODEL, std::string(graph) + ": expected " + (inputs ? "input " : "output ") +
-                                                  expected[i] + ", found " + name.get());
-        }
-    }
 }
 
 class NemoTdtFamily final : public ModelFamily {
@@ -228,7 +158,7 @@ public:
             if (token != blank_id_) {
                 const std::string &piece = pieces_[size_t(token)];
                 if (!is_control_piece(piece)) {
-                    result.tokens.push_back({int(token), double(t) * frame_sec_, softmax_probability(logits, token)});
+                    result.tokens.push_back({int(token), double(t) * frame_sec_, softmax_probability(logits.data(), size_t(vocab_size_), size_t(token))});
                 }
                 h.swap(h_next);
                 c.swap(c_next);
@@ -249,10 +179,6 @@ public:
     }
 
 private:
-    static void check_cancelled(const RunContext &context) {
-        if (context.cancelled && context.cancelled->load()) throw Error(SD_ASR_CANCELLED, "request cancelled");
-    }
-
     void run_decoder(Ort::RunOptions &run_options, int32_t token, std::vector<float> &h, std::vector<float> &c,
                      std::vector<float> &dec_out, std::vector<float> &h_next, std::vector<float> &c_next) {
         int32_t target = token;
@@ -297,14 +223,6 @@ private:
         std::copy(data, data + count, out.begin());
     }
 
-    double softmax_probability(const std::vector<float> &logits, int64_t token) const {
-        const auto end = logits.begin() + vocab_size_;
-        const float max_logit = *std::max_element(logits.begin(), end);
-        double sum = 0;
-        for (auto it = logits.begin(); it != end; ++it) sum += std::exp(double(*it - max_logit));
-        return std::exp(double(logits[size_t(token)] - max_logit)) / sum;
-    }
-
     // Text = pieces joined with U+2581 -> space, outer spaces trimmed. Words
     // = runs of tokens starting at a U+2581 piece (the first token always
     // starts a word).
@@ -313,7 +231,7 @@ private:
         for (size_t i = 0; i < result.tokens.size(); ++i) {
             const DecodedToken &token = result.tokens[i];
             const std::string &piece = pieces_[size_t(token.id)];
-            const bool word_start = starts_with(piece, kWordStart);
+            const bool word_start = starts_with(piece, kWordStartPiece);
             const std::string body = word_start ? piece.substr(3) : piece;
             if (word_start || result.words.empty()) {
                 if (!result.words.empty()) {
@@ -348,9 +266,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ModelFamily> create_model_family(const Manifest &manifest, const SessionFactory &factory) {
-    if (manifest.family == "nemo_tdt") return std::make_unique<NemoTdtFamily>(manifest, factory);
-    throw Error(SD_ASR_UNSUPPORTED_MODEL_FAMILY, "unsupported model family '" + manifest.family + "'");
+std::unique_ptr<ModelFamily> create_nemo_tdt_family(const Manifest &manifest, const SessionFactory &factory) {
+    return std::make_unique<NemoTdtFamily>(manifest, factory);
 }
 
 }  // namespace sdasr

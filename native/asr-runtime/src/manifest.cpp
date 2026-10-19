@@ -80,7 +80,7 @@ bool Manifest::has_capability(const std::string &name) const {
 }
 
 bool is_supported_family(const std::string &family) {
-    return family == "nemo_tdt";
+    return family == "nemo_tdt" || family == "gigaam_rnnt";
 }
 
 bool is_safe_file_name(const std::string &name) {

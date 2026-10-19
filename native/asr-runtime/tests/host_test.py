@@ -73,7 +73,9 @@ def main():
     config = json.dumps({"model_directory": model_dir, "assets_directory": assets_dir}).encode()
     host.send(CREATE, 2, config)
     status, rid, body = host.recv()
-    check(status == OK and body.get("model_id") == "parakeet-ultra-int8", "create")
+    with open(os.path.join(model_dir, "manifest.json"), encoding="utf-8") as f:
+        expected_model_id = json.load(f)["model_id"]
+    check(status == OK and body.get("model_id") == expected_model_id, "create")
 
     host.send(TRANSCRIBE, 3, b"{}", pcm)
     status, rid, body = host.recv()

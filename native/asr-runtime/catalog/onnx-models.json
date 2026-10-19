@@ -56,6 +56,60 @@
         "pred_hidden": 640,
         "pred_rnn_layers": 2
       }
+    },
+    {
+      "model_id": "gigaam-v3-e2e-rnnt-int8",
+      "display_name": "GigaAM v3 e2e RNN-T (ONNX int8, Russian)",
+      "family": "gigaam_rnnt",
+      "source": "https://huggingface.co/istupakov/gigaam-v3-onnx",
+      "base_model": "ai-sage/GigaAM v3 e2e RNN-T",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "license": "MIT",
+      "attribution": "SberDevices / GigaChat Team (GigaAM v3), Ilya Stupakov (ONNX int8 export)",
+      "quantization": "int8",
+      "sample_rate": 16000,
+      "languages": ["ru"],
+      "capabilities": {"timestamps": true, "punctuation": true, "capitalization": true, "streaming": false, "code_switch": false},
+      "providers": ["cpu"],
+      "files": {
+        "encoder": {
+          "path": "v3_e2e_rnnt_encoder.int8.onnx",
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_encoder.int8.onnx",
+          "size": 224570477,
+          "sha256": "4e0e076a6076cd110277e529b8ac8f32cd5297f7fbebad5341ae8ddb7d00817b"
+        },
+        "decoder": {
+          "path": "v3_e2e_rnnt_decoder.int8.onnx",
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_decoder.int8.onnx",
+          "size": 1159170,
+          "sha256": "89014e134865615b91e037157e46e389b1271e6072460efc010ea08e61e23146"
+        },
+        "joiner": {
+          "path": "v3_e2e_rnnt_joint.int8.onnx",
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_joint.int8.onnx",
+          "size": 687791,
+          "sha256": "ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1"
+        },
+        "tokens": {
+          "path": "v3_e2e_rnnt_vocab.txt",
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_vocab.txt",
+          "size": 13354,
+          "sha256": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7"
+        },
+        "preprocessor": {
+          "bundled": "gigaam_v3.onnx",
+          "sha256": "919c3bc8a434b6e733e5fe5dcd247974d0a7b1f2bc5b6995b6ad55f7225e014d"
+        }
+      },
+      "params": {
+        "feature_dim": 64,
+        "subsampling_factor": 4,
+        "hop_seconds": 0.01,
+        "vocab_size": 1025,
+        "blank_id": 1024,
+        "max_symbols_per_frame": 3,
+        "pred_hidden": 320
+      }
     }
   ]
 }

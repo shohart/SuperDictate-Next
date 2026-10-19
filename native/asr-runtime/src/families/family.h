@@ -48,4 +48,8 @@ public:
 // SD_ASR_MODEL_LOAD_FAILED).
 std::unique_ptr<ModelFamily> create_model_family(const Manifest &manifest, const SessionFactory &factory);
 
+// Per-family constructors behind create_model_family (family.cpp).
+std::unique_ptr<ModelFamily> create_nemo_tdt_family(const Manifest &manifest, const SessionFactory &factory);
+std::unique_ptr<ModelFamily> create_gigaam_rnnt_family(const Manifest &manifest, const SessionFactory &factory);
+
 }  // namespace sdasr

@@ -63,6 +63,9 @@ add_library(sd_asr STATIC
   src/ort_session.cpp
   src/sd_asr.cpp
   src/sha256.cpp
+  src/families/family.cpp
+  src/families/family_util.cpp
+  src/families/gigaam_rnnt.cpp
   src/families/nemo_tdt.cpp
 )
 target_include_directories(sd_asr

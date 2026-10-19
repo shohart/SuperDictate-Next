@@ -1,15 +1,21 @@
 // Real-model tests (spec §11.2). Skipped (exit 77) unless
 //   SD_ASR_TEST_MODEL_DIR  — an installed model directory with manifest.json
 //   SD_ASR_TEST_GOLDEN_DIR — pairs <name>.wav + <name>.txt, the .txt being the
-//                            reference implementation's exact output
-//                            (tools/reference_tdt.py; see tests/fixtures/)
-// are set. SD_ASR_TEST_PARITY selects the comparison: "exact" (default; the
+//                            reference implementation's exact output for the
+//                            model's family (tools/reference_tdt.py,
+//                            tools/reference_gigaam.py; see tests/fixtures/),
+//                            optionally <name>.tokens.json ({"frame_sec",
+//                            "tokens": [[id, frame, conf]]}) for token-level
+//                            parity
+// are set. Any installed model works; the goldens must come from its family's
+// reference. SD_ASR_TEST_PARITY selects the comparison: "exact" (default; the
 // machine class that produced the goldens) or "cer:<max>" e.g. "cer:0.02"
 // for other CPUs, where int8 MLAS kernels may legitimately flip an argmax.
 //   sd_asr_model_tests <assets_dir>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -30,6 +36,7 @@ namespace {
 fs::path g_assets, g_model, g_golden;
 sd_asr_handle *g_handle = nullptr;
 double g_max_cer = 0.0;  // 0 = exact match required
+double g_frame_sec = 0.0;  // params.hop_seconds * params.subsampling_factor of the installed model
 
 std::u32string decode_utf8(const std::string &text) {
     std::u32string out;
@@ -153,7 +160,32 @@ TEST_CASE("golden parity with the reference implementation") {
         }
         CHECK(last_t <= call.body["audio_seconds"].get<double>() + 0.1);
         CHECK_EQ(joined, actual);
-        CHECK_EQ(call.body["frame_sec"].get<double>(), 0.08);
+        CHECK_EQ(call.body["frame_sec"].get<double>(), g_frame_sec);
+
+        // Token-level parity: same ids at the same encoder frames, same
+        // confidences (to float rounding), whenever the reference wrote them.
+        fs::path token_golden = entry.path();
+        token_golden.replace_extension(".tokens.json");
+        if (g_max_cer == 0.0 && fs::exists(token_golden)) {
+            const json expected_tokens = json::parse(read_text(token_golden))["tokens"];
+            const json &tokens = call.body["tokens"];
+            CHECK_EQ(tokens.size(), expected_tokens.size());
+            size_t mismatched = 0;
+            for (size_t i = 0; i < std::min(tokens.size(), expected_tokens.size()); ++i) {
+                const json &a = tokens[i];
+                const json &e = expected_tokens[i];
+                const double frame = a["t"].get<double>() / g_frame_sec;
+                if (a["id"].get<int>() != e[0].get<int>() || std::fabs(frame - e[1].get<double>()) > 1e-6 ||
+                    std::fabs(a["conf"].get<double>() - e[2].get<double>()) > 1e-5) {
+                    if (mismatched++ < 3) {
+                        std::printf("  %s token %zu: actual (%d, %.4f, %.6f) expected %s\n",
+                                    entry.path().filename().u8string().c_str(), i, a["id"].get<int>(), frame,
+                                    a["conf"].get<double>(), e.dump().c_str());
+                    }
+                }
+            }
+            CHECK_EQ(mismatched, size_t(0));
+        }
         ++compared;
     }
     CHECK(compared > 0);
@@ -225,6 +257,11 @@ int main(int argc, char **argv) {
     if (const char *parity = std::getenv("SD_ASR_TEST_PARITY"); parity && std::strncmp(parity, "cer:", 4) == 0) {
         g_max_cer = std::atof(parity + 4);
         std::printf("parity mode: CER <= %.4f\n", g_max_cer);
+    }
+    {
+        const json manifest = json::parse(read_text(g_model / "manifest.json"));
+        g_frame_sec = manifest["params"]["hop_seconds"].get<double>() *
+                      manifest["params"]["subsampling_factor"].get<double>();
     }
     const json config = {{"model_directory", g_model.u8string()},
                          {"assets_directory", g_assets.u8string()},
