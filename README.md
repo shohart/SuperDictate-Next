@@ -48,7 +48,7 @@ exists:
 | Settings window | partial | adds Launch at Login, mute-while-recording, adaptive **Contrast** HUD color, capsule size, indicator modes (level bars / elapsed-timer outline) |
 | Russian numbers | words | optional ITN: dictated numbers written as digits (25, not двадцать пять) |
 | Long dictations | single pass | pause-based segmentation with overlap seam deduplication |
-| Pause detection | — | optional Silero VAD (local ggml port) for smarter pause boundaries |
+| Pause detection | — | Silero VAD (local ggml port, downloaded automatically) for smarter seam placement |
 | Vocabulary learning | — | automatic: hand-correct a word right after dictation and it's remembered — with an Undo toast and a SQLite-backed manager |
 | Corrections | — | vocabulary manager (Settings → Text): add/edit/delete, JSON import/export, cross-Mac folder sync |
 
@@ -277,14 +277,15 @@ Whisper engines were removed on 2026-10-17; details in
 
 ## 🎚️ Pause detection (Silero VAD)
 
-Long dictations are split into segments at pauses. By default, pause
-boundaries are found with a lightweight mel-energy heuristic. If you place
-a [Silero VAD](https://github.com/snakers4/silero-vad) model — the ggml
-build, `ggml-silero-v6.2.0.bin` — into
-`~/Library/Application Support/SuperDictate/Models/`, SuperDictate picks it
-up and uses it for noticeably smarter pause boundaries and overlap-seam
-placement. The VAD runs locally on the CPU and works fully offline; without
-the file, the heuristic fallback keeps everything working.
+Long dictations are split into segments at pauses (a lightweight
+mel-energy heuristic), recognized in overlapping windows and stitched back
+together. Seams between windows are placed with
+[Silero VAD](https://github.com/snakers4/silero-vad) — the ggml build,
+`ggml-silero-v6.2.0.bin` (885 KB, MIT), which SuperDictate downloads in the
+background into `~/Library/Application Support/SuperDictate/Models/` after
+the speech model loads (pinned revision, size and SHA-256 verified). The VAD
+runs locally on the CPU; until the file is there (or offline), seams fall
+back to the mel-energy heuristic and everything keeps working.
 
 ## ✅ Checks before a pull request
 

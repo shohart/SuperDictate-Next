@@ -188,6 +188,8 @@ enum ParakeySelfTest {
             return runSuite("llm-rewrite", testLLMRewriteIntegration)
         case "full-pipeline":
             return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
+        case "silero-vad-download":
+            return runSuite("silero-vad-download", testSileroVadModelDownload)
         case "onnx-asr":
             return runSuite("onnx-asr", testOnnxAsr)
         case "onnx-asr-real":
@@ -3135,6 +3137,40 @@ enum ParakeySelfTest {
                    "an over-long sentence must be cut to the limit")
         try expect(runOnChunks.joined(separator: " "), equals: runOn,
                    "a cut sentence must rejoin to the input")
+    }
+
+    /// The Silero VAD pin through the REAL download path into a temporary
+    /// directory: fresh download, a verified cached copy, and a corrupted
+    /// copy that must be replaced. Network; NOT part of `all`.
+    private static func testSileroVadModelDownload() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superdictate-silero-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent(SILERO_VAD_MODEL_FILENAME, isDirectory: false)
+        let download: @Sendable () async throws -> URL = {
+            try await downloadGECFileIfNeeded(existingDescription: "Silero VAD model",
+                                              destination: destination,
+                                              remoteURL: SILERO_VAD_MODEL_URL,
+                                              expectedSize: SILERO_VAD_MODEL_SIZE_BYTES,
+                                              expectedSHA256: SILERO_VAD_MODEL_SHA256)
+        }
+
+        _ = try runParakeetEngineSynchronously(download)
+        try expect(try sha256Hex(ofFileAt: destination), equals: SILERO_VAD_MODEL_SHA256,
+                   "fresh download must match the pinned SHA-256")
+        let firstModified = try FileManager.default.attributesOfItem(atPath: destination.path)[.modificationDate] as? Date
+
+        _ = try runParakeetEngineSynchronously(download)
+        let secondModified = try FileManager.default.attributesOfItem(atPath: destination.path)[.modificationDate] as? Date
+        try expect(secondModified, equals: firstModified, "a verified cached copy must not be redownloaded")
+
+        try Data(repeating: 0, count: Int(SILERO_VAD_MODEL_SIZE_BYTES)).write(to: destination)
+        _ = try runParakeetEngineSynchronously(download)
+        try expect(try sha256Hex(ofFileAt: destination), equals: SILERO_VAD_MODEL_SHA256,
+                   "a corrupted cached copy must be replaced")
+
+        let engine = try SileroVadEngine(modelPath: destination.path)
+        engine.shutdown()
     }
 
     /// Full pipeline through a REAL downloaded GEC model and a REAL

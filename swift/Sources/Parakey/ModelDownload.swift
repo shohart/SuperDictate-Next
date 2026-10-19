@@ -231,9 +231,19 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
-        finishedLocation = location
         if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
             error = GECModelDownloadError.httpError(statusCode: http.statusCode)
+            return
+        }
+        // URLSession deletes `location` as soon as this callback returns,
+        // so the caller would find nothing there: claim the file now.
+        let claimed = location.deletingLastPathComponent()
+            .appendingPathComponent("superdictate-download-\(UUID().uuidString)", isDirectory: false)
+        do {
+            try FileManager.default.moveItem(at: location, to: claimed)
+            finishedLocation = claimed
+        } catch {
+            self.error = GECModelDownloadError.downloadFailed(underlying: error)
         }
     }
 
@@ -253,8 +263,10 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
     }
 }
 
+/// Shared by every single-file pinned download: the LLM models and the
+/// Silero VAD model (`downloadSileroVadModelIfNeeded`).
 @discardableResult
-private func downloadGECFileIfNeeded(existingDescription: String,
+func downloadGECFileIfNeeded(existingDescription: String,
                                      destination: URL,
                                      remoteURL: URL,
                                      expectedSize: Int64,
@@ -274,7 +286,7 @@ private func downloadGECFileIfNeeded(existingDescription: String,
                 return destination
             }
         }
-        log("LLM: cached \(existingDescription) failed size/checksum verification; redownloading")
+        log("model download: cached \(existingDescription) failed size/checksum verification; redownloading")
         try? FileManager.default.removeItem(at: destination)
     }
 
@@ -685,13 +697,43 @@ func speechModelCacheBaseDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
 }
 
-/// `~/Library/Application Support/SuperDictate/Models`: the optional Silero
-/// VAD model lives here (see `sileroVadModelPath`). The retired GGUF
+/// `~/Library/Application Support/SuperDictate/Models`: the Silero VAD
+/// model lives here (see `sileroVadModelDefaultPath`). The retired GGUF
 /// Parakeet and Whisper models also lived here; their files are left in
 /// place, never loaded.
 func speechModelsDirectory() -> URL {
     resolvedParakeetSupportDirectory(nil)!
         .appendingPathComponent("Models", isDirectory: true)
+}
+
+// MARK: - Silero VAD model (overlap-seam placement)
+//
+// The ggml build of Silero VAD v6.2.0 from ggml-org/whisper-vad (MIT),
+// pinned to a revision; SHA-256 and size match
+// swift/Sources/silero_vad/upstream-vad/PROVENANCE.md. 885 KB, fetched in
+// the background after the speech model loads. Never required: without it
+// seams are placed by mel energy (VadBoundaryOracle's fallback chain).
+let SILERO_VAD_MODEL_FILENAME = "ggml-silero-v6.2.0.bin"
+let SILERO_VAD_MODEL_URL = URL(
+    string: "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"
+)!
+let SILERO_VAD_MODEL_SHA256 = "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+let SILERO_VAD_MODEL_SIZE_BYTES: Int64 = 885_098
+
+func sileroVadModelDefaultPath() -> URL {
+    speechModelsDirectory().appendingPathComponent(SILERO_VAD_MODEL_FILENAME, isDirectory: false)
+}
+
+/// Downloads (or re-verifies) the Silero VAD model at its default path.
+@discardableResult
+func downloadSileroVadModelIfNeeded() async throws -> URL {
+    try await downloadGECFileIfNeeded(
+        existingDescription: "Silero VAD model",
+        destination: sileroVadModelDefaultPath(),
+        remoteURL: SILERO_VAD_MODEL_URL,
+        expectedSize: SILERO_VAD_MODEL_SIZE_BYTES,
+        expectedSHA256: SILERO_VAD_MODEL_SHA256
+    )
 }
 
 func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {

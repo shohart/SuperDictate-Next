@@ -155,6 +155,17 @@ actor TranscriptionWorker {
         log("ASR runtime: ONNX Runtime (SuperDictateOnnxHost)")
         let reason = await loaded.providerFallbackReason
         log("ASR device: \(await loaded.providerActual)\(reason.isEmpty ? "" : " (\(reason))")")
+
+        // Best effort, off the load path: a failure only means mel-energy
+        // seam placement until the next load retries.
+        Task.detached(priority: .utility) {
+            do {
+                try await downloadSileroVadModelIfNeeded()
+                log("Silero VAD model: ready at \(sileroVadModelDefaultPath().path)")
+            } catch {
+                log("Silero VAD model: download failed (\(error.localizedDescription)); seams use mel-energy placement")
+            }
+        }
     }
 
     private func loadOnnxEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> OnnxAsrEngine {
@@ -429,18 +440,15 @@ func transcribeWithOverlapWindows(
     )
 }
 
-/// Where the Silero VAD model file would live if it were staged. There is
-/// deliberately NO download wiring for it yet (see
-/// scripts/vendor-silero-vad.sh's PROVENANCE notes), so on a normal install
-/// this file is absent, `SileroVadEngine` is never constructed, and the
-/// oracle chain runs mel-energy → midpoint. That is a fully supported
-/// configuration, not a degraded one.
+/// The Silero VAD model file. `TranscriptionWorker.load` fetches it in the
+/// background (`downloadSileroVadModelIfNeeded`); until it lands — or
+/// offline — `SileroVadEngine` is never constructed and the oracle chain
+/// runs mel-energy → midpoint, a fully supported configuration.
 private func sileroVadModelPath() -> String {
     if let override = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"], !override.isEmpty {
         return override
     }
-    return speechModelsDirectory()
-        .appendingPathComponent("ggml-silero-v6.2.0.bin", isDirectory: false).path
+    return sileroVadModelDefaultPath().path
 }
 
 /// Phase B of the overlap path — see `transcribeWithOverlapWindows`.

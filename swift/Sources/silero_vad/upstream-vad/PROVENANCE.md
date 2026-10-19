@@ -87,8 +87,9 @@ Do not hand-edit anything under this directory — re-run the vendor script.
   - Size: 885098 bytes
   - Verified by downloading the file and independently computing
     `sha256sum` on 2026-07-30 (not copied from any cached research note).
-  - NOT YET DOWNLOADED/WIRED into this project's model-download
-    infrastructure by this task — see the note below.
+  - Downloaded automatically since 2026-10-19:
+    `downloadSileroVadModelIfNeeded()` in `swift/Sources/Parakey/ModelDownload.swift`
+    (background, after the speech model loads). The note below is historical.
 - Model download wiring: OUT OF SCOPE for this vendoring task (deliberately
   — see task-1-report.md's "model-download scope decision" section for the
   full reasoning). `swift/Sources/Parakey/main.swift`'s
