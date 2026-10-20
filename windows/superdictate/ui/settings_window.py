@@ -781,26 +781,12 @@ class SettingsWindow(QDialog):
         system.add_row(None, self._update_label)
 
         engine = Section(i18n.tr("panel_model"))
-        self._quantization = self._combo(
-            engine, "settings_model_quality", "model_quantization",
-            [(asr.QUANTIZATION_INT8, i18n.tr("settings_model_int8")),
-             (asr.QUANTIZATION_FULL, i18n.tr("settings_model_full"))],
+        self._speech_model = self._combo(
+            engine, "settings_speech_model", "speech_model_profile",
+            [(asr.PROFILE_PARAKEET_ULTRA, i18n.tr("settings_model_parakeet_ultra")),
+             (asr.PROFILE_GIGAAM_V3, i18n.tr("settings_model_gigaam_v3"))],
+            hint=i18n.tr("settings_speech_model_hint"),
         )
-
-        providers = asr.available_providers()
-        compute_options = [("auto", i18n.tr("settings_compute_auto"))]
-        if "CUDAExecutionProvider" in providers:
-            compute_options.append(("cuda", i18n.tr("settings_compute_cuda")))
-        compute_options.append(("cpu", i18n.tr("settings_compute_cpu")))
-        self._asr_engine = self._combo(
-            engine, "settings_asr_engine", "asr_engine",
-            [("onnx", i18n.tr("settings_asr_engine_onnx")),
-             ("native", i18n.tr("settings_asr_engine_native"))],
-            hint=i18n.tr("settings_asr_engine_hint"),
-        )
-        self._compute = self._combo(engine, "settings_compute", "compute_provider",
-                                    compute_options)
-        engine.add_row("ONNX Runtime", self._muted_label(", ".join(providers) or "-"))
         return _page(system, engine)
 
     def _text_style_changed(self) -> None:
@@ -1126,10 +1112,8 @@ class SettingsWindow(QDialog):
 
         self._controller.apply_settings()
 
-        model_changed = (
-            previous.get("model_quantization") != self._draft.get("model_quantization")
-            or previous.get("compute_provider") != self._draft.get("compute_provider")
-        )
+        model_changed = (previous.get("speech_model_profile")
+                         != self._draft.get("speech_model_profile"))
         if model_changed:
             self._controller.reload_model()
         self.accept()

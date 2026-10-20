@@ -5,6 +5,7 @@ Usage::
     python main.py                 # normal launch (tray + control panel)
     python main.py --minimized     # launch to tray only, for autostart
     python main.py --self-test     # run the built-in checks and exit
+    python main.py --benchmark-transcribe <profile> <wav...>   # real host, no UI
 
 ``--self-test`` mirrors the macOS ``Parakey --self-test all``: it exercises
 the pure logic (hotkey state machine, transcript processing, settings
@@ -41,6 +42,13 @@ def main(argv: list[str]) -> int:
         from superdictate.selftest import run_all
 
         return 0 if run_all() else 1
+    if "--benchmark-transcribe" in argv:
+        from superdictate.diagnostics import benchmark_transcribe
+
+        paths.ensure_directories()
+        configure(verbose="--verbose" in argv)
+        index = argv.index("--benchmark-transcribe")
+        return benchmark_transcribe([a for a in argv[index + 1:] if a != "--verbose"])
 
     paths.ensure_directories()
     log = configure(verbose="--verbose" in argv)

@@ -874,28 +874,171 @@ def _raises(callable_, exception_type) -> bool:
 
 
 def test_compute_backends_are_independent() -> None:
-    """The ASR device and the LLM device are two settings, not one.
+    """Speech recognition is CPU-only; the LLM device is its own setting.
 
-    Parakeet has come out fastest on the CPU on real hardware while the
-    local LLM is several times faster on the GPU, so a single switch would
-    always be wrong for one of them.
+    Same split as the macOS build since 0.7.0: Parakeet gains nothing from
+    the GPU here while the local LLM is several times faster on it, so the
+    only device switch left belongs to the LLM.
     """
     import tempfile
 
     from .settings import Settings
 
     settings = Settings(path=tempfile.mktemp(suffix=".json"))
-    settings._set("compute_provider", "cpu")
-    _check("changing the ASR device leaves the LLM alone",
+    _check("the speech model defaults to Parakeet Ultra",
+           settings.speech_model_profile, "parakeet_ultra_onnx")
+    settings._set("speech_model_profile", "gigaam_v3_onnx")
+    _check("GigaAM can be chosen", settings.speech_model_profile, "gigaam_v3_onnx")
+    settings._set("speech_model_profile", "whisper_russian")
+    _check("a retired or unknown model falls back to the default",
+           settings.speech_model_profile, "parakeet_ultra_onnx")
+    _check("the ASR model leaves the LLM device alone",
            settings.llm_compute_backend, "gpu")
     settings._set("llm_compute_backend", "cpu")
-    _check("the ASR device is still what it was", settings.compute_provider, "cpu")
     _check("cpu means no offloaded layers", settings.llm_gpu_layers, 0)
     settings._set("llm_compute_backend", "gpu")
     _check("gpu means all of them", settings.llm_gpu_layers, 99)
     settings._set("llm_compute_backend", "nonsense")
     _check("an unknown value falls back to the gpu default",
            settings.llm_compute_backend, "gpu")
+
+
+def test_retired_asr_settings_are_dropped() -> None:
+    """Settings from the onnx-asr / ggml era load without leaking through."""
+    import json
+    import tempfile
+
+    from .settings import Settings
+
+    path = tempfile.mktemp(suffix=".json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"asr_engine": "native", "compute_provider": "cuda",
+                   "model_quantization": "full", "numbers_as_digits": False}, handle)
+    settings = Settings(path=path)
+    snapshot = settings.snapshot()
+    _check("retired keys are not carried", sorted(
+        key for key in ("asr_engine", "compute_provider", "model_quantization")
+        if key in snapshot), [])
+    _check("the rest of the file still loads", settings.numbers_as_digits, False)
+    _check("the model is the default", settings.speech_model_profile, "parakeet_ultra_onnx")
+
+
+def test_asr_thread_policy() -> None:
+    """Every physical core but two, 2..16; a valid override wins."""
+    from .onnx_host import resolved_thread_count
+
+    _check("18 cores", resolved_thread_count(18, override=""), 16)
+    _check("8 cores", resolved_thread_count(8, override=""), 6)
+    _check("a 2-core machine still gets 2", resolved_thread_count(2, override=""), 2)
+    _check("a valid override", resolved_thread_count(8, override="12"), 12)
+    _check("an out-of-range override is ignored", resolved_thread_count(8, override="64"), 6)
+    _check("a non-numeric override is ignored", resolved_thread_count(8, override="x"), 6)
+
+
+def test_onnx_catalog_and_manifest() -> None:
+    """The shared catalog parses, and the manifest keeps what the host checks."""
+    from . import onnx_models
+    from .asr import PROFILE_GIGAAM_V3, PROFILE_PARAKEET_ULTRA, model_id_for
+
+    models = onnx_models.catalog()
+    for profile in (PROFILE_PARAKEET_ULTRA, PROFILE_GIGAAM_V3):
+        _check(f"{profile} is in the catalog", model_id_for(profile) in models, True)
+    ultra = models[onnx_models.PARAKEET_ULTRA_MODEL_ID]
+    _check("every Parakeet file is pinned to a revision",
+           all("/resolve/" in item.url and len(item.sha256) == 64 for item in ultra.files), True)
+    manifest = onnx_models._manifest_for(ultra.entry)
+    _check("the manifest drops download URLs",
+           any("url" in spec for spec in manifest["files"].values()), False)
+    _check("the manifest drops presentation keys", "display_name" in manifest, False)
+    _check("the manifest keeps the model id", manifest["model_id"], ultra.model_id)
+    _check("a traversal path is refused",
+           _raises(lambda: onnx_models._check_relative("../evil.onnx"),
+                   onnx_models.ModelInstallError), True)
+    _check("a nested path is refused",
+           _raises(lambda: onnx_models._check_relative("sub/encoder.onnx"),
+                   onnx_models.ModelInstallError), True)
+
+
+_FAKE_HOST = r"""
+import json, struct, sys, threading, time
+REQ = struct.Struct("<4sHHQIQ"); RES = struct.Struct("<4sHHQI")
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+lock = threading.Lock()
+def send(status, rid, body):
+    data = json.dumps(body).encode()
+    with lock:
+        out.write(RES.pack(b"SDAR", 1, status, rid, len(data)) + data); out.flush()
+def read(n):
+    buf = b""
+    while len(buf) < n:
+        chunk = inp.read(n - len(buf))
+        if not chunk: sys.exit(0)
+        buf += chunk
+    return buf
+hanging = {}
+while True:
+    magic, version, kind, rid, jlen, plen = REQ.unpack(read(REQ.size))
+    body = json.loads(read(jlen) or b"{}"); pcm = read(plen)
+    if kind == 1:
+        send(0, rid, {"provider_actual": "cpu", "model_id": body.get("model_id", "fake")})
+    elif kind == 2:
+        count = plen // 4
+        if count == 1600: hanging[rid] = True; continue
+        if count == 3200: sys.exit(7)
+        send(0, rid, {"text": f"samples {count}", "processing_seconds": 0.01,
+                      "words": [{"w": "samples", "start": 0.0, "end": 0.1},
+                                {"w": str(count), "start": 0.2, "end": 0.3}]})
+    elif kind == 4:
+        target = body["target"]; send(0, rid, {})
+        if hanging.pop(target, False): send(8, target, {"category": "CANCELLED", "message": ""})
+    elif kind == 5:
+        sys.exit(0)
+"""
+
+
+def test_onnx_host_ipc() -> None:
+    """Framing v1 against a stand-in host: success, timeout→CANCEL, crash."""
+    import sys
+    import tempfile
+
+    import numpy as np
+
+    from . import onnx_host
+
+    script = Path(tempfile.mkdtemp()) / "fake_host.py"
+    script.write_text(_FAKE_HOST, encoding="utf-8")
+
+    host = onnx_host.OnnxHost([sys.executable, "-I", str(script)])
+    try:
+        host.create(model_directory=Path("m"), assets_directory=Path("a"), threads=4,
+                    expected_model_id="parakeet-ultra-int8")
+        _check("CREATE reports the model", host.model_id, "parakeet-ultra-int8")
+        result = host.transcribe(np.zeros(800, dtype=np.float32), timestamps=True)
+        _check("TRANSCRIBE round-trips the PCM", result.text, "samples 800")
+        _check("words carry their times",
+               [(w.text, w.start) for w in result.words], [("samples", 0.0), ("800", 0.2)])
+
+        original = onnx_host.timeout_seconds
+        onnx_host.timeout_seconds = lambda count, rate=16000: 0.3
+        try:
+            _check("a hung request times out via CANCEL",
+                   _raises(lambda: host.transcribe(np.zeros(1600, dtype=np.float32)),
+                           onnx_host.TimedOut), True)
+        finally:
+            onnx_host.timeout_seconds = original
+        _check("a timed-out host is not reused", host.is_alive, False)
+    finally:
+        host.shutdown()
+
+    crashing = onnx_host.OnnxHost([sys.executable, "-I", str(script)])
+    try:
+        crashing.create(model_directory=Path("m"), assets_directory=Path("a"), threads=1)
+        _check("a host that dies mid-request is reported",
+               _raises(lambda: crashing.transcribe(np.zeros(3200, dtype=np.float32)),
+                       onnx_host.HostExited), True)
+        _check("and marked dead", crashing.is_alive, False)
+    finally:
+        crashing.shutdown()
 
 
 def test_vocabulary_transfer() -> None:
@@ -986,6 +1129,10 @@ _TESTS = [
     test_boundary_oracles,
     test_overlap_assembly,
     test_compute_backends_are_independent,
+    test_retired_asr_settings_are_dropped,
+    test_asr_thread_policy,
+    test_onnx_catalog_and_manifest,
+    test_onnx_host_ipc,
     test_vocabulary_transfer,
 ]
 

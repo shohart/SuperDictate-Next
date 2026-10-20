@@ -1,20 +1,15 @@
-# Dictation for Windows, runtime dependencies.
+# SuperDictate for Windows, runtime dependencies.
+#
+# Speech recognition is not a Python dependency: it runs in
+# SuperDictateOnnxHost.exe (native/asr-runtime), built and staged by
+# tools/build-onnx-host.ps1.
 #
 # Pinned to the versions the port was built and tested against
 # (Python 3.11, Windows 11 24H2, x64).
 
 PySide6-Essentials==6.11.1   # Qt: tray, control panel, settings, HUD
-onnx-asr==0.12.0             # Parakeet TDT v3 wrapper
-onnxruntime==1.27.0          # CPU inference
 numpy==2.4.6
 sounddevice==0.5.5           # PortAudio capture (WASAPI)
-huggingface_hub==1.24.0      # model download
 pycaw==20251023              # system-audio muting while recording
 comtypes==1.4.16             # pycaw's COM layer
 pywin32==312
-
-# For CUDA, replace onnxruntime with onnxruntime-gpu and install the
-# matching CUDA 12 / cuDNN 9 runtime. The app's "compute_provider"
-# setting ("auto" / "cuda" / "cpu") then picks it up with no code change;
-# "auto" falls back to CPU when the provider is unavailable.
-# onnxruntime-gpu==1.27.0

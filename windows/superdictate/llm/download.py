@@ -1,11 +1,10 @@
 """Fetching the post-processing weights.
 
-The ASR model comes down through ``huggingface_hub``'s ``snapshot_download``
-(see :mod:`superdictate.asr`), which is the right tool for a directory of
-files. These are single large files pinned to an exact revision and an exact
-digest, so they are fetched directly instead: a plain ranged HTTP download
-that can be resumed, verified and reported on without a second dependency
-deciding what "latest" means.
+These are single large files pinned to an exact revision and an exact
+digest, fetched directly: a plain ranged HTTP download that can be resumed,
+verified and reported on without a dependency deciding what "latest" means.
+The speech models follow the same rule through their own pinned catalog
+(:mod:`superdictate.onnx_models`).
 
 **Every download is verified before it is used.** A truncated 4.9 GB file
 that llama.cpp then refuses to load is a confusing failure; a size and

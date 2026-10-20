@@ -296,17 +296,14 @@ class ControlPanel(QMainWindow):
         for attribute, label in self._shortcut_labels.items():
             label.setText(hotkey_name(getattr(settings, attribute), i18n.language()))
 
-        quantization = settings.model_quantization
-        self._model_label.setText(
-            "Parakeet TDT 0.6B v3 · "
-            + ("int8" if quantization == asr.QUANTIZATION_INT8 else "fp32")
-        )
+        self._model_label.setText(i18n.tr(
+            "settings_model_gigaam_v3"
+            if settings.speech_model_profile == asr.PROFILE_GIGAAM_V3
+            else "settings_model_parakeet_ultra"))
         model = getattr(self._controller, "_model", None)
         if model is not None and model.active_providers:
-            self._compute_label.setText(", ".join(
-                provider.replace("ExecutionProvider", "")
-                for provider in model.active_providers
-            ))
+            self._compute_label.setText(
+                f"{', '.join(model.active_providers).upper()} · {model.threads}")
         else:
             self._compute_label.setText("-")
         self._microphone_label.setText(

@@ -1,27 +1,23 @@
 """Speech recognition.
 
-The macOS build runs Parakeet TDT v3 through FluidAudio on the Apple
-Neural Engine. Windows has no ANE, so the same model runs through ONNX
-Runtime via ``onnx-asr``, which resolves the weights from
-``istupakov/parakeet-tdt-0.6b-v3-onnx``, the same NVIDIA checkpoint,
-same 25 languages, same vocabulary.
+Same engine as the macOS build since 0.7.0: ``SuperDictateOnnxHost``, the
+native C++ core in ``native/asr-runtime``, running ONNX Runtime 1.23.2 on
+the CPU in a helper process (:mod:`superdictate.onnx_host`). Same models
+from the same pinned catalog (:mod:`superdictate.onnx_models`):
 
-Two weight sets exist upstream and both are offered:
+* **Parakeet Ultra 0.6B** (``parakeet_ultra_onnx``), int8, 25 languages
+  including Russian. Default.
+* **GigaAM v3** (``gigaam_v3_onnx``), int8, Russian only — punctuation,
+  capitalisation, ё and digits come from the model itself, with far fewer
+  word-form errors on Russian than Parakeet.
 
-* ``int8``, 640 MB, matching the macOS on-disk footprint. Default.
-* ``fp32``, 2.4 GB, meaningfully better on a CUDA GPU, where int8
-  kernels are not the fast path.
-
-One caveat versus macOS: FluidAudio exposes a per-language decoder script
-filter, which ``onnx-asr`` does not. The dictation-language setting still
-drives the ``<unk>`` → "ё" repair in :mod:`superdictate.textproc`, but it
-cannot bias the joint head. Auto-detect behaves identically on both
-platforms.
+Recognition is CPU-only on both platforms. The GPU belongs to the LLM
+stages, which gain several times from it; Parakeet does not, and one device
+switch for both was always wrong for one of them.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -30,40 +26,26 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import paths
+from . import onnx_models, paths
 from .audio import SAMPLE_RATE
 from .logging_setup import get as get_logger
+from .onnx_host import HostTranscription, OnnxHost, OnnxHostError, resolved_thread_count
 
 log = get_logger("asr")
 
-MODEL_NAME = "nemo-parakeet-tdt-0.6b-v3"
-MODEL_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+PROFILE_PARAKEET_ULTRA = "parakeet_ultra_onnx"
+PROFILE_GIGAAM_V3 = "gigaam_v3_onnx"
+DEFAULT_PROFILE = PROFILE_PARAKEET_ULTRA
+PROFILES = (PROFILE_PARAKEET_ULTRA, PROFILE_GIGAAM_V3)
 
-QUANTIZATION_INT8 = "int8"
-QUANTIZATION_FULL = "full"
-
-MODEL_FILES: dict[str, list[str]] = {
-    QUANTIZATION_INT8: [
-        "config.json",
-        "vocab.txt",
-        "nemo128.onnx",
-        "encoder-model.int8.onnx",
-        "decoder_joint-model.int8.onnx",
-    ],
-    QUANTIZATION_FULL: [
-        "config.json",
-        "vocab.txt",
-        "nemo128.onnx",
-        "encoder-model.onnx",
-        "encoder-model.onnx.data",
-        "decoder_joint-model.onnx",
-    ],
+_PROFILE_MODEL_IDS = {
+    PROFILE_PARAKEET_ULTRA: onnx_models.PARAKEET_ULTRA_MODEL_ID,
+    PROFILE_GIGAAM_V3: onnx_models.GIGAAM_V3_MODEL_ID,
 }
 
-MODEL_TOTAL_BYTES: dict[str, int] = {
-    QUANTIZATION_INT8: 671 * 1024 * 1024,
-    QUANTIZATION_FULL: 2551 * 1024 * 1024,
-}
+
+def model_id_for(profile: str) -> str:
+    return _PROFILE_MODEL_IDS.get(profile, _PROFILE_MODEL_IDS[DEFAULT_PROFILE])
 
 
 class State(str, Enum):
@@ -106,73 +88,45 @@ class TranscriptionResult:
         return self.inference_seconds / self.audio_seconds
 
 
-def _model_dir(quantization: str) -> "os.PathLike[str]":
-    return paths.MODELS_DIR / f"parakeet-tdt-0.6b-v3-{quantization}"
+def model_is_present(profile: str) -> bool:
+    return onnx_models.is_installed(model_id_for(profile))
 
 
-def model_is_present(quantization: str) -> bool:
-    directory = paths.MODELS_DIR / f"parakeet-tdt-0.6b-v3-{quantization}"
-    return all((directory / name).exists() for name in MODEL_FILES[quantization])
+def local_model_bytes(profile: str) -> int:
+    return onnx_models.installed_bytes(model_id_for(profile))
 
 
-def local_model_bytes(quantization: str) -> int:
-    directory = paths.MODELS_DIR / f"parakeet-tdt-0.6b-v3-{quantization}"
-    total = 0
-    if not directory.exists():
-        return 0
-    for item in directory.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
-def available_providers() -> list[str]:
+def model_total_bytes(profile: str) -> int:
     try:
-        import onnxruntime as rt
-
-        return list(rt.get_available_providers())
-    except Exception:
-        return []
+        return onnx_models.model(model_id_for(profile)).total_bytes
+    except (onnx_models.ModelInstallError, OSError, ValueError):
+        return 0
 
 
-def resolve_providers(preference: str) -> list[str]:
-    """Turn the user's compute choice into an ONNX Runtime provider list.
-
-    CUDA is only offered when the runtime actually reports it; a wheel
-    built without it, a missing driver, or an absent cuDNN all surface the
-    same way, and silently falling back to CPU beats failing to start.
-    """
-    available = available_providers()
-    cuda = "CUDAExecutionProvider"
-    if preference == "cpu":
-        return ["CPUExecutionProvider"]
-    if cuda in available and preference in ("auto", "cuda"):
-        return [cuda, "CPUExecutionProvider"]
-    if preference == "cuda":
-        log.warning("CUDA requested but unavailable (providers: %s); using CPU", available)
-    return ["CPUExecutionProvider"]
+def delete_model_cache(profile: Optional[str] = None) -> None:
+    onnx_models.delete(model_id_for(profile) if profile else None)
 
 
 class SpeechModel:
-    """Owns the ONNX session and serialises transcription requests.
+    """Owns one host process and serialises requests to it.
 
-    ONNX Runtime sessions are thread-safe for ``Run``, but the transducer
-    decoding in onnx-asr keeps per-call state, so a lock keeps concurrent
-    dictations (a fast second hotkey press) from interleaving.
+    The host answers one TRANSCRIBE at a time (a second one gets BUSY), so a
+    lock keeps a fast second dictation from racing the first. A host that
+    died — a crash, a timeout kill — is started again on the next request,
+    once; if that fails too the error surfaces to the dictation.
     """
 
-    def __init__(self, quantization: str = QUANTIZATION_INT8,
-                 compute_provider: str = "auto") -> None:
-        self.quantization = quantization
-        self.compute_provider = compute_provider
-        self._model = None
+    def __init__(self, profile: str = DEFAULT_PROFILE, threads: Optional[int] = None) -> None:
+        self.profile = profile if profile in PROFILES else DEFAULT_PROFILE
+        self.model_id = model_id_for(self.profile)
+        self.threads = threads or resolved_thread_count()
+        self._host: Optional[OnnxHost] = None
         self._lock = threading.Lock()
         self._state = State.IDLE
         self._error: Optional[str] = None
-        self._active_providers: list[str] = []
+        #: Bumped on every load and unload, like the macOS
+        #: ``TranscriptionWorker.engineGeneration``.
+        self.generation = 0
 
     @property
     def state(self) -> State:
@@ -184,16 +138,16 @@ class SpeechModel:
 
     @property
     def is_ready(self) -> bool:
-        return self._state is State.READY and self._model is not None
+        return self._state is State.READY and self._host is not None
 
     @property
     def active_providers(self) -> list[str]:
-        return list(self._active_providers)
+        host = self._host
+        return [host.provider_actual] if host is not None else []
 
     @property
     def uses_gpu(self) -> bool:
-        return any("CUDA" in provider or "Dml" in provider
-                   for provider in self._active_providers)
+        return False
 
     # -- loading -----------------------------------------------------
 
@@ -209,13 +163,16 @@ class SpeechModel:
                     pass
 
         try:
-            if not model_is_present(self.quantization):
-                report(Progress(State.DOWNLOADING, local_model_bytes(self.quantization),
-                                MODEL_TOTAL_BYTES[self.quantization]))
-                self._download(report)
+            if not onnx_models.is_installed(self.model_id):
+                total = model_total_bytes(self.profile)
+                report(Progress(State.DOWNLOADING, 0, total))
+                onnx_models.install(
+                    self.model_id,
+                    lambda done, all_bytes: report(Progress(State.DOWNLOADING, done, all_bytes)))
 
             report(Progress(State.LOADING, message="loading"))
-            self._load()
+            with self._lock:
+                self._start_host()
             report(Progress(State.READY, message="ready"))
             return True
         except Exception as exc:
@@ -224,108 +181,84 @@ class SpeechModel:
             report(Progress(State.FAILED, message=str(exc)))
             return False
 
-    def _download(self, report: Callable[[Progress], None]) -> None:
-        from huggingface_hub import snapshot_download
-        from huggingface_hub.utils import disable_progress_bars
-
-        # The hub draws its own tqdm bar on stderr. A windowed build has no
-        # stderr at all, so the bar's first write ended the download with
-        # "'NoneType' object has no attribute 'write'" before a single byte
-        # had been fetched. The progress the user sees comes from the
-        # watcher below, so the bar is not wanted here in any case.
-        disable_progress_bars()
-
-        target = _model_dir(self.quantization)
-        total = MODEL_TOTAL_BYTES[self.quantization]
-        stop = threading.Event()
-
-        def watch() -> None:
-            # snapshot_download has no aggregate callback, so progress is
-            # measured from what has landed on disk. Good enough for a
-            # progress bar and immune to upstream API churn.
-            while not stop.wait(0.5):
-                report(Progress(State.DOWNLOADING,
-                                local_model_bytes(self.quantization), total))
-
-        watcher = threading.Thread(target=watch, name="model-download-progress", daemon=True)
-        watcher.start()
+    def _start_host(self) -> None:
+        executable = onnx_models.host_executable()
+        if executable is None:
+            raise RuntimeError("SuperDictateOnnxHost.exe is missing from the installation")
+        if self._host is not None:
+            self._host.shutdown()
+            self._host = None
+        host = OnnxHost([str(executable)], cwd=executable.parent,
+                        stderr_path=paths.LOG_DIR / "OnnxHost.log")
         try:
-            snapshot_download(
-                MODEL_REPO,
-                local_dir=str(target),
-                allow_patterns=MODEL_FILES[self.quantization],
-                max_workers=4,
-            )
-        finally:
-            stop.set()
-            watcher.join(timeout=1.0)
+            host.create(model_directory=onnx_models.model_directory(self.model_id),
+                        assets_directory=onnx_models.assets_directory(),
+                        threads=self.threads,
+                        expected_model_id=self.model_id)
+        except Exception:
+            host.shutdown()
+            raise
+        self._host = host
+        self.generation += 1
+        log.info("ONNX model %s loaded in %.1fs (provider=%s, threads=%d)",
+                 host.model_id or self.model_id, host.load_seconds,
+                 host.provider_actual, self.threads)
+        self._warm_up(host)
 
-        missing = [name for name in MODEL_FILES[self.quantization]
-                   if not (paths.MODELS_DIR / f"parakeet-tdt-0.6b-v3-{self.quantization}"
-                           / name).exists()]
-        if missing:
-            raise RuntimeError(f"Model download incomplete, missing: {', '.join(missing)}")
-        report(Progress(State.DOWNLOADING, local_model_bytes(self.quantization), total))
-
-    def _load(self) -> None:
-        import onnx_asr
-
-        providers = resolve_providers(self.compute_provider)
-        quantization = None if self.quantization == QUANTIZATION_FULL else "int8"
-        started = time.monotonic()
-        model = onnx_asr.load_model(
-            MODEL_NAME,
-            str(_model_dir(self.quantization)),
-            quantization=quantization,
-            providers=providers,
-        )
-        self._model = model
-        self._active_providers = providers
-        log.info(
-            "Model loaded in %.1fs (quantization=%s, providers=%s)",
-            time.monotonic() - started, self.quantization, providers,
-        )
-        self._warm_up()
-
-    def _warm_up(self) -> None:
-        """First inference allocates kernels and, on CUDA, compiles them.
-
-        Doing it at load time keeps the first real dictation from paying a
-        multi-second penalty, the same reason the macOS build primes
-        FluidAudio right after the model finishes loading.
-        """
+    @staticmethod
+    def _warm_up(host: OnnxHost) -> None:
+        """First inference allocates kernels; pay it at load, not at the first dictation."""
         try:
-            silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
             started = time.monotonic()
-            self._model.recognize(silence, sample_rate=SAMPLE_RATE)
+            host.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32))
             log.info("Warm-up inference took %.2fs", time.monotonic() - started)
-        except Exception as exc:
+        except OnnxHostError as exc:
             log.warning("Warm-up failed (continuing anyway): %s", exc)
 
     def unload(self) -> None:
         with self._lock:
-            self._model = None
+            if self._host is not None:
+                self._host.shutdown()
+            self._host = None
             self._state = State.IDLE
-            self._active_providers = []
+            self.generation += 1
 
     # -- inference ---------------------------------------------------
 
-    def transcribe(self, samples: np.ndarray, enqueued_at: float) -> TranscriptionResult:
-        if self._model is None:
+    def _call(self, samples: np.ndarray, timestamps: bool) -> HostTranscription:
+        """One request, with one restart if the host turned out to be dead."""
+        if self._host is None:
             raise RuntimeError("Speech model is not loaded")
+        if not self._host.is_alive:
+            log.warning("ONNX host is gone; starting it again")
+            self._start_host()
+        try:
+            return self._host.transcribe(samples, timestamps=timestamps)
+        except OnnxHostError as exc:
+            if not exc.kills_host:
+                raise
+            log.warning("ONNX host failed (%s); restarting it for the next request", exc)
+            self._start_host()
+            raise
+
+    def transcribe(self, samples: np.ndarray, enqueued_at: float) -> TranscriptionResult:
         audio_seconds = len(samples) / SAMPLE_RATE
         with self._lock:
             queue_seconds = time.monotonic() - enqueued_at
             started = time.monotonic()
-            raw = self._model.recognize(samples, sample_rate=SAMPLE_RATE)
+            result = self._call(samples, timestamps=False)
             inference_seconds = time.monotonic() - started
-        text = raw if isinstance(raw, str) else str(raw)
         return TranscriptionResult(
-            text=text.strip(),
+            text=result.text.strip(),
             audio_seconds=audio_seconds,
             queue_seconds=queue_seconds,
             inference_seconds=inference_seconds,
         )
+
+    def transcribe_words(self, samples: np.ndarray) -> HostTranscription:
+        """Text plus per-word start/end times, for the overlap-window path."""
+        with self._lock:
+            return self._call(samples, timestamps=True)
 
     def transcribe_preview(self, samples: np.ndarray) -> Optional[tuple[str, float]]:
         """A throwaway pass over a recording still in progress.
@@ -336,28 +269,17 @@ class SpeechModel:
         by the time it runs, and holding up the transcription the user is
         actually waiting for to produce one would be backwards.
         """
-        if self._model is None or samples.size == 0:
+        if self._host is None or samples.size == 0:
             return None
         if not self._lock.acquire(blocking=False):
             return None
         try:
             started = time.monotonic()
-            raw = self._model.recognize(samples, sample_rate=SAMPLE_RATE)
+            result = self._call(samples, timestamps=False)
             elapsed = time.monotonic() - started
         except Exception as exc:
             log.debug("Preview pass failed: %s", exc)
             return None
         finally:
             self._lock.release()
-        text = raw if isinstance(raw, str) else str(raw)
-        return text.strip(), elapsed
-
-
-def delete_model_cache(quantization: Optional[str] = None) -> None:
-    import shutil
-
-    targets = [quantization] if quantization else list(MODEL_FILES)
-    for name in targets:
-        directory = paths.MODELS_DIR / f"parakeet-tdt-0.6b-v3-{name}"
-        if directory.exists():
-            shutil.rmtree(directory, ignore_errors=True)
+        return result.text.strip(), elapsed

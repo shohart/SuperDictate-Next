@@ -29,7 +29,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import asr, audio, i18n, inject, system, textproc
+from . import asr, audio, i18n, inject, system, textproc, transcription
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
@@ -259,16 +259,7 @@ class DictationController(QObject):
         self.postprocessor.shutdown()
 
     def _prepare_model(self) -> None:
-        if self.settings.asr_engine == "native":
-            from .asr_native import NativeSpeechModel
-
-            model = NativeSpeechModel(
-                compute_provider=self.settings.compute_provider)
-        else:
-            model = asr.SpeechModel(
-                quantization=self.settings.model_quantization,
-                compute_provider=self.settings.compute_provider,
-            )
+        model = asr.SpeechModel(profile=self.settings.speech_model_profile)
         self._model = model
 
         def on_progress(progress: asr.Progress) -> None:
@@ -646,7 +637,7 @@ class DictationController(QObject):
         if model is None or not model.is_ready:
             raise RuntimeError("Speech model is not ready")
 
-        result = model.transcribe(job.samples, job.enqueued_at)
+        result = transcription.transcribe(model, job.samples, job.enqueued_at)
         text, applied, removed = textproc.process_transcript(
             result.text,
             language=self.settings.dictation_language,
@@ -657,10 +648,11 @@ class DictationController(QObject):
             style=self.settings.text_style,
         )
         log.info(
-            "Transcribed %.1fs of audio in %.2fs (RTF %.2f, %d corrections, "
-            "%d fillers removed)",
+            "Transcribed %.1fs of audio in %.2fs (RTF %.2f, %d segment(s)%s, "
+            "%d corrections, %d fillers removed)",
             result.audio_seconds, result.inference_seconds,
-            result.realtime_factor, applied, removed,
+            result.realtime_factor, result.segments,
+            ", overlap" if result.overlap_path else "", applied, removed,
         )
 
         if not text:

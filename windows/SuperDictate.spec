@@ -1,28 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller build for SuperDictate.
 
-One-folder rather than one-file: onnxruntime ships large native DLLs, and
-a one-file build would unpack ~200 MB to a temporary directory on every
-launch, adding seconds to a hotkey-driven app that is meant to sit in the
+One-folder rather than one-file: Qt, ONNX Runtime and the engine hosts
+are large native DLLs, and a one-file build would unpack them to a
+temporary directory on every launch, adding seconds to a hotkey-driven app that is meant to sit in the
 tray from login.
 
-The speech model is NOT bundled. It is ~640 MB, it is licensed
+Speech recognition runs in SuperDictateOnnxHost.exe, the native host
+shared with the macOS build. tools\build-onnx-host.ps1 stages it with
+onnxruntime.dll, the pinned model catalog and the bundled feature graphs
+into onnx-asr\, which travels into the build as is. The app itself never
+imports ONNX Runtime.
+
+The speech model is NOT bundled. It is ~600 MB, it is licensed
 separately, and the app already downloads it on first run with a progress
-bar into %LOCALAPPDATA%\\SuperDictate\\Models.
+bar into %LOCALAPPDATA%\\SuperDictate\\Models\\onnx.
 """
 
-from PyInstaller.utils.hooks import (
-    collect_data_files,
-    collect_dynamic_libs,
-    copy_metadata,
-)
+import os
 
-datas = collect_data_files("onnx_asr")
-# onnx_asr/__init__.py reads its own version through importlib.metadata at
-# import time, which raises PackageNotFoundError unless the dist-info is
-# shipped alongside the code.
-datas += copy_metadata("onnx-asr")
-datas += copy_metadata("onnxruntime")
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata  # noqa: F401
+
+if not os.path.isfile(os.path.join("onnx-asr", "SuperDictateOnnxHost.exe")):
+    raise SystemExit("onnx-asr\\ is not staged: run tools\\build-onnx-host.ps1 first")
+
+datas = []
 # The tray icon is drawn from the product mark at runtime, so the PNG has
 # to travel with the build; the .ico only covers the window/taskbar icon
 # that Windows reads from the executable itself.
@@ -30,7 +32,18 @@ datas += [("assets/SuperDictate.png", "assets")]
 # The recording cues are played straight off disk by winsound.
 datas += [("assets/record-start.wav", "assets"),
           ("assets/record-stop.wav", "assets")]
-binaries = collect_dynamic_libs("onnxruntime")
+datas += [("onnx-asr", "onnx-asr")]
+# The correction LoRA is small enough to ship (llm/models.py).
+datas += [("assets/models/gec-lora-adapter.gguf", "assets/models")]
+# superdictate-llm-host.exe and whisper.dll (Silero VAD) with their ggml
+# DLLs, built from upstream llama.cpp / whisper.cpp. Optional: without them
+# post-processing reports itself unavailable and seams fall back to mel
+# energy, but dictation works.
+if os.path.isdir("engines"):
+    datas += [("engines", "engines")]
+else:
+    print("WARNING: engines\\ is missing; the build has no LLM post-processing and no Silero VAD")
+binaries = []
 
 hiddenimports = [
     "comtypes.stream",     # pycaw resolves this lazily at runtime

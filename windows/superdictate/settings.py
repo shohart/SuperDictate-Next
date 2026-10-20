@@ -247,18 +247,12 @@ _DEFAULTS: dict[str, Any] = {
     "stop_on_silence": False,
     "silence_stop_seconds": 2.5,
     "start_at_login": False,
-    # Two independent compute settings, deliberately not one. On real
-    # hardware Parakeet has repeatedly come out fastest AND most accurate on
-    # the CPU, while the local LLM is several times faster on the GPU — so a
-    # single "use the GPU" switch would always be wrong for one of them.
-    # Which ASR engine runs. ONNX Runtime is the default because on this
-    # hardware it is the faster of the two AND the better-tested path here;
-    # the native ggml engine exists so the transcript can be made identical
-    # to the macOS build's when that matters more than speed.
-    "asr_engine": "onnx",             # onnx | native
-    "compute_provider": "auto",       # ASR only: auto | cuda | cpu
+    # Which speech model runs. Same key and values as the macOS build.
+    # Recognition is CPU-only (ONNX Runtime in SuperDictateOnnxHost); the
+    # GPU belongs to the LLM stages, which is why the LLM device below is
+    # its own setting.
+    "speech_model_profile": "parakeet_ultra_onnx",  # parakeet_ultra_onnx | gigaam_v3_onnx
     "llm_compute_backend": "gpu",     # LLM only: gpu | cpu
-    "model_quantization": "int8",  # int8 | full
 
     # -- LLM post-processing ------------------------------------------
     # Key names match the macOS build's UserDefaults keys exactly, so the
@@ -507,21 +501,11 @@ class Settings:
         return bool(self._get("start_at_login"))
 
     @property
-    def model_quantization(self) -> str:
-        value = str(self._get("model_quantization"))
-        return value if value in ("int8", "full") else "int8"
-
-    @property
-    def compute_provider(self) -> str:
-        value = str(self._get("compute_provider"))
-        return value if value in ("auto", "cuda", "cpu") else "auto"
+    def speech_model_profile(self) -> str:
+        value = str(self._get("speech_model_profile"))
+        return value if value in ("parakeet_ultra_onnx", "gigaam_v3_onnx") else "parakeet_ultra_onnx"
 
     # -- LLM post-processing ------------------------------------------
-
-    @property
-    def asr_engine(self) -> str:
-        value = str(self._get("asr_engine"))
-        return value if value in ("onnx", "native") else "onnx"
 
     @property
     def llm_compute_backend(self) -> str:

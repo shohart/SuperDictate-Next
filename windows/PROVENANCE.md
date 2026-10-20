@@ -33,9 +33,10 @@ authorship chain intact.
 
 Shared by construction, and deliberately kept in sync:
 
-- **Model files.** The same GGUF weights, pinned to the same repositories
-  and revisions as `swift/Sources/Parakey/ModelDownload.swift`, verified by
-  the same SHA-256 digests. One exception, forced by the engine (below).
+- **Model files.** The same weights, pinned to the same repositories and
+  revisions, verified by the same SHA-256 digests: the LLM GGUFs as in
+  `swift/Sources/Parakey/ModelDownload.swift`, the speech models through the
+  shared ONNX catalog (below).
 - **Setting names.** Where a setting exists on both platforms it carries
   the same key, so behaviour is comparable and support answers transfer.
 - **Prompts.** The correction and rewrite prompts are carried over
@@ -43,17 +44,18 @@ Shared by construction, and deliberately kept in sync:
   They were tuned empirically against these exact models; changing one on
   one platform without the other silently forks the product's behaviour.
 
-Not shared: the engine hosts are built from upstream C++ rather than the
-vendored copies under `swift/Sources/`. See `docs/engine-layer.md` for what
-that costs and why it is nonetheless the cheaper side.
+Not shared: the LLM host and the Silero VAD (`engines\`) are built from
+upstream llama.cpp / whisper.cpp rather than the vendored copies under
+`swift/Sources/`. The speech host is shared source (below).
 
-## Engine model divergence
+## Speech recognition: shared, not diverged
 
-The macOS app loads Parakeet through the vendored `parakeet.cpp` fork and
-its GGUF container (`mudler/parakeet-cpp-gguf`, `tdt-0.6b-v3-q8_0.gguf`).
-The Windows port loads it through whisper.cpp's own in-tree Parakeet
-implementation, which rejects that file with "bad magic" — a different
-container around the same NVIDIA TDT 0.6B v3 checkpoint. Windows therefore
-pins `ggml-org/parakeet-GGUF` / `ggml-parakeet-tdt-0.6b-v3-f16.bin`.
-
-Same weights, same 25 languages, same vocabulary; different wrapper.
+Earlier revisions of the port ran Parakeet TDT v3 through the Python
+`onnx-asr` package, or through whisper.cpp's in-tree Parakeet with a
+different GGUF container than the macOS build. Both are gone. Since the
+macOS 0.7.0 switch to ONNX, both platforms run the same native host,
+`SuperDictateOnnxHost` (`native/asr-runtime`, C++ over ONNX Runtime
+1.23.2), with the same models from the same pinned catalog
+(`native/asr-runtime/catalog/onnx-models.json`) and the same CPU-only
+policy. The Python side only speaks the host's framed IPC
+(`superdictate/onnx_host.py`), as the Swift `OnnxAsrEngine` does.

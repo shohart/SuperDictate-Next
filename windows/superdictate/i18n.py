@@ -308,22 +308,18 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_history_limit": ("Быстрая история", "Quick history"),
     "settings_history_off": ("Выключена", "Off"),
     "settings_history_last": ("Последние {n}", "Last {n}"),
-    "settings_model_quality": ("Веса модели", "Model weights"),
-    "settings_model_int8": ("Сжатые int8 · 640 МБ", "Quantized int8 · 640 MB"),
-    "settings_model_full": ("Полные fp32 · 2,4 ГБ", "Full fp32 · 2.4 GB"),
-    "settings_asr_engine": ("Движок распознавания", "Recognition engine"),
-    "settings_asr_engine_onnx": ("ONNX Runtime (быстрее)", "ONNX Runtime (faster)"),
-    "settings_asr_engine_native": ("Нативный ggml (как на macOS)",
-                                   "Native ggml (as on macOS)"),
-    "settings_asr_engine_hint": (
-        "ONNX вдвое быстрее на этой машине. Нативный движок даёт текст, "
-        "совпадающий с macOS-сборкой, и работает только на процессоре.",
-        "ONNX is twice as fast here. The native engine produces the same "
-        "text as the macOS build and runs on the CPU only."),
-    "settings_compute": ("Распознавание речи", "Speech recognition"),
-    "settings_compute_auto": ("Авто", "Auto"),
-    "settings_compute_cuda": ("GPU (CUDA)", "GPU (CUDA)"),
-    "settings_compute_cpu": ("CPU", "CPU"),
+    "settings_speech_model": ("Модель распознавания", "Speech model"),
+    "settings_model_parakeet_ultra": ("Parakeet Ultra 0.6B · 25 языков",
+                                      "Parakeet Ultra 0.6B · 25 languages"),
+    "settings_model_gigaam_v3": ("GigaAM v3 · только русский",
+                                 "GigaAM v3 · Russian only"),
+    "settings_speech_model_hint": (
+        "Распознавание идёт на процессоре, как и на macOS. GigaAM заметно "
+        "точнее на русском, но других языков не знает. Модель скачивается "
+        "при первом выборе (~600 / ~220 МБ).",
+        "Recognition runs on the CPU, as on macOS. GigaAM is noticeably more "
+        "accurate on Russian but knows no other language. The model "
+        "downloads the first time it is chosen (~600 / ~220 MB)."),
     "settings_save_restart": ("Сохранить и перезапустить", "Save and restart"),
     "settings_cancel": ("Отмена", "Cancel"),
 

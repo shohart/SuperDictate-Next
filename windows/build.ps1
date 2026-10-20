@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Regenerates the icon, runs the self-tests (a failing port should never
-    reach a build), then packages with PyInstaller.
+    reach a build), builds and stages SuperDictateOnnxHost
+    (tools\build-onnx-host.ps1), then packages with PyInstaller.
 
 .EXAMPLE
     .\build.ps1
@@ -40,6 +41,10 @@ if (-not $SkipTests) {
     if ($LASTEXITCODE -ne 0) { throw "Self-tests failed; not building." }
 }
 
+Write-Host "Building the speech-recognition host..." -ForegroundColor Cyan
+& .\tools\build-onnx-host.ps1
+if ($LASTEXITCODE) { throw "build-onnx-host failed." }
+
 Write-Host "Packaging with PyInstaller..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm SuperDictate.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
@@ -51,4 +56,4 @@ $size = [math]::Round((Get-ChildItem dist\SuperDictate -Recurse |
                        Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 Write-Host ""
 Write-Host "Built $exe ($size MB folder)" -ForegroundColor Green
-Write-Host "The speech model (~640 MB) downloads on first run." -ForegroundColor DarkGray
+Write-Host "The speech model (~600 MB) downloads on first run." -ForegroundColor DarkGray
