@@ -1,0 +1,12 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.log
+desktop.ini
+Thumbs.db
+
+# Built by tools/make_icon.py from SuperDictate.png at build time, but
+# committed too: the installer script needs it and not every checkout has
+# PySide6 available to regenerate it.
