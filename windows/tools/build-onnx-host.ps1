@@ -41,15 +41,19 @@ $OrtRoot = Join-Path $RuntimeDir "third_party\onnxruntime\win-x64"
 & (Join-Path $RepoRoot "scripts\fetch-onnxruntime.ps1")
 if ($LASTEXITCODE) { throw "fetch-onnxruntime failed" }
 
+# Visual Studio or Build Tools, wherever installed (Build Tools land under
+# Program Files (x86)).
+$vs = $null
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path $vswhere) {
+    $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+}
+
 $cmake = Get-Command cmake -ErrorAction SilentlyContinue
-if (-not $cmake) {
+if (-not $cmake -and $vs) {
     # Visual Studio ships its own CMake; use it when none is on PATH.
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vswhere) {
-        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        $candidate = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-        if (Test-Path $candidate) { $cmake = Get-Item $candidate }
-    }
+    $candidate = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    if (Test-Path $candidate) { $cmake = Get-Item $candidate }
 }
 if (-not $cmake) { throw "cmake not found: install CMake or the Visual Studio C++ workload" }
 $cmakeExe = if ($cmake -is [System.Management.Automation.CommandInfo]) { $cmake.Source } else { $cmake.FullName }
@@ -87,8 +91,13 @@ Copy-Item (Join-Path $OrtRoot "LICENSE") (Join-Path $Stage "onnxruntime-LICENSE.
 
 # Packaging check (spec section 10): the host must load ONNX Runtime from
 # beside itself and need no Visual C++ redistributable of its own.
-$dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($dumpbin) {
+$dumpbin = $null
+if ($vs) {
+    $dumpbin = Get-ChildItem (Join-Path $vs "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+if (-not $dumpbin) {
+    Write-Warning "dumpbin not found: skipping the import check of SuperDictateOnnxHost.exe"
+} else {
     $deps = & $dumpbin.FullName /nologo /dependents (Join-Path $Stage "SuperDictateOnnxHost.exe") |
         Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
     Write-Host ("SuperDictateOnnxHost.exe imports: " + ($deps -join ", ")) -ForegroundColor DarkGray

@@ -495,7 +495,7 @@ encoder output: an **empty transcript** for most short dictations. The
 tests missed it. The encoder now receives the full frame count (C++ and
 `reference_tdt.py`); with batch 1 the length only drives masking, so the
 goldens are unchanged. Regression test: "short speech prefixes are never
-empty" (`tests/model_tests.cpp`). Not yet verified on Windows.
+empty" (`tests/model_tests.cpp`). Verified on Windows on 2026-10-21 (below).
 
 **W6 first comparison (2026-10-16, same Mac, release build of the app,
 8 threads, CPU vs CPU, idle machine).** `--benchmark-transcribe cpu 8` (GGUF
@@ -565,6 +565,35 @@ onnx-asr) **exactly** (text and token ids/frames). Swift: profile
 default `parakeet_ultra_onnx`; each profile downloads into its own
 `onnx/<model_id>/` cache, only the selected model is loaded;
 `--benchmark-transcribe gigaam cpu <threads> <wav...>`.
+
+**Windows x64 (2026-10-21)**, gaming PC (Intel 8 cores / 16 threads,
+2.8 GHz engineering sample, 16 GB, RTX 4070, Windows 11 24H2 26100), VS 2022
+Build Tools 14.44, CMake, ONNX Runtime win-x64 1.23.2. The host builds with
+`windows/tools/build-onnx-host.ps1` (`/MT`): `SuperDictateOnnxHost.exe`
+imports only `onnxruntime.dll` and `KERNEL32.dll`, no VC++ redistributable.
+Contract, IPC and model tests pass, the model tests with **exact** parity
+against the goldens (EN 11 s, RU 11 s, RU 71 s, Parakeet Ultra). Through
+the Windows app (`python main.py --benchmark-transcribe`, Python → host,
+6 threads = physical cores − 2) Parakeet's plain-path text is identical to
+the goldens, and its segmented RU 71 s text (5 overlap windows) is identical
+to the macOS host's. GigaAM v3 matches macOS exactly on RU 11 s; on RU 71 s
+it differs by 3 of 124 words on the plain path and 1 on the segmented path
+(int8 kernels of the two x86 CPUs round differently; Parakeet is not
+affected). `sd_asr_cli`, RU 71 s, warm run, peak working set:
+
+| intra-op threads | Parakeet Ultra | GigaAM v3 |
+|---|---|---|
+| 4 | 5.2 s (RTF 0.073) | 4.0 s (0.057) |
+| 6 (default) | 4.5 s (0.064) | 3.5 s (0.049) |
+| 8 | 4.1 s (0.058) | 3.3 s (0.047) |
+| 12 | 4.6 s | 3.7 s |
+| 16 | 4.7 s | 3.9 s |
+| peak working set | 1.66 GB | 0.61 GB |
+
+Load: Parakeet 1.8 s, GigaAM 1.0 s. Hugging Face's xet CDN
+(`us.aws.cdn.hf.co`) resets the TLS handshake on this network, so the model
+download path was exercised only up to that failure (reported, not
+retried); the models were copied from the Mac's verified installs.
 
 ## 13. Waves
 

@@ -108,7 +108,8 @@ def host_executable() -> Optional[Path]:
     candidates = [runtime_directory() / name]
     override = os.environ.get("SUPERDICTATE_ONNX_HOST")
     if override:
-        candidates.insert(0, Path(override))
+        # Absolute: the host is spawned with its own directory as cwd.
+        candidates.insert(0, Path(override).resolve())
     build = _source_tree_root() / "native" / "asr-runtime" / "build"
     candidates += [build / name, build / "Release" / name]
     for candidate in candidates:
