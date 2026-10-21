@@ -7,8 +7,11 @@ Windows port stops one step earlier: it reports what is published and
 opens the release page. Nothing is downloaded or executed automatically;
 the macOS build also never installs without an explicit click.
 
-If the upstream release carries no Windows asset the check says so
-plainly rather than offering a macOS ZIP the user cannot run.
+Both platforms publish to the same repository, so Windows releases are
+tagged ``windows-vX.Y.Z`` and published without GitHub's "latest" flag:
+the macOS updater reads ``releases/latest`` and must never see one. This
+module lists the releases and picks the newest Windows tag, never a macOS
+one. If that release carries no installer the check says so plainly.
 """
 
 from __future__ import annotations
@@ -26,14 +29,16 @@ from .version import VERSION
 
 log = get_logger("updater")
 
-LATEST_RELEASE_URL = "https://api.github.com/repos/shohart/SuperDictate-Next/releases/latest"
-RELEASES_PAGE = "https://github.com/shohart/SuperDictate-Next/releases/latest"
+RELEASES_URL = "https://api.github.com/repos/shohart/SuperDictate-Next/releases?per_page=50"
+RELEASES_PAGE = "https://github.com/shohart/SuperDictate-Next/releases"
+#: Tag prefix of Windows releases; ``v0.7.0`` alone is a macOS release.
+WINDOWS_TAG_PREFIX = "windows-v"
 CHECK_INTERVAL_SECONDS = 6 * 3600
 REQUEST_TIMEOUT = 15
 
-# The releases this checks are Windows-only, so any installer or archive
-# is the right asset; requiring "win" in the name would reject
-# "SuperDictate-0.6.0-setup.exe".
+# Only Windows releases get here (by tag), so any installer or archive is
+# the right asset; requiring "win" in the name would reject
+# "SuperDictate-0.7.0-setup.exe".
 _WINDOWS_ASSET = re.compile(r"\.(exe|msi|zip)$", re.IGNORECASE)
 
 
@@ -47,7 +52,10 @@ class UpdateInfo:
 
 
 def parse_version(raw: str) -> tuple[int, ...]:
-    cleaned = raw.strip().lstrip("vV")
+    cleaned = raw.strip()
+    if cleaned.lower().startswith(WINDOWS_TAG_PREFIX):
+        cleaned = cleaned[len(WINDOWS_TAG_PREFIX):]
+    cleaned = cleaned.lstrip("vV")
     parts: list[int] = []
     for chunk in re.split(r"[.\-+]", cleaned):
         if chunk.isdigit():
@@ -61,9 +69,22 @@ def is_newer(candidate: str, current: str = VERSION) -> bool:
     return parse_version(candidate) > parse_version(current)
 
 
+def newest_windows_release(releases: list) -> Optional[dict]:
+    """The newest published ``windows-v*`` release in a releases listing."""
+    candidates = [
+        release for release in releases
+        if isinstance(release, dict)
+        and str(release.get("tag_name", "")).lower().startswith(WINDOWS_TAG_PREFIX)
+        and not release.get("draft")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda release: parse_version(str(release["tag_name"])))
+
+
 def check_latest(timeout: int = REQUEST_TIMEOUT) -> Optional[UpdateInfo]:
     request = urllib.request.Request(
-        LATEST_RELEASE_URL,
+        RELEASES_URL,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"SuperDictate-Windows/{VERSION}",
@@ -76,20 +97,21 @@ def check_latest(timeout: int = REQUEST_TIMEOUT) -> Optional[UpdateInfo]:
         log.warning("Update check failed: %s", exc)
         return None
 
-    tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
-    if not tag:
+    release = newest_windows_release(payload if isinstance(payload, list) else [])
+    if release is None:
         return None
+    tag = str(release["tag_name"]).strip()
 
     windows_asset = None
-    for asset in payload.get("assets", []) or []:
+    for asset in release.get("assets", []) or []:
         name = str(asset.get("name", ""))
         if _WINDOWS_ASSET.search(name):
             windows_asset = str(asset.get("browser_download_url", "")) or None
             break
 
     return UpdateInfo(
-        version=tag.lstrip("vV"),
-        page_url=str(payload.get("html_url") or RELEASES_PAGE),
+        version=".".join(str(part) for part in parse_version(tag)),
+        page_url=str(release.get("html_url") or RELEASES_PAGE),
         has_windows_asset=windows_asset is not None,
         asset_url=windows_asset,
         is_newer=is_newer(tag),

@@ -967,6 +967,24 @@ def test_llm_backend_without_bundled_host() -> None:
            endpoint.effective_model_name, "gpt-4o-mini")
 
 
+def test_update_channel_is_windows_only() -> None:
+    # Both platforms publish to one repository; a macOS release (plain
+    # "v0.8.0", a .zip of the .app) must never read as a Windows update.
+    from .updater import is_newer, newest_windows_release, parse_version
+
+    releases = [
+        {"tag_name": "v0.9.0", "assets": [{"name": "SuperDictate.zip"}]},
+        {"tag_name": "windows-v0.7.1", "assets": []},
+        {"tag_name": "windows-v0.7.10", "assets": []},
+        {"tag_name": "windows-v0.8.0", "draft": True},
+    ]
+    _check("the newest windows tag wins, macOS and drafts ignored",
+           newest_windows_release(releases)["tag_name"], "windows-v0.7.10")
+    _check("no windows release, no update", newest_windows_release(releases[:1]), None)
+    _check("windows tags parse", parse_version("windows-v0.7.10"), (0, 7, 10))
+    _check("a newer windows tag is newer", is_newer("windows-v0.7.1", "0.7.0"), True)
+
+
 def test_retired_asr_settings_are_dropped() -> None:
     """Settings from the onnx-asr / ggml era load without leaking through."""
     import json
@@ -1195,6 +1213,7 @@ _TESTS = [
     test_overlap_assembly,
     test_compute_backends_are_independent,
     test_llm_backend_without_bundled_host,
+    test_update_channel_is_windows_only,
     test_retired_asr_settings_are_dropped,
     test_asr_thread_policy,
     test_onnx_catalog_and_manifest,
