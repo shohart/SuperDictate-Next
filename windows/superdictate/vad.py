@@ -5,9 +5,9 @@ Port of the macOS build's ``superdictate_silero_vad`` bridge
 ``SileroVadEngine`` above it — with one simplification the platform allows.
 
 The macOS build vendors whisper.cpp's Silero implementation into its own
-target and wraps it in a hand-written C bridge, because two copies of ggml
-cannot be linked into one binary there. Windows has no such problem: the
-same functions are already exported from ``whisper.dll``, so this binds them
+target and wraps it in a hand-written C bridge. Windows builds the same
+vendored sources into ``engines\\silero-vad.dll`` (``tools/build-engines.ps1``),
+which exports the upstream ``whisper_vad_*`` functions, and binds them
 directly with ``ctypes``. Same upstream code, same model file, one layer
 fewer.
 
@@ -93,7 +93,7 @@ class SileroVad:
         try:
             self._lib = _load_library()
         except OSError as exc:
-            self._error = f"whisper.dll not loadable: {exc}"
+            self._error = f"silero-vad.dll not loadable: {exc}"
             log.info("%s", self._error)
             return
 
@@ -166,45 +166,15 @@ class SileroVad:
                 return None
 
 
-def _dll_directories(engine_directory: str) -> list[str]:
-    """Directories to make loadable, most specific first.
-
-    Both CUDA layouts are listed because they differ by version and getting
-    it wrong is invisible until load time: CUDA 12 put the runtime DLLs in
-    ``bin``, CUDA 13 moved them to ``bin\\x64``. Listing both costs nothing
-    and spares the next person this exact hour.
-    """
-    directories = [engine_directory]
-    cuda = os.environ.get("CUDA_PATH")
-    if cuda:
-        directories.append(os.path.join(cuda, "bin", "x64"))
-        directories.append(os.path.join(cuda, "bin"))
-    return [d for d in directories if os.path.isdir(d)]
-
-
 def _load_library():
-    """Open whisper.dll from the engines directory, with its dependencies.
+    """Open silero-vad.dll from the engines directory.
 
-    ``ggml.dll`` and friends sit beside it and are not on any search path,
-    so the directory is added explicitly rather than relying on the process
-    working directory happening to be right.
+    It is self-contained (ggml is linked in, CPU only), so nothing else has
+    to be made loadable.
     """
-    directory = _engine_directory()
-    dll = os.path.join(directory, "whisper.dll")
+    dll = os.path.join(_engine_directory(), "silero-vad.dll")
     if not os.path.exists(dll):
         raise OSError(f"not found: {dll}")
-
-    # whisper.dll pulls in the ggml family beside it, and the CUDA backend
-    # pulls in the CUDA runtime, which lives in the toolkit rather than
-    # next to us. Both directories are registered explicitly: relying on
-    # the process working directory or a user PATH is how this fails on
-    # somebody else's machine.
-    if hasattr(os, "add_dll_directory"):
-        for candidate in _dll_directories(directory):
-            try:
-                os.add_dll_directory(candidate)
-            except OSError:
-                continue
     library = ctypes.CDLL(dll)
 
     library.whisper_vad_default_context_params.restype = _VadContextParams
@@ -232,7 +202,7 @@ def _load_library():
 
 
 #: Kept alive at module scope on purpose: ctypes callbacks are collected as
-#: soon as the last Python reference goes, and whisper.dll would then call
+#: soon as the last Python reference goes, and the DLL would then call
 #: into freed memory on its next log line.
 _LOG_CALLBACK = None
 
@@ -245,7 +215,9 @@ def _silence_upstream_logging(library) -> None:
     been bitten by that once, where the model download died on the first
     write to a missing stream — and even with a console it is noise the
     user did not ask for. Nothing here is fatal if the symbol is absent:
-    an older DLL just keeps printing.
+    the vendored extract in ``silero-vad.dll`` has no ``whisper_log_set``
+    and keeps printing to a stderr the windowed build does not have, which
+    the C runtime ignores.
     """
     global _LOG_CALLBACK
     try:

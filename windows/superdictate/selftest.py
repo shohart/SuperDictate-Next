@@ -893,14 +893,14 @@ def test_compute_backends_are_independent() -> None:
     _check("a retired or unknown model falls back to the default",
            settings.speech_model_profile, "parakeet_ultra_onnx")
     _check("the ASR model leaves the LLM device alone",
-           settings.llm_compute_backend, "gpu")
+           settings.llm_compute_backend, "cpu")
     settings._set("llm_compute_backend", "cpu")
     _check("cpu means no offloaded layers", settings.llm_gpu_layers, 0)
     settings._set("llm_compute_backend", "gpu")
     _check("gpu means all of them", settings.llm_gpu_layers, 99)
     settings._set("llm_compute_backend", "nonsense")
-    _check("an unknown value falls back to the gpu default",
-           settings.llm_compute_backend, "gpu")
+    _check("an unknown value falls back to the cpu default",
+           settings.llm_compute_backend, "cpu")
 
 
 def test_retired_asr_settings_are_dropped() -> None:

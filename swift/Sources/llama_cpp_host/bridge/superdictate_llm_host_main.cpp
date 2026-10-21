@@ -47,8 +47,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#else
+#include <unistd.h>
+#endif
 
 // Not "json" -- common/chat.h already defines that alias (to
 // nlohmann::ordered_json) at global scope, and both headers end up in this
@@ -431,6 +437,35 @@ int main(int argc, char ** argv) {
     // the whole process shuts down within one poll interval. _Exit (not
     // exit) so an in-flight generation's destructors cannot hang the
     // shutdown — nobody is left waiting for that response anyway.
+    //
+    // Windows has no re-parenting to poll for: the parent's PID is looked up
+    // once, and a handle to it is waited on. (The Windows app also puts this
+    // process in a kill-on-close job object; this covers running it alone.)
+#ifdef _WIN32
+    HANDLE parent = nullptr;
+    {
+        const DWORD self = GetCurrentProcessId();
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W entry{};
+            entry.dwSize = sizeof(entry);
+            for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+                if (entry.th32ProcessID == self) {
+                    parent = OpenProcess(SYNCHRONIZE, FALSE, entry.th32ParentProcessID);
+                    break;
+                }
+            }
+            CloseHandle(snapshot);
+        }
+    }
+    if (parent != nullptr) {
+        std::thread([parent]() {
+            WaitForSingleObject(parent, INFINITE);
+            std::fprintf(stderr, "superdictate-llm-host: parent exited, shutting down\n");
+            std::_Exit(0);
+        }).detach();
+    }
+#else
     const pid_t original_ppid = getppid();
     std::thread([original_ppid]() {
         while (true) {
@@ -441,6 +476,7 @@ int main(int argc, char ** argv) {
             }
         }
     }).detach();
+#endif
 
     httplib::Server svr;
 

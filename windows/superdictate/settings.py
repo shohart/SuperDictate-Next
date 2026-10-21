@@ -252,7 +252,10 @@ _DEFAULTS: dict[str, Any] = {
     # GPU belongs to the LLM stages, which is why the LLM device below is
     # its own setting.
     "speech_model_profile": "parakeet_ultra_onnx",  # parakeet_ultra_onnx | gigaam_v3_onnx
-    "llm_compute_backend": "gpu",     # LLM only: gpu | cpu
+    # LLM only: gpu | cpu. CPU until the user opts in, as on macOS
+    # (llmUseGPU): a GPU that computes wrong gives fluent-looking garbage,
+    # and the CPU path is the one that is right everywhere.
+    "llm_compute_backend": "cpu",
 
     # -- LLM post-processing ------------------------------------------
     # Key names match the macOS build's UserDefaults keys exactly, so the
@@ -511,7 +514,7 @@ class Settings:
     def llm_compute_backend(self) -> str:
         """Where the post-processing models run. Independent of the ASR one."""
         value = str(self._get("llm_compute_backend"))
-        return value if value in ("gpu", "cpu") else "gpu"
+        return value if value in ("gpu", "cpu") else "cpu"
 
     @property
     def llm_gpu_layers(self) -> int:

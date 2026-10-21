@@ -120,11 +120,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Для постобработки дополнительно нужны собранный хост
-(`engines\superdictate-llm-host.exe` рядом с `llama.dll` и `ggml*.dll`)
-и файлы моделей в `%LOCALAPPDATA%\SuperDictate\Models\llm\`. Silero VAD
-берётся из `engines\whisper.dll`; без него швы длинной диктовки
-выбираются по энергии сигнала.
+Постобработка и Silero VAD собираются в `engines\` отдельным скриптом
+(нужен Vulkan SDK, только для сборки):
+
+```powershell
+.\tools\build-engines.ps1        # superdictate-llm-host.exe, silero-vad.dll -> engines\
+```
+
+Хост LLM — тот же, что на macOS, из того же vendored llama.cpp, на CPU и
+Vulkan (в рантайме нужен только драйвер видеокарты). Файлы моделей лежат в
+`%LOCALAPPDATA%\SuperDictate\Models\llm\`. Без `engines\silero-vad.dll`
+швы длинной диктовки выбираются по энергии сигнала.
 
 Самопроверка, без микрофона и модели:
 

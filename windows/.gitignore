@@ -12,6 +12,6 @@ Thumbs.db
 # PySide6 available to regenerate it.
 
 # Staged by tools/build-onnx-host.ps1
-onnx-asr/
-# Engine hosts built from upstream llama.cpp / whisper.cpp
-engines/
+/onnx-asr/
+# Staged by tools/build-engines.ps1
+/engines/

@@ -5,15 +5,18 @@
 .DESCRIPTION
     Regenerates the icon, runs the self-tests (a failing port should never
     reach a build), builds and stages SuperDictateOnnxHost
-    (tools\build-onnx-host.ps1), then packages with PyInstaller.
+    (tools\build-onnx-host.ps1) and the LLM host and Silero VAD
+    (tools\build-engines.ps1), then packages with PyInstaller.
 
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -SkipTests
+    .\build.ps1 -SkipEngines     # no Vulkan SDK: ship without LLM and VAD
 #>
 [CmdletBinding()]
 param(
     [switch]$SkipTests,
+    [switch]$SkipEngines,
     [switch]$Clean
 )
 
@@ -44,6 +47,12 @@ if (-not $SkipTests) {
 Write-Host "Building the speech-recognition host..." -ForegroundColor Cyan
 & .\tools\build-onnx-host.ps1
 if ($LASTEXITCODE) { throw "build-onnx-host failed." }
+
+if (-not $SkipEngines) {
+    Write-Host "Building the LLM host and Silero VAD..." -ForegroundColor Cyan
+    & .\tools\build-engines.ps1
+    if ($LASTEXITCODE) { throw "build-engines failed." }
+}
 
 Write-Host "Packaging with PyInstaller..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm SuperDictate.spec

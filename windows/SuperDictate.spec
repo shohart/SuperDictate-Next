@@ -35,10 +35,10 @@ datas += [("assets/record-start.wav", "assets"),
 datas += [("onnx-asr", "onnx-asr")]
 # The correction LoRA is small enough to ship (llm/models.py).
 datas += [("assets/models/gec-lora-adapter.gguf", "assets/models")]
-# superdictate-llm-host.exe and whisper.dll (Silero VAD) with their ggml
-# DLLs, built from upstream llama.cpp / whisper.cpp. Optional: without them
-# post-processing reports itself unavailable and seams fall back to mel
-# energy, but dictation works.
+# superdictate-llm-host.exe (with its Vulkan shaders) and silero-vad.dll,
+# built by tools/build-engines.ps1 from the vendored macOS sources.
+# Optional: without them post-processing reports itself unavailable and
+# seams fall back to mel energy, but dictation works.
 if os.path.isdir("engines"):
     datas += [("engines", "engines")]
 else:

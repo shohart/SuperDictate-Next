@@ -1,8 +1,9 @@
 """The local LLM host process, and the OpenAI-compatible client for it.
 
 ``superdictate-llm-host.exe`` is the same hand-written C++ host the macOS
-build spawns (``swift/Sources/llama_cpp_host/bridge/``), compiled for
-Windows against llama.cpp with the CUDA backend. It loads one GGUF model
+build spawns (``swift/Sources/llama_cpp_host/bridge/``), built from the same
+vendored llama.cpp with the same CPU and Vulkan backends
+(``tools/build-engines.ps1``). It loads one GGUF model
 (optionally with a LoRA adapter) and serves ``/health`` plus
 ``/v1/chat/completions`` over loopback HTTP — deliberately indistinguishable
 from a real OpenAI-compatible server, so the same client code below serves
@@ -69,18 +70,17 @@ def host_executable() -> "os.PathLike[str]":
 
 
 def _engine_environment() -> dict[str, str]:
-    """The host's environment, with the engine directory on PATH.
+    """The host's environment: where its Vulkan shaders are.
 
-    ``llama.dll``/``ggml*.dll`` ship next to the executable, and the CUDA
-    runtime DLLs come from the toolkit; neither is on a default PATH.
+    The host is one static executable; Vulkan itself is the GPU driver's
+    ``vulkan-1.dll``. The SPIR-V corpus is loaded from disk on first use,
+    and without this variable the host would look for it beside the source
+    tree it was compiled from. A value already set wins, for debugging a
+    rebuilt corpus.
     """
     env = dict(os.environ)
-    engine_dir = str(paths.resource_path("engines"))
-    cuda_path = env.get("CUDA_PATH")
-    prefix = engine_dir
-    if cuda_path:
-        prefix += os.pathsep + os.path.join(cuda_path, "bin")
-    env["PATH"] = prefix + os.pathsep + env.get("PATH", "")
+    env.setdefault("SUPERDICTATE_VULKAN_SHADER_DIR",
+                   str(paths.resource_path("engines", "vulkan-shaders")))
     return env
 
 
@@ -146,17 +146,26 @@ class LLMHostProcess:
                      "--lora-scale", str(self.spec.lora_scale)]
 
         started = time.monotonic()
+        # The host's own stderr (model load, device, errors) goes to a log
+        # file: the windowed app has no console to show it on.
+        try:
+            stderr = open(paths.LOG_DIR / "LLMHost.log", "ab")
+        except OSError:
+            stderr = subprocess.DEVNULL
         try:
             self._process = subprocess.Popen(
                 argv,
                 env=_engine_environment(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError as exc:
             raise LLMHostError(f"could not launch host: {exc}") from exc
+        finally:
+            if stderr is not subprocess.DEVNULL:
+                stderr.close()
 
         _kill_child_with_parent(self._process)
 
