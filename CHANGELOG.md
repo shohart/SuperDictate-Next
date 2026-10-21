@@ -6,14 +6,33 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.8.0 — 2026-10-21
+
+macOS: tag `mac-v0.8.0` (also published once as `v0.8.0` for 0.7.0 clients). Windows: tag `win-v0.8.0`.
+
+### Added
+- **GigaAM v3 (Russian) as a second speech model** (ONNX, e2e RNN-T, MIT). Pick it in Settings → Speech model. Parakeet Ultra stays the default; only the selected model is downloaded. On 4 minutes of Russian speech its WER is 0.015, against 0.075 for Parakeet.
+- **Long dictations are transcribed while you speak.** Overlap windows that are already final are recognised during the recording, so releasing the hotkey after several minutes leaves only the last window or two. The text is byte-identical to the old path. Nothing changes below 15 s of audio.
+- **Silero VAD downloads itself** (885 KB, pinned and checksummed), so pause detection no longer falls back to the energy heuristic.
+- **Windows port** (`windows/`): the same speech host and models as macOS; correction and rewrite go through an OpenAI-compatible API. In this release:
+  - The recording capsule appears at the text caret. The caret comes from the Win32 caret or UI Automation, which covers browsers, Electron, Office and UWP. The capsule follows the caret while you speak.
+  - The text goes to the field where the dictation started, even if you switched windows. If that window has closed, the text goes to the clipboard instead of into another app.
+  - The macOS capsule animations: reveal, level bars, a timer after 10 s, the transcribing and "improving text" animations, and the error flash. There are light, dark and system backgrounds, a contrast colour, and a colour for the improvement stage.
 
 ### Changed
 - **macOS and Windows releases have their own tags.** macOS releases are tagged `mac-vX.Y.Z` from now on (up to 0.7.0: `vX.Y.Z`), Windows releases `win-vX.Y.Z`. The update check lists the releases and takes the newest macOS one, so a Windows release can never be offered as a Mac update. The process is in `docs/RELEASING.md`.
-- **The correction guardrail lets the corrector drop fillers.** The VoiceScribe corrector deletes fillers by design («ну короче завтра…» → «Завтра…»), and the leading-word check used to revert that as a lost word. Its accept/reject cases now live in `fixtures/llm-correction-guardrail.json`, shared with the Windows port; several come from a probe of the real model.
+- **The correction guardrail lets the corrector drop fillers.** The VoiceScribe corrector deletes fillers by design («ну короче завтра…» → «Завтра…»), and the leading-word check used to revert that as a lost word. Its accept/reject cases now live in `fixtures/llm-correction-guardrail.json`, shared with the Windows port.
+- **The local LLM stays loaded from launch**, so the first dictation after a start no longer waits for it. Switching a stage or a model off unloads its host at once.
+- **Speech recognition uses all physical cores but two** (at most 16).
 
-### Added
-- **Windows port** (`windows/`): the same speech host and models as macOS 0.7.0; correction and rewrite through an OpenAI-compatible API.
+### Fixed
+- Long dictations are no longer cut by the correction pass. The text is corrected in sentence-sized chunks, and output whose word count drifts more than 10 % is reverted.
+- Vocabulary learning works again in Chrome-based editors (ChatGPT and similar), where the edit watch used to abort.
+- The LLM host no longer spins on a closed stderr.
+
+### Validation
+- macOS 0.8.0 (build 60), bundle id `com.local.superdictate`, macOS 14.0+, x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `068dd0af1eb711973961a51045558ed39fc172ee7cb28b469dab8de7daf921fc`.
+- Windows 0.8.0: 48 self-tests pass. An end-to-end run in a real desktop session found the caret in a Win32 edit control and in Edge (UI Automation), returned to the starting field after a window switch and pasted there, and sent the text to the clipboard once the starting window had closed. `SuperDictate-0.8.0-setup.exe` SHA-256: `399e7e8af6f27cec4dc2795381da9d62076004dfa6e35d4f4e26b9dbd79ff482`.
 
 ## v0.7.0 — 2026-10-17
 
