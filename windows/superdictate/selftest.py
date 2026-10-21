@@ -503,6 +503,44 @@ def test_correction_guardrail() -> None:
     _check("guardrail keeps empty output out",
            sanitized_correction("привет", "   "), "привет")
 
+    # The corrector deletes fillers by design: a cleaned leading «ну короче»
+    # is an edit, not a lost word. A dropped real word still is.
+    cleaned = "Завтра встреча в десять часов утра."
+    _check("guardrail lets the model drop leading fillers",
+           sanitized_correction("ну короче завтра встреча в десять часов утра", cleaned),
+           cleaned)
+    _check("guardrail accepts a filler the model kept",
+           sanitized_correction("ну завтра встреча", "Ну, завтра встреча."),
+           "Ну, завтра встреча.")
+    _check("a sometimes-filler is still a word",
+           sanitized_correction("вот документ готов", "Документ готов."),
+           "вот документ готов")
+    # Word count, as on macOS: a dropped tail is never a correction.
+    long_in = " ".join(["слово"] * 40)
+    _check("guardrail rejects a dropped tail",
+           sanitized_correction(long_in, " ".join(["Слово"] * 30)), long_in)
+    _check("guardrail allows a term merge",
+           sanitized_correction("залей на гит хаб", "Залей на GitHub."),
+           "Залей на GitHub.")
+
+
+def test_correction_chunks() -> None:
+    from .llm.guardrail import correction_chunks
+
+    _check("short text is one chunk", correction_chunks(" привет. "), ["привет."])
+    _check("empty text is no chunks", correction_chunks("  "), [])
+    sentence = "Это предложение средней длины для проверки разбиения. "
+    text = (sentence * 30).strip()
+    chunks = correction_chunks(text)
+    _check("long text is split", len(chunks) > 1, True)
+    _check("every chunk fits", all(len(c) <= 500 for c in chunks), True)
+    _check("chunks end on sentences", all(c.endswith(".") for c in chunks), True)
+    _check("joining restores the text", " ".join(chunks), text)
+    run_on = " ".join(["слово"] * 300)
+    pieces = correction_chunks(run_on)
+    _check("an over-long sentence is cut at spaces",
+           all(len(c) <= 500 for c in pieces) and " ".join(pieces) == run_on, True)
+
 
 # -- vocabulary -----------------------------------------------------------
 
@@ -903,6 +941,32 @@ def test_compute_backends_are_independent() -> None:
            settings.llm_compute_backend, "cpu")
 
 
+def test_llm_backend_without_bundled_host() -> None:
+    # Release builds ship no LLM host: a stored "bundledLocal" (the macOS
+    # default) must read as the endpoint, and the endpoint must get the
+    # zero-shot prompt and the macOS default model name.
+    import tempfile
+    from unittest import mock
+
+    from .llm import LLMBackend
+    from .llm.pipeline import CustomEndpoint
+    from .settings import Settings
+
+    settings = Settings(path=tempfile.mktemp(suffix=".json"))
+    with mock.patch("superdictate.llm.host.bundled_host_available", return_value=False):
+        _check("no host: correction uses the endpoint",
+               settings.correction_config().backend, LLMBackend.CUSTOM_ENDPOINT)
+        _check("no host: rewrite uses the endpoint",
+               settings.rewrite_config().backend, LLMBackend.CUSTOM_ENDPOINT)
+    with mock.patch("superdictate.llm.host.bundled_host_available", return_value=True):
+        _check("experimental host: the stored backend stands",
+               settings.correction_config().backend, LLMBackend.BUNDLED_LOCAL)
+    endpoint = CustomEndpoint(base_url="http://127.0.0.1:1234")
+    _check("an endpoint needs only its address", endpoint.is_configured, True)
+    _check("an empty model name falls back to the macOS default",
+           endpoint.effective_model_name, "gpt-4o-mini")
+
+
 def test_retired_asr_settings_are_dropped() -> None:
     """Settings from the onnx-asr / ggml era load without leaking through."""
     import json
@@ -1117,6 +1181,7 @@ _TESTS = [
     test_autostart_starts_in_the_tray,
     test_autostart_target_parsing,
     test_correction_guardrail,
+    test_correction_chunks,
     test_learn_candidate,
     test_vocabulary_store,
     test_hud_elapsed_format,
@@ -1129,6 +1194,7 @@ _TESTS = [
     test_boundary_oracles,
     test_overlap_assembly,
     test_compute_backends_are_independent,
+    test_llm_backend_without_bundled_host,
     test_retired_asr_settings_are_dropped,
     test_asr_thread_policy,
     test_onnx_catalog_and_manifest,

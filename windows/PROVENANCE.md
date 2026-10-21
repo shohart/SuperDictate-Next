@@ -44,11 +44,13 @@ Shared by construction, and deliberately kept in sync:
   They were tuned empirically against these exact models; changing one on
   one platform without the other silently forks the product's behaviour.
 
-Shared too: the LLM host and the Silero VAD (`engines\`) are built by
-`tools/build-engines.ps1` (`native/engines/CMakeLists.txt`) from the same
-vendored copies under `swift/Sources/` as the macOS app — llama.cpp
-d59d455 with the CPU and Vulkan backends, and whisper.cpp's Silero VAD over
-ggml v0.13.0. Earlier revisions linked upstream llama.cpp / whisper.cpp
+Shared too: the Silero VAD and the (experimental, not released) LLM host
+in `engines\` are built by `tools/build-engines.ps1`
+(`native/engines/CMakeLists.txt`) from the same vendored copies under
+`swift/Sources/` as the macOS app — whisper.cpp's Silero VAD over ggml
+v0.13.0, and llama.cpp d59d455 with the CPU (and optionally Vulkan)
+backend. Release builds do correction and rewrite through an
+OpenAI-compatible endpoint only. Earlier revisions linked upstream llama.cpp / whisper.cpp
 built with CUDA; the binaries were never committed and could not be
 rebuilt. The speech host is shared source (below).
 

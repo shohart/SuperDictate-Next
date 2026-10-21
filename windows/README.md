@@ -120,17 +120,28 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Постобработка и Silero VAD собираются в `engines\` отдельным скриптом
-(нужен Vulkan SDK, только для сборки):
+Silero VAD собирается в `engines\` отдельным скриптом (его вызывает и
+`build.ps1`); без `engines\silero-vad.dll` швы длинной диктовки
+выбираются по энергии сигнала:
 
 ```powershell
-.\tools\build-engines.ps1        # superdictate-llm-host.exe, silero-vad.dll -> engines\
+.\tools\build-engines.ps1        # silero-vad.dll -> engines\
 ```
 
-Хост LLM — тот же, что на macOS, из того же vendored llama.cpp, на CPU и
-Vulkan (в рантайме нужен только драйвер видеокарты). Файлы моделей лежат в
-`%LOCALAPPDATA%\SuperDictate\Models\llm\`. Без `engines\silero-vad.dll`
-швы длинной диктовки выбираются по энергии сигнала.
+Коррекция и переписывание в релизе работают только через
+OpenAI-совместимый API (LM Studio, Ollama, llama-server или облако):
+адрес, ключ и модель задаются в настройках. Встроенный хост LLM — тот же,
+что на macOS, — пока экспериментальный и в релиз не входит:
+
+```powershell
+.\tools\build-engines.ps1 -ExperimentalLlmHost           # на CPU
+.\tools\build-engines.ps1 -ExperimentalLlmHost -Vulkan   # на GPU, нужен Vulkan SDK
+```
+
+С ним в настройках появляются встроенные модели (веса — в
+`%LOCALAPPDATA%\SuperDictate\Models\llm\`) и выбор CPU/GPU. GPU-режим
+не проверен: на тестовой машине видеокарта давала неверные результаты и
+через Vulkan, и через CUDA (официальные сборки llama.cpp тоже).
 
 Самопроверка, без микрофона и модели:
 

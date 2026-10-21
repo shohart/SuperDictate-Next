@@ -17,7 +17,15 @@ Both share one signature: the input's first word does not survive into the
 output. This module checks exactly that — with enough fuzziness to let a
 legitimate term replacement through («гитхаб» → «GitHub») — and falls back
 to the uncorrected input on failure, per the pipeline's never-lose-text
-policy. Everything here is deterministic and hermetic: no model, no I/O.
+policy. It also checks the word count, like the macOS guardrail: the
+prompt forbids adding or removing words, so a large drift is the model
+dropping a tail or echoing an example, never an edit. Everything here is
+deterministic and hermetic: no model, no I/O.
+
+One deliberate difference: the corrector is trained to delete filler words
+(«ну короче завтра…» → «Завтра…»), so both checks look at the input with its
+unambiguous fillers removed. Otherwise every correctly cleaned dictation
+that starts with «ну» would be reverted as "leading word lost".
 """
 
 from __future__ import annotations
@@ -25,11 +33,23 @@ from __future__ import annotations
 import re
 
 from ..logging_setup import get as get_logger
+from ..textproc import remove_filler_words
 
 log = get_logger("llm.guardrail")
 
 # Letters and digits only; every run of anything else separates words.
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+# Fillers the corrector removes by design: hesitations and verbal tics that
+# are almost never anything else (textproc.PRESET_FILLERS minus the words
+# that are filler only sometimes — «это», «вот», «просто», «like»…, where a
+# dropped word may well be the user's own).
+_MODEL_REMOVED_FILLERS: tuple[str, ...] = (
+    "э", "эм", "ээ", "м", "мм", "ам", "аа", "ну",
+    "как бы", "типа", "короче", "это самое", "так сказать", "в общем",
+    "в принципе", "собственно", "допустим", "слушай", "понимаешь", "знаешь",
+    "um", "uh", "ah", "er", "erm", "hm", "you know", "i mean",
+)
 
 # U+0410..U+044F — А-Я а-я. `normalized_words` has already lowercased and
 # mapped ё away by the time anything asks.
@@ -132,15 +152,90 @@ def preserves_leading_word(text_in: str, text_out: str) -> bool:
     return False
 
 
+def preserves_word_count(text_in: str, text_out: str) -> bool:
+    """Whether ``text_out`` has roughly as many words: within ``max(2, 10 %)``.
+
+    The floor of 2 absorbs legitimate term merges («гит хаб» → «GitHub»,
+    «пул реквест» → «pull request») on short inputs.
+    """
+    count_in = len(normalized_words(text_in))
+    count_out = len(normalized_words(text_out))
+    return abs(count_out - count_in) <= max(2, count_in // 10)
+
+
+def without_model_removed_fillers(text: str) -> str:
+    """``text`` as the corrector is expected to leave it, filler-wise."""
+    return remove_filler_words(text, _MODEL_REMOVED_FILLERS)[0]
+
+
 def sanitized_correction(text_in: str, text_out: str) -> str:
-    """``text_out`` trimmed, or ``text_in`` unchanged if the check fails.
+    """``text_out`` trimmed, or ``text_in`` unchanged if a check fails.
 
     Log-only on rejection; never raises, never blocks.
     """
     trimmed = text_out.strip()
     if not trimmed:
         return text_in
-    if preserves_leading_word(text_in, trimmed):
-        return trimmed
-    log.info("Guardrail rejected correction (leading word lost); keeping original text")
-    return text_in
+    # Compared with the fillers gone, but either form counts: the model may
+    # also leave a filler in.
+    candidates = (without_model_removed_fillers(text_in) or text_in, text_in)
+    if not any(preserves_leading_word(c, trimmed) for c in candidates):
+        log.info("Guardrail rejected correction (leading word lost); keeping original text")
+        return text_in
+    if not any(preserves_word_count(c, trimmed) for c in candidates):
+        log.info("Guardrail rejected correction (word count %d → %d); keeping original text",
+                 len(normalized_words(text_in)), len(normalized_words(trimmed)))
+        return text_in
+    return trimmed
+
+
+def correction_chunks(text: str, max_characters: int = 500) -> list[str]:
+    """Sentence-bounded pieces of at most ``max_characters``, one request each.
+
+    Port of ``LLMCorrectionGuardrail.correctionChunks``. The corrector was
+    trained on short utterances and fails far more often on long inputs
+    (macOS, 4-minute dictation: no rejected pieces at 500 chars, whole-text
+    garbage at 1500); a failed piece then falls back to its own raw text,
+    not the whole dictation's. A sentence longer than the limit is cut at
+    the last space before it. Joining with " " restores the text up to
+    whitespace runs.
+    """
+    trimmed = text.strip()
+    if len(trimmed) <= max_characters:
+        return [trimmed] if trimmed else []
+
+    sentences: list[str] = []
+    sentence = ""
+    previous = ""
+    for character in trimmed:
+        if character.isspace() and previous and previous in ".!?…":
+            sentences.append(sentence)
+            sentence = ""
+        elif not (character.isspace() and not sentence):
+            sentence += character
+        previous = character
+    if sentence:
+        sentences.append(sentence)
+
+    chunks: list[str] = []
+    current = ""
+    for piece in sentences:
+        while len(piece) > max_characters:
+            if current:
+                chunks.append(current)
+                current = ""
+            cut = piece.rfind(" ", 0, max_characters)
+            if cut <= 0:
+                cut = max_characters
+            chunks.append(piece[:cut].strip())
+            piece = piece[cut:].strip()
+        if not current:
+            current = piece
+        elif len(current) + 1 + len(piece) <= max_characters:
+            current += " " + piece
+        else:
+            chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]

@@ -597,14 +597,22 @@ class SettingsWindow(QDialog):
         QMessageBox.information(self, i18n.tr("app_name"), message)
 
     def _build_postprocessing_tab(self) -> QWidget:
-        """Correction and rewrite: what runs, on which model, with which prompt.
+        """Correction and rewrite: what runs, where, with which prompt.
 
-        The weights are gigabytes, so the download is offered here rather
-        than happening on the first dictation that wants them — a dictation
-        must never block on a five-gigabyte fetch.
+        Release builds have no local LLM host, so both stages talk to an
+        OpenAI-compatible endpoint the user names here. A build with the
+        experimental host (tools/build-engines.ps1 -ExperimentalLlmHost)
+        also offers the bundled models, their downloads and the CPU/GPU
+        choice. The weights are gigabytes, so the download is offered here
+        rather than happening on the first dictation that wants them.
         """
         from ..llm import BundledLLMModel, RewriteStyle
+        from ..llm.host import bundled_host_available
         from ..llm.models import PROFILES
+
+        bundled = bundled_host_available()
+        engines = [("bundledLocal", i18n.tr("settings_llm_engine_bundled")),
+                   ("customEndpoint", i18n.tr("settings_llm_engine_custom"))]
 
         correction = Section(i18n.tr("settings_correction"),
                              i18n.tr("settings_correction_hint"))
@@ -613,11 +621,14 @@ class SettingsWindow(QDialog):
             [("off", i18n.tr("settings_correction_off")),
              ("correction", i18n.tr("settings_correction_on"))],
         )
-        self._correction_model = self._combo(
-            correction, "settings_correction_model", "correction_bundled_model_v2",
-            [(model.value, i18n.tr(f"llm_model_{model.value}"))
-             for model in BundledLLMModel],
-        )
+        if bundled:
+            self._combo(correction, "settings_llm_engine", "llm_engine_backend_v1", engines)
+            self._correction_model = self._combo(
+                correction, "settings_correction_model", "correction_bundled_model_v2",
+                [(model.value, i18n.tr(f"llm_model_{model.value}"))
+                 for model in BundledLLMModel],
+            )
+        self._endpoint_fields(correction, "llm_custom")
         self._correction_prompt = self._prompt_editor(
             correction, "settings_correction_prompt", "correction_system_prompt_v1")
 
@@ -630,22 +641,28 @@ class SettingsWindow(QDialog):
             [(style.value, i18n.tr(f"rewrite_style_{style.value}"))
              for style in RewriteStyle],
         )
-        self._rewrite_model = self._combo(
-            rewrite, "settings_rewrite_model", "rewrite_bundled_model_v2",
-            [(model.value, i18n.tr(f"llm_model_{model.value}"))
-             for model in BundledLLMModel],
-        )
+        if bundled:
+            self._combo(rewrite, "settings_llm_engine", "rewrite_engine_backend_v1", engines)
+            self._rewrite_model = self._combo(
+                rewrite, "settings_rewrite_model", "rewrite_bundled_model_v2",
+                [(model.value, i18n.tr(f"llm_model_{model.value}"))
+                 for model in BundledLLMModel],
+            )
+        self._endpoint_fields(rewrite, "rewrite_custom")
         for style in RewriteStyle:
             self._prompt_editor(
                 rewrite, f"rewrite_style_{style.value}",
                 f"rewrite_system_prompt_{style.value}_v1")
 
+        if not bundled:
+            return _page(correction, rewrite)
+
         device = Section(i18n.tr("settings_llm_device"),
                          i18n.tr("settings_llm_device_hint"))
         self._llm_backend = self._combo(
             device, "settings_llm_backend", "llm_compute_backend",
-            [("gpu", i18n.tr("settings_llm_backend_gpu")),
-             ("cpu", i18n.tr("settings_llm_backend_cpu"))],
+            [("cpu", i18n.tr("settings_llm_backend_cpu")),
+             ("gpu", i18n.tr("settings_llm_backend_gpu"))],
         )
 
         models = Section(i18n.tr("settings_llm_models"),
@@ -655,6 +672,21 @@ class SettingsWindow(QDialog):
             self._model_rows[model] = self._model_row(models, model, model_profile)
 
         return _page(correction, rewrite, device, models)
+
+    def _endpoint_fields(self, section: "Section", prefix: str) -> None:
+        """Base URL, API key and model name of one stage's endpoint."""
+        for suffix, label_key, placeholder, secret in (
+                ("base_url_v1", "settings_endpoint_url", "http://127.0.0.1:1234", False),
+                ("api_key_v1", "settings_endpoint_key", i18n.tr("settings_endpoint_key_placeholder"), True),
+                ("model_name_v1", "settings_endpoint_model", "gpt-4o-mini", False)):
+            key = f"{prefix}_{suffix}"
+            field = QLineEdit(str(self._draft.get(key, "") or ""))
+            field.setPlaceholderText(placeholder)
+            if secret:
+                field.setEchoMode(QLineEdit.EchoMode.Password)
+            field.textChanged.connect(
+                lambda value, k=key: self._draft.update({k: value.strip()}))
+            section.add_row(i18n.tr(label_key), field)
 
     def _prompt_editor(self, section: "Section", label_key: str,
                        draft_key: str) -> QWidget:

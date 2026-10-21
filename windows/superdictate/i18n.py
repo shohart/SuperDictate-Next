@@ -54,9 +54,22 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_correction": ("Коррекция", "Correction"),
     "settings_correction_hint": (
         "Исправляет ошибки распознавания и возвращает английским терминам "
-        "латинское написание. Работает локально, ничего не уходит в сеть.",
+        "латинское написание. Текст отправляется на указанный ниже "
+        "OpenAI-совместимый сервер: локальный (LM Studio, Ollama, "
+        "llama-server) или облачный.",
         "Fixes recognition errors and restores canonical Latin spelling for "
-        "English terms. Runs locally; nothing leaves the machine."),
+        "English terms. The text is sent to the OpenAI-compatible server "
+        "named below: a local one (LM Studio, Ollama, llama-server) or a "
+        "cloud one."),
+    "settings_llm_engine": ("Где обрабатывать", "Runs on"),
+    "settings_llm_engine_bundled": ("Встроенная модель (экспериментально)",
+                                    "Bundled model (experimental)"),
+    "settings_llm_engine_custom": ("OpenAI-совместимый API", "OpenAI-compatible API"),
+    "settings_endpoint_url": ("Адрес API", "API address"),
+    "settings_endpoint_key": ("API-ключ", "API key"),
+    "settings_endpoint_key_placeholder": ("Не нужен для локального сервера",
+                                          "Not needed for a local server"),
+    "settings_endpoint_model": ("Модель", "Model"),
     "settings_correction_mode": ("Коррекция текста", "Text correction"),
     "settings_correction_off": ("Выключена", "Off"),
     "settings_correction_on": ("Включена", "On"),
@@ -97,7 +110,7 @@ _STRINGS: dict[str, tuple[str, str]] = {
         "much faster on the GPU, while Parakeet turns out faster and more "
         "accurate on the CPU on these machines."),
     "settings_llm_backend": ("Обработка текста", "Text post-processing"),
-    "settings_llm_backend_gpu": ("Видеокарта", "GPU"),
+    "settings_llm_backend_gpu": ("Видеокарта (экспериментально)", "GPU (experimental)"),
     "settings_llm_backend_cpu": ("Процессор", "CPU"),
 
     # -- HUD ---------------------------------------------------------

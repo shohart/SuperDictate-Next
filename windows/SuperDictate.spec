@@ -33,16 +33,17 @@ datas += [("assets/SuperDictate.png", "assets")]
 datas += [("assets/record-start.wav", "assets"),
           ("assets/record-stop.wav", "assets")]
 datas += [("onnx-asr", "onnx-asr")]
-# The correction LoRA is small enough to ship (llm/models.py).
-datas += [("assets/models/gec-lora-adapter.gguf", "assets/models")]
-# superdictate-llm-host.exe (with its Vulkan shaders) and silero-vad.dll,
+# silero-vad.dll, and in experimental builds superdictate-llm-host.exe,
 # built by tools/build-engines.ps1 from the vendored macOS sources.
-# Optional: without them post-processing reports itself unavailable and
-# seams fall back to mel energy, but dictation works.
+# Optional: without the VAD, seams fall back to mel energy. Release builds
+# have no LLM host: post-processing goes through an OpenAI-compatible API.
 if os.path.isdir("engines"):
     datas += [("engines", "engines")]
 else:
-    print("WARNING: engines\\ is missing; the build has no LLM post-processing and no Silero VAD")
+    print("WARNING: engines\\ is missing; the build has no Silero VAD")
+if os.path.isfile(os.path.join("engines", "superdictate-llm-host.exe")):
+    # The correction LoRA belongs to the bundled host (llm/models.py).
+    datas += [("assets/models/gec-lora-adapter.gguf", "assets/models")]
 binaries = []
 
 hiddenimports = [

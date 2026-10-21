@@ -532,14 +532,28 @@ class Settings:
     def correction_enabled(self) -> bool:
         return str(self._get("text_postprocessing_mode_v1")) == "correction"
 
+    def _llm_backend(self, key: str):
+        """The stored stage backend, or the endpoint when no host ships.
+
+        Release builds carry no local LLM host, so a stored ``bundledLocal``
+        (the macOS default, kept for key compatibility) would silently do
+        nothing; it reads as the custom endpoint instead.
+        """
+        from .llm import LLMBackend
+        from .llm.host import bundled_host_available
+
+        backend = _enum_or(LLMBackend, self._get(key), LLMBackend.BUNDLED_LOCAL)
+        if backend is LLMBackend.BUNDLED_LOCAL and not bundled_host_available():
+            return LLMBackend.CUSTOM_ENDPOINT
+        return backend
+
     def correction_config(self):
         """Build the correction stage's config from stored settings."""
         from .llm import BundledLLMModel, CorrectionConfig, CustomEndpoint, LLMBackend
 
         return CorrectionConfig(
             enabled=self.correction_enabled,
-            backend=_enum_or(LLMBackend, self._get("llm_engine_backend_v1"),
-                             LLMBackend.BUNDLED_LOCAL),
+            backend=self._llm_backend("llm_engine_backend_v1"),
             model=_enum_or(BundledLLMModel, self._get("correction_bundled_model_v2"),
                            BundledLLMModel.VOICESCRIBE),
             endpoint=CustomEndpoint(
@@ -589,8 +603,7 @@ class Settings:
                     }
         return RewriteConfig(
             enabled=self.rewrite_enabled,
-            backend=_enum_or(LLMBackend, self._get("rewrite_engine_backend_v1"),
-                             LLMBackend.BUNDLED_LOCAL),
+            backend=self._llm_backend("rewrite_engine_backend_v1"),
             model=_enum_or(BundledLLMModel, self._get("rewrite_bundled_model_v2"),
                            BundledLLMModel.YANDEXGPT),
             style=_enum_or(RewriteStyle, self._get("rewrite_style_v1"),

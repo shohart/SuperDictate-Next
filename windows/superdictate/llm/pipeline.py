@@ -68,9 +68,17 @@ class CustomEndpoint:
     api_key: str = ""
     model_name: str = ""
 
+    #: What the request names when the user left the model empty — the
+    #: macOS default, which most OpenAI-compatible local servers ignore.
+    DEFAULT_MODEL_NAME = "gpt-4o-mini"
+
     @property
     def is_configured(self) -> bool:
-        return bool(self.base_url.strip() and self.model_name.strip())
+        return bool(self.base_url.strip())
+
+    @property
+    def effective_model_name(self) -> str:
+        return self.model_name.strip() or self.DEFAULT_MODEL_NAME
 
 
 @dataclass
@@ -191,24 +199,36 @@ class LLMPostprocessor:
     # -- stages ------------------------------------------------------
 
     def _corrected(self, text: str, config: CorrectionConfig) -> str:
-        model_profile = profile(config.model)
+        # A custom endpoint serves whichever model the user named there, so
+        # it gets the zero-shot instruct prompt, as on macOS: the few-shot
+        # turns were tuned against the bundled adapter only.
+        few_shot = (config.backend is LLMBackend.BUNDLED_LOCAL
+                    and profile(config.model).uses_few_shot_correction)
         system = (config.system_prompt_override.strip()
-                  or prompts.correction_system_prompt(
-                      few_shot=model_profile.uses_few_shot_correction))
-        messages = [Message(Role.SYSTEM, system)]
-        messages += list(prompts.correction_example_turns(
-            few_shot=model_profile.uses_few_shot_correction))
-        messages.append(Message(Role.USER, text))
+                  or prompts.correction_system_prompt(few_shot=few_shot))
+        examples = list(prompts.correction_example_turns(few_shot=few_shot))
 
-        raw = self._complete(messages, backend=config.backend,
-                             model=config.model, endpoint=config.endpoint,
-                             stage="correction", max_tokens=1024)
-        if raw is None:
-            return text
-        # The guardrail is the whole reason the correction stage is safe to
-        # run by default: it reverts to the input whenever the model's
-        # known failure modes show up.
-        return guardrail.sanitized_correction(text, raw)
+        # One request per sentence-bounded chunk, as on macOS: a long
+        # dictation in one request is where the model loses or replaces
+        # text, and the guardrail then reverts each chunk on its own.
+        chunks = guardrail.correction_chunks(text)
+        corrected: list[str] = []
+        for index, chunk in enumerate(chunks):
+            messages = [Message(Role.SYSTEM, system), *examples, Message(Role.USER, chunk)]
+            raw = self._complete(messages, backend=config.backend,
+                                 model=config.model, endpoint=config.endpoint,
+                                 stage="correction",
+                                 max_tokens=min(2048, max(64, len(chunk.encode("utf-8")))))
+            if raw is None:
+                # A failed request would fail the same way for every
+                # remaining chunk; don't wait it out N times.
+                corrected += chunks[index:]
+                break
+            # The guardrail is the whole reason the correction stage is safe
+            # to run by default: it reverts to the input whenever the
+            # model's known failure modes show up.
+            corrected.append(guardrail.sanitized_correction(chunk, raw))
+        return " ".join(corrected) if corrected else text
 
     def _rewritten(self, text: str, config: RewriteConfig) -> str:
         custom = config.custom_styles.get(config.custom_style_id) \
@@ -258,7 +278,7 @@ class LLMPostprocessor:
                     endpoint.base_url, messages,
                     max_tokens=max_tokens,
                     api_key=endpoint.api_key,
-                    model=endpoint.model_name,
+                    model=endpoint.effective_model_name,
                 )
             else:
                 content = self._bundled_completion(model, messages, max_tokens)

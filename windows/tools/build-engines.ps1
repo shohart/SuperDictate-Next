@@ -1,29 +1,43 @@
 <#
 .SYNOPSIS
-    Build the engines\ directory: superdictate-llm-host.exe (local LLM
-    post-processing) and silero-vad.dll (pause detection for long dictation).
+    Build the engines\ directory: silero-vad.dll (pause detection for long
+    dictation) and, experimentally, superdictate-llm-host.exe.
 
 .DESCRIPTION
     Both come from the vendored sources the macOS app is built from
-    (swift/Sources/llama_cpp_host, swift/Sources/silero_vad), through
+    (swift/Sources/silero_vad, swift/Sources/llama_cpp_host), through
     windows\native\engines\CMakeLists.txt. The staged tree:
 
-        engines\superdictate-llm-host.exe   CPU + Vulkan, static MSVC runtime
-        engines\vulkan-shaders\*.spv        loaded by the host at run time
         engines\silero-vad.dll              whisper_vad_* (CPU only)
         engines\LICENSE-*.txt               upstream notices
 
-    Needs Visual Studio 2022 (or Build Tools) with the C++ workload, CMake
-    3.20+ and the Vulkan SDK (build time only: at run time the host uses the
-    GPU driver's vulkan-1.dll). SuperDictate.spec copies engines\ as is.
+    and with -ExperimentalLlmHost also
+
+        engines\superdictate-llm-host.exe   local LLM post-processing
+        engines\vulkan-shaders\*.spv        with -Vulkan only
+
+    Release builds leave the LLM host out: on Windows, correction and
+    rewrite go through a user-supplied OpenAI-compatible endpoint. The app
+    offers the bundled models only when the host is present.
+
+    Needs Visual Studio 2022 (or Build Tools) with the C++ workload and
+    CMake 3.20+; -Vulkan also needs the Vulkan SDK (build time only: at run
+    time the host uses the GPU driver's vulkan-1.dll). SuperDictate.spec
+    copies engines\ as is.
 
 .EXAMPLE
     .\tools\build-engines.ps1
+    .\tools\build-engines.ps1 -ExperimentalLlmHost            # CPU LLM host
+    .\tools\build-engines.ps1 -ExperimentalLlmHost -Vulkan    # GPU LLM host
 #>
 [CmdletBinding()]
-param()
+param(
+    [switch]$ExperimentalLlmHost,
+    [switch]$Vulkan
+)
 
 $ErrorActionPreference = "Stop"
+if ($Vulkan -and -not $ExperimentalLlmHost) { throw "-Vulkan applies to the LLM host: add -ExperimentalLlmHost" }
 
 $WindowsDir = Split-Path -Parent $PSScriptRoot
 $RepoRoot = Split-Path -Parent $WindowsDir
@@ -46,7 +60,7 @@ if (-not $cmake -and $vs) {
 if (-not $cmake) { throw "cmake not found: install CMake or the Visual Studio C++ workload" }
 $cmakeExe = if ($cmake -is [System.Management.Automation.CommandInfo]) { $cmake.Source } else { $cmake.FullName }
 
-if (-not $env:VULKAN_SDK) {
+if ($Vulkan -and -not $env:VULKAN_SDK) {
     # The SDK installer sets VULKAN_SDK machine-wide; a shell opened before
     # the install does not see it yet.
     $sdk = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
@@ -54,25 +68,34 @@ if (-not $env:VULKAN_SDK) {
     $env:VULKAN_SDK = $sdk.FullName
 }
 
-Write-Host "Configuring windows\native\engines (Vulkan SDK $env:VULKAN_SDK)..." -ForegroundColor Cyan
-& $cmakeExe -S $SourceDir -B $BuildDir -A x64 | Out-Host
+$onOff = { param($flag) if ($flag) { "ON" } else { "OFF" } }
+Write-Host "Configuring windows\native\engines..." -ForegroundColor Cyan
+& $cmakeExe -S $SourceDir -B $BuildDir -A x64 `
+    "-DSD_LLM_HOST=$(& $onOff $ExperimentalLlmHost)" `
+    "-DSD_LLM_VULKAN=$(& $onOff $Vulkan)" | Out-Host
 if ($LASTEXITCODE) { throw "CMake configure failed" }
 
-Write-Host "Building superdictate-llm-host and silero-vad..." -ForegroundColor Cyan
+Write-Host "Building..." -ForegroundColor Cyan
 & $cmakeExe --build $BuildDir --config Release --parallel | Out-Host
 if ($LASTEXITCODE) { throw "CMake build failed" }
 
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage | Out-Null
-Copy-Item (Join-Path $BuildDir "Release\superdictate-llm-host.exe") $Stage
+$binaries = @("silero-vad.dll")
 Copy-Item (Join-Path $BuildDir "Release\silero-vad.dll") $Stage
-Copy-Item (Join-Path $Llama "ggml-vulkan\vulkan-shaders") (Join-Path $Stage "vulkan-shaders") -Recurse
-Copy-Item (Join-Path $Llama "LICENSE-llama-cpp.txt") $Stage
 Copy-Item (Join-Path $Vad "upstream\LICENSE-ggml.txt") $Stage
 Copy-Item (Join-Path $Vad "upstream-vad\LICENSE-whisper-cpp.txt") $Stage
 Copy-Item (Join-Path $Vad "upstream-vad\LICENSE-silero-vad.txt") $Stage
+if ($ExperimentalLlmHost) {
+    $binaries += "superdictate-llm-host.exe"
+    Copy-Item (Join-Path $BuildDir "Release\superdictate-llm-host.exe") $Stage
+    Copy-Item (Join-Path $Llama "LICENSE-llama-cpp.txt") $Stage
+    if ($Vulkan) {
+        Copy-Item (Join-Path $Llama "ggml-vulkan\vulkan-shaders") (Join-Path $Stage "vulkan-shaders") -Recurse
+    }
+}
 
-# Both must run on a machine with nothing but a GPU driver: no VC++
+# Everything must run on a machine with nothing but a GPU driver: no VC++
 # redistributable, no Vulkan SDK.
 $dumpbin = $null
 if ($vs) {
@@ -81,7 +104,7 @@ if ($vs) {
 if (-not $dumpbin) {
     Write-Warning "dumpbin not found: skipping the import check"
 } else {
-    foreach ($binary in "superdictate-llm-host.exe", "silero-vad.dll") {
+    foreach ($binary in $binaries) {
         $deps = & $dumpbin.FullName /nologo /dependents (Join-Path $Stage $binary) |
             Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
         Write-Host ("$binary imports: " + ($deps -join ", ")) -ForegroundColor DarkGray
@@ -90,5 +113,7 @@ if (-not $dumpbin) {
     }
 }
 
-& (Join-Path $Stage "superdictate-llm-host.exe") --list-devices | Out-Host
+if ($Vulkan) {
+    & (Join-Path $Stage "superdictate-llm-host.exe") --list-devices | Out-Host
+}
 Write-Host "Staged engines into $Stage" -ForegroundColor Green

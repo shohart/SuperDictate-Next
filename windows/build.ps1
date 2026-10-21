@@ -5,13 +5,14 @@
 .DESCRIPTION
     Regenerates the icon, runs the self-tests (a failing port should never
     reach a build), builds and stages SuperDictateOnnxHost
-    (tools\build-onnx-host.ps1) and the LLM host and Silero VAD
-    (tools\build-engines.ps1), then packages with PyInstaller.
+    (tools\build-onnx-host.ps1) and Silero VAD (tools\build-engines.ps1),
+    then packages with PyInstaller. Release builds have no local LLM host:
+    correction and rewrite use an OpenAI-compatible endpoint.
 
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -SkipTests
-    .\build.ps1 -SkipEngines     # no Vulkan SDK: ship without LLM and VAD
+    .\build.ps1 -SkipEngines     # ship without Silero VAD
 #>
 [CmdletBinding()]
 param(
@@ -49,7 +50,7 @@ Write-Host "Building the speech-recognition host..." -ForegroundColor Cyan
 if ($LASTEXITCODE) { throw "build-onnx-host failed." }
 
 if (-not $SkipEngines) {
-    Write-Host "Building the LLM host and Silero VAD..." -ForegroundColor Cyan
+    Write-Host "Building Silero VAD..." -ForegroundColor Cyan
     & .\tools\build-engines.ps1
     if ($LASTEXITCODE) { throw "build-engines failed." }
 }

@@ -69,6 +69,16 @@ def host_executable() -> "os.PathLike[str]":
     return paths.resource_path("engines", "superdictate-llm-host.exe")
 
 
+def bundled_host_available() -> bool:
+    """Whether this build ships the local host at all.
+
+    Release builds do not (tools/build-engines.ps1 builds it only with
+    ``-ExperimentalLlmHost``): post-processing then runs through a
+    user-supplied OpenAI-compatible endpoint only.
+    """
+    return os.path.isfile(host_executable())
+
+
 def _engine_environment() -> dict[str, str]:
     """The host's environment: where its Vulkan shaders are.
 
