@@ -467,61 +467,41 @@ def test_autostart_target_parsing() -> None:
 
 # -- LLM correction guardrail --------------------------------------------
 #
-# The bundled corrector has two documented failure modes — it sometimes drops
-# the input's leading word, and rarely hallucinates a term instead of
-# normalizing it — and both show up as the first word not surviving. These
-# cases are the macOS build's own, so a divergence here is a port bug.
+# The bundled corrector drops the input's leading word now and then, rarely
+# hallucinates a term, and deletes fillers by design. The cases live in
+# fixtures/llm-correction-guardrail.json, shared with the macOS suite, so
+# the two guardrails cannot drift apart: a divergence here is a port bug.
+
+def _guardrail_fixture():
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "fixtures" / "llm-correction-guardrail.json"
+    if not path.is_file():
+        _failures.append(f"guardrail fixture missing: {path} (run the self-test from a checkout)")
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
 
 def test_correction_guardrail() -> None:
-    from .llm.guardrail import preserves_leading_word, sanitized_correction
+    from .llm.guardrail import (MODEL_REMOVED_FILLERS, preserves_word_count,
+                                sanitized_correction)
 
-    accepted = [
-        ("залей изменения на гит хаб", "Залей изменения на GitHub"),
-        ("гитхаб упал", "GitHub упал"),                   # cross-script, distance 1
-        ("хаггинг фейс открыт", "хаггингфейс открыт"),    # same-script splice
-        ("я поставил дебиан", "Я поставил Debian"),       # single-char leading word
-        ("отправь письмо", "Отправь письмо"),
-    ]
-    rejected = [
-        ("я скачал модель", "Скачал модель"),             # leading word dropped
-        ("золи изменения", "Золить изменения"),           # hallucinated word form
-        ("кубернейтс упал", "Cerebral упал"),             # hallucinated term
-        ("расскажи как дела", "Как дела"),                # leading verb dropped
-    ]
-    for text_in, text_out in accepted:
-        _check(f"guardrail accepts {text_in!r}",
-               preserves_leading_word(text_in, text_out), True)
-    for text_in, text_out in rejected:
-        _check(f"guardrail rejects {text_in!r}",
-               preserves_leading_word(text_in, text_out), False)
-
-    # A rejection must return the ORIGINAL text, never the model's output:
-    # this is the never-lose-text policy in one assertion.
-    _check("guardrail reverts to input",
-           sanitized_correction("я скачал модель", "Скачал модель"),
-           "я скачал модель")
-    _check("guardrail keeps empty output out",
-           sanitized_correction("привет", "   "), "привет")
-
-    # The corrector deletes fillers by design: a cleaned leading «ну короче»
-    # is an edit, not a lost word. A dropped real word still is.
-    cleaned = "Завтра встреча в десять часов утра."
-    _check("guardrail lets the model drop leading fillers",
-           sanitized_correction("ну короче завтра встреча в десять часов утра", cleaned),
-           cleaned)
-    _check("guardrail accepts a filler the model kept",
-           sanitized_correction("ну завтра встреча", "Ну, завтра встреча."),
-           "Ну, завтра встреча.")
-    _check("a sometimes-filler is still a word",
-           sanitized_correction("вот документ готов", "Документ готов."),
-           "вот документ готов")
-    # Word count, as on macOS: a dropped tail is never a correction.
-    long_in = " ".join(["слово"] * 40)
-    _check("guardrail rejects a dropped tail",
-           sanitized_correction(long_in, " ".join(["Слово"] * 30)), long_in)
-    _check("guardrail allows a term merge",
-           sanitized_correction("залей на гит хаб", "Залей на GitHub."),
-           "Залей на GitHub.")
+    fixture = _guardrail_fixture()
+    if fixture is None:
+        return
+    _check("the filler list matches the shared fixture",
+           list(MODEL_REMOVED_FILLERS), fixture["model_removed_fillers"])
+    for case in fixture["cases"]:
+        expected = case["output"].strip() if case["expect"] == "accept" else case["input"]
+        _check(f"guardrail {case['expect']}s {case['input']!r} ({case['why']})",
+               sanitized_correction(case["input"], case["output"]), expected)
+    for case in fixture["word_count"]:
+        text_in = " ".join(f"слово{n}" for n in range(case["input_words"]))
+        text_out = " ".join(f"слово{n}" for n in range(case["output_words"]))
+        _check(f"word count {case['input_words']} → {case['output_words']} ({case['why']})",
+               preserves_word_count(text_in, text_out), case["expect"] == "accept")
 
 
 def test_correction_chunks() -> None:
@@ -961,6 +941,9 @@ def test_llm_backend_without_bundled_host() -> None:
     with mock.patch("superdictate.llm.host.bundled_host_available", return_value=True):
         _check("experimental host: the stored backend stands",
                settings.correction_config().backend, LLMBackend.BUNDLED_LOCAL)
+    from .llm.models import BundledLLMModel, profile
+    _check("the VoiceScribe rsLoRA runs at the macOS scale",
+           profile(BundledLLMModel.VOICESCRIBE).lora_scale, 4.0)
     endpoint = CustomEndpoint(base_url="http://127.0.0.1:1234")
     _check("an endpoint needs only its address", endpoint.is_configured, True)
     _check("an empty model name falls back to the macOS default",
@@ -968,21 +951,22 @@ def test_llm_backend_without_bundled_host() -> None:
 
 
 def test_update_channel_is_windows_only() -> None:
-    # Both platforms publish to one repository; a macOS release (plain
-    # "v0.8.0", a .zip of the .app) must never read as a Windows update.
+    # Both platforms publish to one repository; a macOS release (mac-v0.9.0,
+    # legacy v0.8.0, a .zip of the .app) must never read as a Windows update.
     from .updater import is_newer, newest_windows_release, parse_version
 
     releases = [
-        {"tag_name": "v0.9.0", "assets": [{"name": "SuperDictate.zip"}]},
-        {"tag_name": "windows-v0.7.1", "assets": []},
-        {"tag_name": "windows-v0.7.10", "assets": []},
-        {"tag_name": "windows-v0.8.0", "draft": True},
+        {"tag_name": "mac-v0.9.0", "assets": [{"name": "SuperDictate.zip"}]},
+        {"tag_name": "v0.8.0", "assets": [{"name": "SuperDictate.zip"}]},
+        {"tag_name": "win-v0.7.1", "assets": []},
+        {"tag_name": "win-v0.7.10", "assets": []},
+        {"tag_name": "win-v0.8.0", "draft": True},
     ]
-    _check("the newest windows tag wins, macOS and drafts ignored",
-           newest_windows_release(releases)["tag_name"], "windows-v0.7.10")
-    _check("no windows release, no update", newest_windows_release(releases[:1]), None)
-    _check("windows tags parse", parse_version("windows-v0.7.10"), (0, 7, 10))
-    _check("a newer windows tag is newer", is_newer("windows-v0.7.1", "0.7.0"), True)
+    _check("the newest win tag wins; macOS and drafts are ignored",
+           newest_windows_release(releases)["tag_name"], "win-v0.7.10")
+    _check("no Windows release, no update", newest_windows_release(releases[:2]), None)
+    _check("win tags parse", parse_version("win-v0.7.10"), (0, 7, 10))
+    _check("a newer win tag is newer", is_newer("win-v0.7.1", "0.7.0"), True)
 
 
 def test_retired_asr_settings_are_dropped() -> None:

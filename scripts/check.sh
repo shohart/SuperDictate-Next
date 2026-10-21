@@ -10,6 +10,12 @@ plutil -lint swift/Info.plist entitlements.plist
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"
 installer_version="$(sed -n 's/^RELEASE_VERSION="\([^"]*\)"$/\1/p' install.sh)"
+installer_tag="$(sed -n 's/^RELEASE_TAG="\([^"]*\)"$/\1/p' install.sh)"
+[[ "$installer_tag" == "mac-v$installer_version" || "$installer_tag" == "v$installer_version" ]] || {
+    printf 'install.sh RELEASE_TAG=%s does not name version %s (expected mac-v%s)\n' \
+        "$installer_tag" "$installer_version" "$installer_version" >&2
+    exit 1
+}
 installer_sha256="$(sed -n 's/^RELEASE_SHA256="\([^"]*\)"$/\1/p' install.sh)"
 manifest_version="$(plutil -extract version raw -o - update.json)"
 manifest_sha256="$(plutil -extract sha256 raw -o - update.json)"

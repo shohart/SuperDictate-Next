@@ -3016,7 +3016,10 @@ enum ParakeySelfTest {
     /// Hermetic unit tests for LLMCorrectionGuardrail — the safety net
     /// against the dictation-corrector model's empirically-observed
     /// failure modes (dropping the input's leading word, hallucinating
-    /// unfamiliar terms). No model, no network; part of `all`.
+    /// unfamiliar terms) that must still let its by-design filler removal
+    /// through. No model, no network; part of `all`. The accept/reject
+    /// cases live in fixtures/llm-correction-guardrail.json, shared with the
+    /// Windows port's suite, so the two guardrails cannot drift apart.
     private static func testLLMCorrectionGuardrail() throws {
         // editDistance primitive.
         try expect(LLMCorrectionGuardrail.editDistance("гитхаб", "гитхуб"), equals: 1,
@@ -3024,94 +3027,7 @@ enum ParakeySelfTest {
         try expect(LLMCorrectionGuardrail.editDistance("abc", "abc"), equals: 0,
                    "identical strings should have distance 0")
 
-        // Legitimate corrections MUST pass.
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "залей изменения на гит хаб через пул реквест",
-            output: "Залей изменения на GitHub через pull request"), equals: true,
-                   "verbatim leading word (just capitalized) must pass")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "модель скачал с хаггинг фейс",
-            output: "Модель скачал с Hugging Face"), equals: true,
-                   "preserved leading word with later term replacement must pass")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "я завтра пойду в магазин",
-            output: "Я завтра пойду в магазин"), equals: true,
-                   "single-character leading word preserved as a standalone word must pass")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "please send me the report",
-            output: "Please send me the report"), equals: true,
-                   "Latin leading word must pass")
-
-        // Cross-script term replacement of the FIRST word must pass
-        // (fuzzy transliteration: гитхаб vs github→гитхуб, distance 1).
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "гитхаб релиз готов",
-            output: "GitHub релиз готов"), equals: true,
-                   "leading-word term replacement (same word, other script) must pass")
-
-        // Corruptions MUST be rejected.
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "я скачал модель с хаггинг фейс",
-            output: "Скачал модель с Hugging Face"), equals: false,
-                   "dropped single-character leading pronoun must be rejected")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "расскажи как дела",
-            output: "Как дела"), equals: false,
-                   "dropped leading verb must be rejected")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "я задеплоил сервис на кубернейтс",
-            output: "Задеплоил сервис на Cerebral"), equals: false,
-                   "dropped leading word AND hallucinated term must be rejected")
-        // Word-form hallucinations the dictation-corrector model was
-        // observed producing when a repair-inviting few-shot pair was
-        // tried (see LLMPostprocessingPrompts.swift finding 6): the model
-        // invents a form ("Золер", "Золить") instead of repairing
-        // "золей"/"золи". Both are edit-distance 2 from the leading word
-        // (threshold 1) — must be rejected, falling back to the input.
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "золей релизную ветку в мастер",
-            output: "Золер релизную ветку в мастер"), equals: false,
-                   "hallucinated word form (золей → Золер) must be rejected")
-        try expect(LLMCorrectionGuardrail.correctionPreservesLeadingWord(
-            input: "золи правки в мастер ветку",
-            output: "Золить правки в мастер ветку"), equals: false,
-                   "hallucinated word form (золи → Золить) must be rejected")
-
-        // sanitizedCorrection behavior on both sides.
-        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
-            input: "расскажи как дела",
-            output: "  Как дела\n"), equals: "расскажи как дела",
-                   "guardrail must revert to the input when the leading word is lost")
-        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
-            input: "залей изменения",
-            output: "  Залей изменения  \n"), equals: "Залей изменения",
-                   "guardrail must return the trimmed correction when it passes")
-        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
-            input: "текст",
-            output: "   "), equals: "текст",
-                   "whitespace-only output must fall back to the input")
-
-        // Word-count preservation: the long-dictation failure modes.
-        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
-            input: "залей изменения на гит хаб через пул реквест",
-            output: "Залей изменения на GitHub через pull request"), equals: true,
-                   "term merges (гит хаб → GitHub) must pass")
-        let longInput = (1...40).map { "слово\($0)" }.joined(separator: " ")
-        let truncated = (1...30).map { "слово\($0)" }.joined(separator: " ")
-        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
-            input: longInput, output: truncated), equals: false,
-                   "a dropped tail (40 → 30 words) must be rejected")
-        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
-            input: longInput, output: truncated), equals: longInput,
-                   "guardrail must revert to the input when words are lost")
-        try expect(LLMCorrectionGuardrail.sanitizedCorrection(
-            input: "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем",
-            output: "Сегодня. Сочини рассказ про кота"), equals:
-                "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем",
-                   "a few-shot echo instead of the text must be rejected")
-        try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(
-            input: truncated, output: longInput), equals: false,
-                   "added words (30 → 40) must be rejected")
+        try runSharedGuardrailFixture()
 
         // Chunking for one correction request per piece.
         try expect(LLMCorrectionGuardrail.correctionChunks("  короткий текст. "), equals: ["короткий текст."],
@@ -3132,6 +3048,40 @@ enum ParakeySelfTest {
                    "an over-long sentence must be cut to the limit")
         try expect(runOnChunks.joined(separator: " "), equals: runOn,
                    "a cut sentence must rejoin to the input")
+    }
+
+    /// Every case of fixtures/llm-correction-guardrail.json through
+    /// `sanitizedCorrection`, plus the shared filler list. Located from this
+    /// source file, so it runs from a checkout (DEBUG self-tests always do).
+    private static func runSharedGuardrailFixture() throws {
+        struct Case: Decodable { let input: String; let output: String; let expect: String; let why: String }
+        struct WordCount: Decodable {
+            let input_words: Int; let output_words: Int; let expect: String; let why: String
+        }
+        struct Fixture: Decodable {
+            let model_removed_fillers: [String]; let cases: [Case]; let word_count: [WordCount]
+        }
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("fixtures/llm-correction-guardrail.json")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        try expect(LLMCorrectionGuardrail.modelRemovedFillers, equals: fixture.model_removed_fillers,
+                   "the filler list must match the shared fixture")
+        for item in fixture.cases {
+            let expected = item.expect == "accept"
+                ? item.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                : item.input
+            try expect(LLMCorrectionGuardrail.sanitizedCorrection(input: item.input, output: item.output),
+                       equals: expected, "guardrail must \(item.expect) «\(item.input)» (\(item.why))")
+        }
+        for item in fixture.word_count {
+            let input = (0..<item.input_words).map { "слово\($0)" }.joined(separator: " ")
+            let output = (0..<item.output_words).map { "слово\($0)" }.joined(separator: " ")
+            try expect(LLMCorrectionGuardrail.correctionPreservesWordCount(input: input, output: output),
+                       equals: item.expect == "accept",
+                       "word count \(item.input_words) → \(item.output_words) (\(item.why))")
+        }
     }
 
     /// The Silero VAD pin through the REAL download path into a temporary
@@ -4710,11 +4660,11 @@ enum ParakeySelfTest {
     }
 
     private static func testUpdateCheckParsing() throws {
-        let ok = HTTPURLResponse(url: GITHUB_LATEST_RELEASE_URL,
+        let ok = HTTPURLResponse(url: GITHUB_RELEASES_API_URL,
                                  statusCode: 200,
                                  httpVersion: nil,
                                  headerFields: nil)!
-        let notFound = HTTPURLResponse(url: GITHUB_LATEST_RELEASE_URL,
+        let notFound = HTTPURLResponse(url: GITHUB_RELEASES_API_URL,
                                        statusCode: 404,
                                        httpVersion: nil,
                                        headerFields: nil)!
@@ -4735,7 +4685,7 @@ enum ParakeySelfTest {
             equals: .failure(.httpStatus(404)),
             "update parsing should reject non-2xx HTTP responses with the status code"
         )
-        let rateLimited = HTTPURLResponse(url: GITHUB_LATEST_RELEASE_URL,
+        let rateLimited = HTTPURLResponse(url: GITHUB_RELEASES_API_URL,
                                           statusCode: 403,
                                           httpVersion: nil,
                                           headerFields: nil)!
@@ -4826,6 +4776,59 @@ enum ParakeySelfTest {
                                            htmlURL: GITHUB_RELEASES_PAGE.absoluteString)),
             "update parsing should fall back when release URL tag does not match the payload tag"
         )
+        // macOS and Windows share the repository: the check lists the
+        // releases and must take the newest macOS one, never a Windows tag,
+        // draft or pre-release, and accept both mac-v and legacy v tags.
+        let listing = Data(
+            #"""
+            [{"tag_name":"win-v9.9.9","html_url":"https://github.com/shohart/SuperDictate-Next/releases/tag/win-v9.9.9"},
+             {"tag_name":"mac-v1.0.0","draft":true},
+             {"tag_name":"mac-v0.9.0","prerelease":true},
+             {"tag_name":"mac-v0.7.10","body":"Notes","html_url":"https://github.com/shohart/SuperDictate-Next/releases/tag/mac-v0.7.10"},
+             {"tag_name":"mac-v0.7.9"},
+             {"tag_name":"v0.7.0"},
+             {"tag_name":"windows-v0.7.0"}]
+            """#.utf8
+        )
+        try expect(
+            UpdateCheck.parseReleases(data: listing, response: ok),
+            equals: .success(GitHubRelease(tagName: "mac-v0.7.10",
+                                           version: "0.7.10",
+                                           body: "Notes",
+                                           htmlURL: "https://github.com/shohart/SuperDictate-Next/releases/tag/mac-v0.7.10")),
+            "the update check must pick the newest published macOS release"
+        )
+        try expect(
+            UpdateCheck.parseReleases(data: Data(#"[{"tag_name":"v0.7.0"},{"tag_name":"v0.6.0"}]"#.utf8), response: ok),
+            equals: .success(GitHubRelease(tagName: "v0.7.0", version: "0.7.0", body: "",
+                                           htmlURL: GITHUB_RELEASES_PAGE.absoluteString)),
+            "legacy v tags are macOS releases"
+        )
+        try expect(
+            UpdateCheck.parseReleases(data: Data(#"[{"tag_name":"win-v0.8.0"}]"#.utf8), response: ok),
+            equals: .failure(.unexpectedResponse),
+            "a listing with only Windows releases offers no macOS update"
+        )
+        try expect(
+            UpdateCheck.parseReleases(data: listing, response: notFound),
+            equals: .failure(.httpStatus(404)),
+            "the release listing must surface HTTP errors"
+        )
+        try expect(UpdateCheck.normalizedReleaseVersion(from: "mac-v1.2.3"), equals: "1.2.3",
+                   "mac-v tags must parse")
+        try expect(UpdateCheck.normalizedReleaseVersion(from: "win-v1.2.3"), equals: nil,
+                   "Windows tags must never read as macOS versions")
+        let manifest = SuperDictateUpdateManifest(version: "0.7.1", sha256: String(repeating: "a", count: 64))
+        try expect(
+            try SuperDictateUpdateInstaller.archiveURL(tagName: "mac-v0.7.1", manifest: manifest).absoluteString,
+            equals: "https://github.com/shohart/SuperDictate-Next/releases/download/mac-v0.7.1/SuperDictate.zip",
+            "the archive is downloaded from the release's own tag"
+        )
+        do {
+            _ = try SuperDictateUpdateInstaller.archiveURL(tagName: "mac-v0.7.2", manifest: manifest)
+            throw SelfTestFailure.failed("an archive tag that does not name the manifest version must be refused")
+        } catch is SuperDictateUpdateInstallerError {}
+
         // Manual-check alert copy: each failure kind gets its own
         // explanation instead of blaming the network for everything.
         try expect(

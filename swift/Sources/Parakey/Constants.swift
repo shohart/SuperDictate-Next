@@ -37,7 +37,12 @@ let MIN_CLIP_SECONDS: Double = 0.25
 let UPDATE_CHECK_FIRST_DELAY_SECONDS: TimeInterval = 30
 let UPDATE_CHECK_INTERVAL_SECONDS: TimeInterval = 6 * 3600  // 6h
 let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
-let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shohart/SuperDictate-Next/releases/latest")!
+// macOS and Windows publish to the same repository, told apart by tag:
+// `mac-vX.Y.Z` here (plain `vX.Y.Z` up to 0.7.0), `win-vX.Y.Z` for Windows.
+// The update check lists the releases and keeps the macOS ones, so it no
+// longer depends on which release GitHub calls "latest".
+let GITHUB_RELEASES_API_URL = URL(string: "https://api.github.com/repos/shohart/SuperDictate-Next/releases?per_page=30")!
+let MAC_RELEASE_TAG_PREFIX = "mac-v"
 let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shohart/SuperDictate-Next")!
 let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shohart/SuperDictate-Next/releases/latest")!
 let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/update.json")!

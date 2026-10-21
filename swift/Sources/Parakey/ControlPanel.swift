@@ -1367,7 +1367,8 @@ header.addArrangedSubview(panelLabel(
                                   "Downloading the archive and verifying SHA-256…")
                 )
                 self.refresh(force: true)
-                let prepared = try await SuperDictateUpdateInstaller.prepare(manifest: manifest)
+                let prepared = try await SuperDictateUpdateInstaller.prepare(manifest: manifest,
+                                                                             tagName: release.tagName)
                 guard !Task.isCancelled else {
                     try? FileManager.default.removeItem(at: prepared.workDirectory)
                     return

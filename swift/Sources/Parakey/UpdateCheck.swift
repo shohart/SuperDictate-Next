@@ -17,14 +17,17 @@ import UniformTypeIdentifiers
 
 // MARK: - Update check
 //
-// Hits the GitHub Releases API once at boot + every 6 h. Users can
+// Hits the GitHub Releases API once at boot + every 6 h, and takes the
+// newest macOS release from the list (tags `mac-vX.Y.Z`, or legacy
+// `vX.Y.Z`); Windows releases (`win-vX.Y.Z`) share the repository and are
+// skipped, as are drafts and pre-releases. Users can
 // also force the same lookup from the menu. When a newer version is
 // found AND it's not in the user's skipped list, a submenu inserts
 // itself at the top of the menu: What's new / Update now / Remind me
 // in 24 hours / Skip vX.Y.Z.
 
 struct GitHubRelease: Sendable, Equatable {
-    let tagName: String      // 'v0.1.7'
+    let tagName: String      // 'mac-v0.7.1', legacy 'v0.1.7'
     let version: String      // '0.1.7' (no v)
     let body: String         // release notes, raw markdown
     let htmlURL: String
@@ -34,11 +37,15 @@ private struct GitHubReleaseResponse: Decodable {
     let tagName: String
     let body: String?
     let htmlURL: String?
+    let draft: Bool?
+    let prerelease: Bool?
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
         case body
         case htmlURL = "html_url"
+        case draft
+        case prerelease
     }
 }
 
@@ -76,9 +83,12 @@ func manualUpdateCheckFailureText(_ failure: UpdateCheckFailure) -> String {
 enum UpdateCheck {
     private static let githubReleaseURLPathPrefix = "/shohart/SuperDictate-Next/releases/tag/"
     static let maxReleaseResponseBytes = 512 * 1024
+    /// The release LIST (30 entries with their notes) is bigger than one
+    /// release, but still bounded before decoding.
+    static let maxReleaseListResponseBytes = 4 * 1024 * 1024
 
     static func fetchLatest() async -> Result<GitHubRelease, UpdateCheckFailure> {
-        var req = URLRequest(url: GITHUB_LATEST_RELEASE_URL)
+        var req = URLRequest(url: GITHUB_RELEASES_API_URL)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         // The privacy docs promise exactly this fixed token — no
         // version, device, or user identifiers. Must stay in sync with
@@ -95,7 +105,7 @@ enum UpdateCheck {
 
         do {
             let (data, response) = try await session.data(for: req)
-            return parseLatest(data: data, response: response)
+            return parseReleases(data: data, response: response)
         } catch {
             return .failure(.network)
         }
@@ -113,22 +123,53 @@ enum UpdateCheck {
             return .failure(.unexpectedResponse)
         }
 
-        let tag = payload.tagName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let version = normalizedReleaseVersion(from: tag) else {
+        guard let release = release(from: payload) else {
             return .failure(.unexpectedResponse)
         }
+        return .success(release)
+    }
 
-        return .success(GitHubRelease(
+    /// The newest published macOS release in a `GET /releases` listing.
+    /// Windows tags, drafts, pre-releases and unparseable tags are skipped;
+    /// a listing with no macOS release at all is an unexpected response.
+    static func parseReleases(data: Data, response: URLResponse) -> Result<GitHubRelease, UpdateCheckFailure> {
+        guard let http = response as? HTTPURLResponse else {
+            return .failure(.unexpectedResponse)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            return .failure(.httpStatus(http.statusCode))
+        }
+        guard data.count <= maxReleaseListResponseBytes,
+              let payloads = try? JSONDecoder().decode([GitHubReleaseResponse].self, from: data) else {
+            return .failure(.unexpectedResponse)
+        }
+        let candidates = payloads
+            .filter { $0.draft != true && $0.prerelease != true }
+            .compactMap(release(from:))
+        guard let newest = candidates.max(by: { parseSemver($0.version).lexicographicallyPrecedes(parseSemver($1.version)) }) else {
+            return .failure(.unexpectedResponse)
+        }
+        return .success(newest)
+    }
+
+    private static func release(from payload: GitHubReleaseResponse) -> GitHubRelease? {
+        let tag = payload.tagName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let version = normalizedReleaseVersion(from: tag) else { return nil }
+        return GitHubRelease(
             tagName: tag,
             version: version,
             body: payload.body ?? "",
             htmlURL: sanitizedReleaseURL(payload.htmlURL, expectedTag: tag)
-        ))
+        )
     }
 
+    /// `X.Y.Z` from a macOS release tag (`mac-vX.Y.Z`, legacy `vX.Y.Z`,
+    /// or a bare version), nil for anything else — Windows tags included.
     static func normalizedReleaseVersion(from tag: String) -> String? {
         var version = tag.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let first = version.first, first == "v" || first == "V" {
+        if version.lowercased().hasPrefix(MAC_RELEASE_TAG_PREFIX) {
+            version.removeFirst(MAC_RELEASE_TAG_PREFIX.count)
+        } else if let first = version.first, first == "v" || first == "V" {
             version.removeFirst()
         }
 
@@ -264,12 +305,23 @@ enum SuperDictateUpdateInstaller {
         return manifest
     }
 
-    static func prepare(manifest: SuperDictateUpdateManifest) async throws -> PreparedSuperDictateUpdate {
+    /// The archive of the release tagged `tagName` (`mac-vX.Y.Z`, legacy
+    /// `vX.Y.Z`), which must name the manifest's version.
+    static func archiveURL(tagName: String, manifest: SuperDictateUpdateManifest) throws -> URL {
+        guard UpdateCheck.normalizedReleaseVersion(from: tagName) == manifest.version,
+              let url = URL(string: "https://github.com/shohart/SuperDictate-Next/releases/download/\(tagName)/SuperDictate.zip") else {
+            throw SuperDictateUpdateInstallerError.manifestVersionMismatch(expected: tagName, actual: manifest.version)
+        }
+        return url
+    }
+
+    static func prepare(manifest: SuperDictateUpdateManifest,
+                        tagName: String) async throws -> PreparedSuperDictateUpdate {
         guard appCanBeReplaced(at: Bundle.main.bundleURL) else {
             throw SuperDictateUpdateInstallerError.appNotWritable
         }
 
-        let archiveURL = URL(string: "https://github.com/shohart/SuperDictate-Next/releases/download/v\(manifest.version)/SuperDictate.zip")!
+        let archiveURL = try archiveURL(tagName: tagName, manifest: manifest)
         var request = URLRequest(url: archiveURL)
         request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60

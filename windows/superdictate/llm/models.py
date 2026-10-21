@@ -104,6 +104,11 @@ class ModelProfile:
     allows_custom_system_prompt: bool = True
     #: Whether a LoRA adapter is applied on top of the base weights.
     uses_lora: bool = False
+    #: llama.cpp's ``--lora-scale``. The VoiceScribe adapter is rsLoRA
+    #: (alpha 80, rank 16, effective scale alpha/sqrt(rank) = 20) while
+    #: llama.cpp applies scale * alpha/rank, so it needs 4.0 — macOS
+    #: GEC_LORA_SCALE. At 1.0 the adapter runs at a quarter strength.
+    lora_scale: float = 1.0
     #: Rough working-set size, for the "not enough VRAM" warning.
     context_size: int = 4096
 
@@ -121,6 +126,7 @@ PROFILES: dict[BundledLLMModel, ModelProfile] = {
         pin=GEC_MODEL,
         uses_few_shot_correction=True,
         uses_lora=True,
+        lora_scale=4.0,
     ),
     BundledLLMModel.YANDEXGPT: ModelProfile(
         pin=YANDEXGPT_MODEL,

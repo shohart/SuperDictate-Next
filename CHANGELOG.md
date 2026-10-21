@@ -8,6 +8,13 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Changed
+- **macOS and Windows releases have their own tags.** macOS releases are tagged `mac-vX.Y.Z` from now on (up to 0.7.0: `vX.Y.Z`), Windows releases `win-vX.Y.Z`. The update check lists the releases and takes the newest macOS one, so a Windows release can never be offered as a Mac update. The process is in `docs/RELEASING.md`.
+- **The correction guardrail lets the corrector drop fillers.** The VoiceScribe corrector deletes fillers by design («ну короче завтра…» → «Завтра…»), and the leading-word check used to revert that as a lost word. Its accept/reject cases now live in `fixtures/llm-correction-guardrail.json`, shared with the Windows port; several come from a probe of the real model.
+
+### Added
+- **Windows port** (`windows/`): the same speech host and models as macOS 0.7.0; correction and rewrite through an OpenAI-compatible API.
+
 ## v0.7.0 — 2026-10-17
 
 ### Changed

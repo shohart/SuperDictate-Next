@@ -24,6 +24,13 @@ import Foundation
 // falls back to the uncorrected input on failure, per this pipeline's
 // never-lose-text policy (LLMPostprocessingPipeline). Everything here is
 // deterministic and hermetic -- unit-tested in SelfTest without any model.
+//
+// The corrector also DELETES fillers by design (its model card: "remove
+// filler (эм/ну/типа/короче) ... preserve all meaning"), so «ну короче
+// завтра…» → «Завтра…» is an edit, not a lost word. Both checks therefore
+// also accept the output against the input with `modelRemovedFillers`
+// taken out. The list and every guardrail case are shared with the Windows
+// port through fixtures/llm-correction-guardrail.json.
 
 enum LLMCorrectionGuardrail {
 
@@ -33,15 +40,42 @@ enum LLMCorrectionGuardrail {
     static func sanitizedCorrection(input: String, output: String) -> String {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return input }
-        guard correctionPreservesLeadingWord(input: input, output: trimmed) else {
+        // Compared with the model-removed fillers gone, but either form
+        // counts: the model may also leave a filler in.
+        let stripped = withoutModelRemovedFillers(input)
+        let candidates = stripped.isEmpty ? [input] : [stripped, input]
+        guard candidates.contains(where: { correctionPreservesLeadingWord(input: $0, output: trimmed) }) else {
             log("LLM postprocessing: guardrail rejected correction (leading word lost); keeping original text")
             return input
         }
-        guard correctionPreservesWordCount(input: input, output: trimmed) else {
+        guard candidates.contains(where: { correctionPreservesWordCount(input: $0, output: trimmed) }) else {
             log("LLM postprocessing: guardrail rejected correction (word count \(normalizedWords(input).count) → \(normalizedWords(trimmed).count)); keeping original text")
             return input
         }
         return trimmed
+    }
+
+    /// Fillers the VoiceScribe corrector deletes by design — the model
+    /// card's own list plus what a probe of the real model with this app's
+    /// prompt dropped (fixtures/llm-correction-guardrail.json says which is
+    /// which). Words the model keeps and that are often real words («вот»,
+    /// «это», «просто», «слушай», «в общем»…) are deliberately absent.
+    /// Same list as the Windows port's guardrail.MODEL_REMOVED_FILLERS.
+    static let modelRemovedFillers: [String] = [
+        "э", "ээ", "эм", "м", "мм", "ам", "аа",
+        "ну", "типа", "короче", "короче говоря", "так сказать", "значит",
+        "um", "uh", "ah", "er", "erm", "hm",
+    ]
+
+    /// `text` as the corrector is expected to leave it, filler-wise. Words
+    /// with a preset use the preset's pattern («э+», «um+»), as the Windows
+    /// port's remover does; the rest match literally.
+    static func withoutModelRemovedFillers(_ text: String) -> String {
+        let presets = FillerWordRemover.presets.filter { modelRemovedFillers.contains($0.displayText) }
+        let presetWords = Set(presets.map(\.displayText))
+        return FillerWordRemover.apply(to: text,
+                                       enabledPresetKeys: Set(presets.map(\.key)),
+                                       customWords: modelRemovedFillers.filter { !presetWords.contains($0) }).text
     }
 
     /// True when `output` has roughly as many words as `input`: within

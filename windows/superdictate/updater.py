@@ -7,11 +7,11 @@ Windows port stops one step earlier: it reports what is published and
 opens the release page. Nothing is downloaded or executed automatically;
 the macOS build also never installs without an explicit click.
 
-Both platforms publish to the same repository, so Windows releases are
-tagged ``windows-vX.Y.Z`` and published without GitHub's "latest" flag:
-the macOS updater reads ``releases/latest`` and must never see one. This
-module lists the releases and picks the newest Windows tag, never a macOS
-one. If that release carries no installer the check says so plainly.
+Both platforms publish to the same repository, told apart by tag:
+``win-vX.Y.Z`` for Windows, ``mac-vX.Y.Z`` (legacy ``vX.Y.Z``) for macOS.
+Windows releases are never marked "latest", which macOS 0.7.0 and earlier
+still read. This module lists the releases and picks the newest Windows
+tag, never a macOS one. If that release carries no installer the check says so plainly.
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ log = get_logger("updater")
 
 RELEASES_URL = "https://api.github.com/repos/shohart/SuperDictate-Next/releases?per_page=50"
 RELEASES_PAGE = "https://github.com/shohart/SuperDictate-Next/releases"
-#: Tag prefix of Windows releases; ``v0.7.0`` alone is a macOS release.
-WINDOWS_TAG_PREFIX = "windows-v"
+#: Tag prefix of Windows releases; ``mac-v0.7.1`` and ``v0.7.0`` are macOS.
+WINDOWS_TAG_PREFIX = "win-v"
 CHECK_INTERVAL_SECONDS = 6 * 3600
 REQUEST_TIMEOUT = 15
 

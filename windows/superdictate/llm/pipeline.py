@@ -307,6 +307,7 @@ class LLMPostprocessor:
         spec = HostSpec(
             model_path=model_profile.model_path,
             lora_path=model_profile.lora_path,
+            lora_scale=model_profile.lora_scale,
             context_size=model_profile.context_size,
             gpu_layers=self.gpu_layers,
         )

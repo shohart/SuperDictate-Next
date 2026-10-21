@@ -40,15 +40,16 @@ log = get_logger("llm.guardrail")
 # Letters and digits only; every run of anything else separates words.
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
-# Fillers the corrector removes by design: hesitations and verbal tics that
-# are almost never anything else (textproc.PRESET_FILLERS minus the words
-# that are filler only sometimes — «это», «вот», «просто», «like»…, where a
-# dropped word may well be the user's own).
-_MODEL_REMOVED_FILLERS: tuple[str, ...] = (
-    "э", "эм", "ээ", "м", "мм", "ам", "аа", "ну",
-    "как бы", "типа", "короче", "это самое", "так сказать", "в общем",
-    "в принципе", "собственно", "допустим", "слушай", "понимаешь", "знаешь",
-    "um", "uh", "ah", "er", "erm", "hm", "you know", "i mean",
+# Fillers the VoiceScribe corrector deletes by design, so a dropped one is
+# an edit, not a lost word. Same list as LLMCorrectionGuardrail.swift;
+# both self-tests check it against fixtures/llm-correction-guardrail.json,
+# which says where each entry comes from (the model card's policy and a
+# probe of the real model). Words the model keeps and that are often real
+# words («вот», «это», «просто», «слушай», «в общем»…) are not here.
+MODEL_REMOVED_FILLERS: tuple[str, ...] = (
+    "э", "ээ", "эм", "м", "мм", "ам", "аа",
+    "ну", "типа", "короче", "короче говоря", "так сказать", "значит",
+    "um", "uh", "ah", "er", "erm", "hm",
 )
 
 # U+0410..U+044F — А-Я а-я. `normalized_words` has already lowercased and
@@ -165,7 +166,7 @@ def preserves_word_count(text_in: str, text_out: str) -> bool:
 
 def without_model_removed_fillers(text: str) -> str:
     """``text`` as the corrector is expected to leave it, filler-wise."""
-    return remove_filler_words(text, _MODEL_REMOVED_FILLERS)[0]
+    return remove_filler_words(text, MODEL_REMOVED_FILLERS)[0]
 
 
 def sanitized_correction(text_in: str, text_out: str) -> str:
