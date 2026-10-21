@@ -271,7 +271,11 @@ _DEFAULTS: dict[str, Any] = {
     "hud_correcting_color": AccentColor.PURPLE.value,
     "hud_background_style": HUDBackgroundStyle.SYSTEM.value,
     "hud_size": HUDSize.STANDARD.value,
-    "hud_display_mode": HUDDisplayMode.LEVEL_BARS.value,
+    # The timer, unlike macOS: this is how the port is meant to be used,
+    # and the setting does not travel from the Mac. Installs from before
+    # this default are moved over once, in load().
+    "hud_display_mode": HUDDisplayMode.TIMER_OUTLINE.value,
+    "hud_timer_default_v1": True,
     "mute_while_recording": False,
     "pause_media_while_recording": False,
     "play_feedback_sounds": True,
@@ -347,6 +351,12 @@ class Settings:
             for key, value in stored.items():
                 if key in _DEFAULTS:
                     self._data[key] = value
+            # Every key is written on save, so a stored "levelBars" from
+            # before the timer became the default is the old default, not
+            # a choice. Moved once; picking the bars afterwards sticks.
+            if "hud_timer_default_v1" not in stored:
+                self._data["hud_display_mode"] = HUDDisplayMode.TIMER_OUTLINE.value
+                self._data["hud_timer_default_v1"] = True
 
     def save(self) -> None:
         paths.ensure_directories()
@@ -544,7 +554,7 @@ class Settings:
     @property
     def hud_display_mode(self) -> HUDDisplayMode:
         return _enum_or(HUDDisplayMode, self._get("hud_display_mode"),
-                        HUDDisplayMode.LEVEL_BARS)
+                        HUDDisplayMode.TIMER_OUTLINE)
 
     @property
     def start_at_login(self) -> bool:

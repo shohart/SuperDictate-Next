@@ -8,7 +8,7 @@
 ;   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SuperDictate.iss
 
 #define AppName        "SuperDictate"
-#define AppVersion     "0.8.0"
+#define AppVersion     "0.8.1"
 #define AppPublisher   "SuperDictate Next"
 #define AppURL         "https://github.com/shohart/SuperDictate-Next"
 #define AppExeName     "SuperDictate.exe"

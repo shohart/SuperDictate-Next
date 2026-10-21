@@ -31,7 +31,10 @@ from ..hotkeys import (
     MOD_ALL,
     MODIFIER_VK_FLAG,
     VK_ESCAPE,
+    VK_LCONTROL,
+    VK_RMENU,
     HotkeyChoice,
+    is_altgr_phantom_time,
 )
 from ..keynames import hotkey_name
 
@@ -41,6 +44,8 @@ WM_KEYUP = 0x0101
 WM_SYSKEYUP = 0x0105
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 
 
 class MSG(ctypes.Structure):
@@ -61,7 +66,8 @@ class ShortcutRecorderDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(420)
 
-        self._pressed_modifiers: set[int] = set()
+        # Held modifier -> the message time of its press.
+        self._pressed_modifiers: dict[int, int] = {}
         self._selected: Optional[HotkeyChoice] = None
 
         layout = QVBoxLayout(self)
@@ -100,17 +106,27 @@ class ShortcutRecorderDialog(QDialog):
         msg = MSG.from_address(int(message))
 
         if msg.message in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            self._on_key_down(_side_specific_vk(msg))
+            vk = _side_specific_vk(msg)
+            if vk == VK_LCONTROL and is_altgr_phantom_time(int(msg.time)):
+                # The Left Ctrl an AltGr layout puts in front of Right
+                # Alt (see hotkeys.ALTGR_PHANTOM_SCAN): not a key press.
+                return True, 0
+            self._on_key_down(vk, int(msg.time))
             return True, 0
         if msg.message in (WM_KEYUP, WM_SYSKEYUP):
-            self._pressed_modifiers.discard(_side_specific_vk(msg))
+            self._pressed_modifiers.pop(_side_specific_vk(msg), None)
             return True, 0
         return False, 0
 
-    def _on_key_down(self, vk: int) -> None:
+    def _on_key_down(self, vk: int, timestamp: int) -> None:
         if vk == VK_ESCAPE:
             self.reject()
             return
+
+        if vk == VK_RMENU and self._pressed_modifiers.get(VK_LCONTROL) == timestamp:
+            # The phantom Ctrl again, for when the hook did not see it:
+            # it shares Right Alt's timestamp, a real press never does.
+            del self._pressed_modifiers[VK_LCONTROL]
 
         if vk in MODIFIER_VK_FLAG:
             # A modifier can be either the chord's prefix or the shortcut
@@ -118,13 +134,19 @@ class ShortcutRecorderDialog(QDialog):
             # held become the required modifiers, pressing Right Shift
             # then Right Alt records "Shift + Right Alt".
             modifiers = self._current_modifier_mask() & ~MODIFIER_VK_FLAG[vk]
-            self._pressed_modifiers.add(vk)
+            self._pressed_modifiers[vk] = timestamp
             self._select(HotkeyChoice(vk, modifiers))
             return
 
         self._select(HotkeyChoice(vk, self._current_modifier_mask()))
 
     def _current_modifier_mask(self) -> int:
+        # A release that never reached this window (focus moved, the key
+        # went up during a click) would otherwise leave the modifier
+        # "held" for good, and every later shortcut would carry it.
+        for vk in [vk for vk in self._pressed_modifiers
+                   if not user32.GetAsyncKeyState(vk) & 0x8000]:
+            del self._pressed_modifiers[vk]
         mask = 0
         for vk in self._pressed_modifiers:
             mask |= MODIFIER_VK_FLAG.get(vk, 0)

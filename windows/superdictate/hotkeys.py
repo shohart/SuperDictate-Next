@@ -21,6 +21,7 @@ import ctypes
 import ctypes.wintypes as wt
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable, Optional
@@ -35,6 +36,16 @@ WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 LLKHF_INJECTED = 0x00000010
 HC_ACTION = 0
+
+# On a layout with AltGr (Russian is one, US English is not) Windows turns
+# every Right Alt press into "Left Ctrl + Right Alt": a Left Ctrl down is
+# synthesised just before Right Alt goes down, and its up just after Right
+# Alt goes up. That Ctrl is not a key anybody pressed. Counted as one, it
+# made Right Alt record as "Ctrl + Alt", and a Right Alt shortcut work in
+# English and not in Russian. The low-level hook tells it apart by this
+# scan code, a real Left Ctrl is 0x1D; window messages lose the high bit,
+# so they get the timestamp instead (``is_altgr_phantom_time``).
+ALTGR_PHANTOM_SCAN = 0x21D
 
 # Modifier bit mask. Deliberately side-agnostic, mirroring the way macOS
 # stores `requiredModifiers` as CGEventFlags while the primary key stays
@@ -412,6 +423,45 @@ class HotkeyStateMachine:
         return _PASS
 
 
+def is_altgr_phantom(vk: int, scan_code: int) -> bool:
+    return vk == VK_LCONTROL and scan_code == ALTGR_PHANTOM_SCAN
+
+
+# Timestamps of recent phantom Ctrl events, as the hook saw them. A window
+# message carries the same time (``GetMessageTime``), which is how the
+# shortcut recorder recognises the phantom among its own messages.
+_phantom_times: "deque[int]" = deque(maxlen=16)
+_phantom_lock = threading.Lock()
+
+
+def note_altgr_phantom_time(timestamp: int) -> None:
+    with _phantom_lock:
+        _phantom_times.append(timestamp)
+
+
+def is_altgr_phantom_time(timestamp: int) -> bool:
+    with _phantom_lock:
+        return timestamp in _phantom_times
+
+
+def held_modifier_mask(is_held: Callable[[int], bool], *, phantom_ctrl_down: bool,
+                       real_lctrl_down: bool) -> int:
+    """The side-agnostic mask of what is held, the AltGr Ctrl taken out.
+
+    Windows' own key state counts the phantom Left Ctrl as held, so while
+    it is down Left Ctrl only counts if the hook saw a real press of it.
+    """
+    mask = 0
+    for vk, flag in MODIFIER_VK_FLAG.items():
+        if vk == VK_LCONTROL and phantom_ctrl_down:
+            held = real_lctrl_down
+        else:
+            held = is_held(vk)
+        if held:
+            mask |= flag
+    return mask
+
+
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("vkCode", wt.DWORD),
@@ -455,6 +505,7 @@ class HotkeyListener:
         self._on_actions = on_actions
         self._machine = HotkeyStateMachine()
         self._down_keys: set[int] = set()
+        self._phantom_ctrl_down = False
         self._thread: Optional[threading.Thread] = None
         self._thread_id: int = 0
         self._hook = None
@@ -506,6 +557,7 @@ class HotkeyListener:
         with self._lock:
             self._machine.reset_all()
             self._down_keys.clear()
+            self._phantom_ctrl_down = False
 
     def reset_toggle(self) -> None:
         with self._lock:
@@ -541,15 +593,15 @@ class HotkeyListener:
         runs before Windows updates its own key state, so GetAsyncKeyState
         does not report this keystroke yet.
         """
-        mask = 0
-        for vk, flag in MODIFIER_VK_FLAG.items():
+        def is_held(vk: int) -> bool:
             if vk == event_vk:
-                held = event_is_down
-            else:
-                held = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-            if held:
-                mask |= flag
-        return mask
+                return event_is_down
+            return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+        return held_modifier_mask(
+            is_held, phantom_ctrl_down=self._phantom_ctrl_down,
+            real_lctrl_down=(event_is_down if event_vk == VK_LCONTROL
+                             else VK_LCONTROL in self._down_keys))
 
     def _callback(self, code: int, wparam: int, lparam) -> int:
         if code != HC_ACTION:
@@ -567,6 +619,14 @@ class HotkeyListener:
 
         vk = info.vkCode
         is_down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+
+        if is_altgr_phantom(vk, info.scanCode):
+            # Not a key press: invisible to the shortcuts, untouched for
+            # the app, which needs it to type AltGr characters.
+            note_altgr_phantom_time(info.time)
+            with self._lock:
+                self._phantom_ctrl_down = is_down
+            return user32.CallNextHookEx(None, code, wparam, lparam)
 
         with self._lock:
             is_repeat = is_down and vk in self._down_keys

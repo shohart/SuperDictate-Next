@@ -200,6 +200,47 @@ def test_modifiers_are_never_swallowed() -> None:
     _check("shift release still reaches the app", release.suppress, False)
 
 
+def test_altgr_phantom_ctrl() -> None:
+    """Regression: on the Russian layout Right Alt recorded as "Ctrl + Alt".
+
+    An AltGr layout sends a Left Ctrl with scan code 0x21D in front of
+    every Right Alt. It must not count as held, or a bare Right Alt
+    shortcut works in English and not in Russian.
+    """
+    from .hotkeys import (ALTGR_PHANTOM_SCAN, held_modifier_mask,
+                          is_altgr_phantom, is_altgr_phantom_time,
+                          note_altgr_phantom_time)
+
+    _check("phantom: 0x21D left ctrl", is_altgr_phantom(VK_LCONTROL, ALTGR_PHANTOM_SCAN), True)
+    _check("phantom: a real left ctrl is not", is_altgr_phantom(VK_LCONTROL, 0x1D), False)
+    _check("phantom: right alt is not", is_altgr_phantom(VK_RMENU, 0x38), False)
+
+    # Windows reports both Left Ctrl and Right Alt as held.
+    os_state = {VK_LCONTROL, VK_RMENU}.__contains__
+    _check("phantom: right alt alone",
+           held_modifier_mask(os_state, phantom_ctrl_down=True, real_lctrl_down=False),
+           MOD_ALT)
+    _check("phantom: a real ctrl held as well still counts",
+           held_modifier_mask(os_state, phantom_ctrl_down=True, real_lctrl_down=True),
+           MOD_CTRL | MOD_ALT)
+    _check("phantom: without one, windows is believed",
+           held_modifier_mask(os_state, phantom_ctrl_down=False, real_lctrl_down=False),
+           MOD_CTRL | MOD_ALT)
+
+    press = _machine().transition(
+        _Event(vk=VK_RMENU, is_down=True,
+               modifiers=held_modifier_mask(os_state, phantom_ctrl_down=True,
+                                            real_lctrl_down=False)),
+        hotkey=HotkeyChoice(VK_RMENU), history_hotkey=HISTORY_HOTKEY,
+        edit_hotkey=EDIT_HOTKEY, trigger_mode=TriggerMode.TOGGLE, is_recording=False)
+    _check("phantom: right alt shortcut starts on an altgr layout",
+           press.actions, [Action.PRESS])
+
+    note_altgr_phantom_time(123456)
+    _check("phantom: recorder recognises its timestamp", is_altgr_phantom_time(123456), True)
+    _check("phantom: other timestamps are real", is_altgr_phantom_time(123457), False)
+
+
 # -- transcript processing ------------------------------------------------
 
 
@@ -371,6 +412,27 @@ def test_settings_round_trip() -> None:
         _check("settings: language persisted", reloaded.interface_language, "en")
         _check("settings: unknown keys dropped",
                "unknown_key" in reloaded.snapshot(), False)
+
+
+def test_hud_timer_default() -> None:
+    """The timer is the default, and installs from before it move once."""
+    import json
+
+    from .settings import HUDDisplayMode, Settings
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "Settings.json"
+        _check("timer: fresh install", Settings(path).hud_display_mode,
+               HUDDisplayMode.TIMER_OUTLINE)
+
+        path.write_text(json.dumps({"hud_display_mode": "levelBars"}), encoding="utf-8")
+        migrated = Settings(path)
+        _check("timer: 0.8.0 settings move over", migrated.hud_display_mode,
+               HUDDisplayMode.TIMER_OUTLINE)
+
+        migrated.apply({"hud_display_mode": "levelBars"})
+        _check("timer: bars chosen afterwards stick", Settings(path).hud_display_mode,
+               HUDDisplayMode.LEVEL_BARS)
 
 
 def test_hotkey_json_guards() -> None:
@@ -1267,6 +1329,7 @@ _TESTS = [
     test_edit_chord,
     test_escape_cancels_only_while_recording,
     test_modifiers_are_never_swallowed,
+    test_altgr_phantom_ctrl,
     test_unk_repair,
     test_corrections,
     test_learned_corrections,
@@ -1276,6 +1339,7 @@ _TESTS = [
     test_numbers_as_digits,
     test_pipeline_order,
     test_settings_round_trip,
+    test_hud_timer_default,
     test_hotkey_json_guards,
     test_filler_word_list,
     test_compact_numbers,

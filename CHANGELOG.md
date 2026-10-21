@@ -6,6 +6,19 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Windows 0.8.1 — 2026-10-21
+
+Windows only, tag `win-v0.8.1`. macOS stays on 0.8.0.
+
+### Fixed
+- **Right Alt works as a shortcut on the Russian layout.** Layouts with AltGr (Russian is one, US English is not) send a synthetic Left Ctrl before every Right Alt. The hotkey hook counted it as a real key, so Right Alt was recorded as "Ctrl + Alt", and a Right Alt shortcut worked in English and failed in Russian. The hook and the shortcut recorder now ignore that Ctrl (scan code `0x21D`, or the same timestamp as Right Alt). The recorder also drops modifiers whose key-up it missed, so a stale Ctrl no longer sticks to every shortcut recorded after it.
+
+### Changed
+- **The recording capsule switches to the timer after 10 seconds by default.** Installs from 0.8.0 are moved over once. If you then choose "Level bars" in Settings, that choice is kept.
+
+### Validation
+- Windows 0.8.1: 50 self-tests pass, two of them new (the AltGr Ctrl, and the timer default with its one-time move). Checked on the test PC: the Russian layout `kbdru.dll` has the AltGr flag, and `kbdus.dll` does not. `SuperDictate-0.8.1-setup.exe` SHA-256: `3f3fc56f9320124442ab9dea38da952688c9f587b83234eb3a0f52a5a7fff659`.
+
 ## 0.8.0 — 2026-10-21
 
 macOS: tag `mac-v0.8.0` (also published once as `v0.8.0` for 0.7.0 clients). Windows: tag `win-v0.8.0`.
