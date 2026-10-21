@@ -73,6 +73,17 @@ class HUDDisplayMode(str, Enum):
     TIMER_OUTLINE = "timerOutline"
 
 
+class HUDBackgroundStyle(str, Enum):
+    """The capsule's own fill. ``SYSTEM`` follows the Windows app theme.
+
+    Values match the macOS ``RecordingHUDBackgroundStyle``.
+    """
+
+    SYSTEM = "system"
+    DARK = "dark"
+    LIGHT = "light"
+
+
 class HUDSize(str, Enum):
     COMPACT = "compact"
     STANDARD = "standard"
@@ -92,6 +103,9 @@ class AccentColor(str, Enum):
     CYAN = "cyan"
     GREEN = "green"
     WHITE = "white"
+    # Black on a light capsule, white on a dark one: the only preset that
+    # depends on the background, exactly as on macOS.
+    CONTRAST = "contrast"
 
     @property
     def rgb(self) -> tuple[int, int, int]:
@@ -104,6 +118,7 @@ class AccentColor(str, Enum):
             "cyan": (100, 210, 255),
             "green": (48, 209, 88),
             "white": (255, 255, 255),
+            "contrast": (255, 255, 255),
         }[self.value]
 
     @property
@@ -128,6 +143,16 @@ class ColorSpec:
         return bool(self.end)
 
     @property
+    def is_contrast(self) -> bool:
+        return self.start == CONTRAST_COLOR
+
+    def resolved(self, light_background: bool) -> "ColorSpec":
+        """Literal colours only: ``contrast`` becomes black or white."""
+        ink = "#000000" if light_background else "#ffffff"
+        return ColorSpec(ink if self.start == CONTRAST_COLOR else self.start,
+                         ink if self.end == CONTRAST_COLOR else self.end)
+
+    @property
     def rgb(self) -> tuple[int, int, int]:
         raw = self.start.lstrip("#")
         return tuple(int(raw[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
@@ -149,6 +174,9 @@ class ColorSpec:
     def _resolve(raw: str) -> Optional[str]:
         """A preset name or a #rrggbb literal, normalised to a literal."""
         value = raw.strip().lower()
+        if value == CONTRAST_COLOR:
+            # Kept symbolic: what it resolves to depends on the capsule.
+            return CONTRAST_COLOR
         try:
             return AccentColor(value).hex
         except ValueError:
@@ -163,7 +191,12 @@ class ColorSpec:
 
     @classmethod
     def of(cls, color: AccentColor) -> "ColorSpec":
+        if color is AccentColor.CONTRAST:
+            return cls(CONTRAST_COLOR)
         return cls(color.hex)
+
+
+CONTRAST_COLOR = AccentColor.CONTRAST.value
 
 
 # Matches the macOS DictationLanguage enum: the 25-language Parakeet TDT v3
@@ -233,6 +266,10 @@ _DEFAULTS: dict[str, Any] = {
     "live_preview": True,
     "hud_recording_color": AccentColor.RED.value,
     "hud_transcribing_color": AccentColor.BLUE.value,
+    # The second accent of the AI-improvement animation: the bars run from
+    # the transcribing colour to this one. macOS defaults to purple too.
+    "hud_correcting_color": AccentColor.PURPLE.value,
+    "hud_background_style": HUDBackgroundStyle.SYSTEM.value,
     "hud_size": HUDSize.STANDARD.value,
     "hud_display_mode": HUDDisplayMode.LEVEL_BARS.value,
     "mute_while_recording": False,
@@ -427,6 +464,16 @@ class Settings:
     def hud_transcribing_color(self) -> ColorSpec:
         return ColorSpec.parse(self._get("hud_transcribing_color"),
                                ColorSpec.of(AccentColor.BLUE))
+
+    @property
+    def hud_correcting_color(self) -> ColorSpec:
+        return ColorSpec.parse(self._get("hud_correcting_color"),
+                               ColorSpec.of(AccentColor.PURPLE))
+
+    @property
+    def hud_background_style(self) -> HUDBackgroundStyle:
+        return _enum_or(HUDBackgroundStyle, self._get("hud_background_style"),
+                        HUDBackgroundStyle.SYSTEM)
 
     @property
     def hud_size(self) -> HUDSize:

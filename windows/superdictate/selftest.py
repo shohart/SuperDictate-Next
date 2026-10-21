@@ -606,24 +606,123 @@ def test_hud_elapsed_format() -> None:
 def test_hud_timer_activation() -> None:
     """The timer must not appear before the dictation is worth timing.
 
-    Pure arithmetic on the blend curve, so this runs without Qt: a capsule
-    that flipped to a clock instantly would turn every two-second dictation
-    into a stopwatch.
+    Pure arithmetic on the blend curve: a capsule that flipped to a clock
+    instantly would turn every two-second dictation into a stopwatch. Ten
+    seconds and a half-second crossover, as on macOS.
     """
-    def blend(elapsed: float) -> float:
-        from .ui.hud import TIMER_ACTIVATION_SECONDS, TIMER_TRANSITION_SECONDS
+    from .ui.hud import timer_blend
 
-        t = (elapsed - TIMER_ACTIVATION_SECONDS) / TIMER_TRANSITION_SECONDS
-        t = max(0.0, min(1.0, t))
-        return t * t * t * (t * (t * 6 - 15) + 10)
+    _check("bars at the start", timer_blend(0.0), 0.0)
+    _check("still bars at nine seconds", timer_blend(9.0), 0.0)
+    _check("still bars at the threshold", timer_blend(10.0), 0.0)
+    _check("fully timer once the crossover is done", timer_blend(10.5), 1.0)
+    _check("crossover is under way midway", 0.2 < timer_blend(10.25) < 0.8, True)
 
-    _check("bars at the start", blend(0.0), 0.0)
-    _check("still bars at nine seconds", blend(9.0), 0.0)
-    _check("still bars at the threshold", blend(10.0), 0.0)
-    _check("fully timer once the crossover is done", blend(11.0), 1.0)
-    midpoint = blend(10.4)
-    _check("crossover is under way midway",
-           0.2 < midpoint < 0.8, True)
+
+def test_hud_phase_speeds() -> None:
+    """recordingHUDPhaseSpeed, constant for constant."""
+    from .ui.hud import phase_speed
+
+    _check("recording at rest", round(phase_speed("recording", 0.0), 2), 16.96)
+    _check("recording at full voice", round(phase_speed("recording", 1.0), 2), 27.04)
+    _check("transcribing", phase_speed("transcribing", 0.7), 10.2)
+    _check("correcting", phase_speed("correcting", 0.0), 6.4)
+    _check("error is still", phase_speed("error", 1.0), 0.0)
+
+
+def test_hud_outline_path() -> None:
+    """The timer's lit outline: nothing at 0, both sides, all of it at 1."""
+    from PySide6.QtCore import QRectF
+
+    from .ui.hud import outline_fill_path
+
+    capsule = QRectF(0, 0, 80, 40)
+    _check("empty at zero", outline_fill_path(capsule, 0.0).length() < 0.01, True)
+    half = outline_fill_path(capsule, 0.5).length()
+    full_perimeter = 2 * (80 - 40) + 3.14159 * 40
+    _check("half lights half the perimeter",
+           abs(half - full_perimeter / 2) < 1.5, True)
+    bounds = outline_fill_path(capsule, 0.25).boundingRect()
+    _check("grows symmetrically from the bottom centre",
+           abs((bounds.left() + bounds.right()) / 2 - 40) < 0.5, True)
+    _check("starts at the bottom", abs(bounds.bottom() - 40) < 0.5, True)
+
+
+def test_contrast_color() -> None:
+    """``contrast`` stays symbolic and resolves against the background."""
+    from .settings import AccentColor, ColorSpec
+
+    spec = ColorSpec.parse("contrast", ColorSpec.of(AccentColor.RED))
+    _check("parsed as contrast", spec.is_contrast, True)
+    _check("round-trips", spec.to_json(), "contrast")
+    _check("black on light", spec.resolved(True).start, "#000000")
+    _check("white on dark", spec.resolved(False).start, "#ffffff")
+    plain = ColorSpec.of(AccentColor.RED)
+    _check("other colours ignore the background",
+           plain.resolved(True).start, plain.start)
+
+
+def test_caret_geometry() -> None:
+    """FocusedInsertionTargetLocator's rules for what counts as a caret."""
+    from .focus_target import (
+        Rect, is_reasonable_field, normalized_caret, usable_target, visual_frame)
+
+    area = Rect(0, 0, 1920, 1040)
+    _check("a zero-width caret gets a width",
+           normalized_caret(Rect(100, 200, 0, 18)), Rect(100, 200, 2, 18))
+    _check("a collapsed caret is no caret",
+           normalized_caret(Rect(0, 0, 0, 0)), None)
+    _check("a selection is not a caret",
+           normalized_caret(Rect(100, 200, 300, 18)), None)
+    _check("a whole field is not a caret",
+           normalized_caret(Rect(100, 200, 10, 400)), None)
+
+    caret = Rect(300, 500, 2, 18)
+    field = Rect(250, 480, 600, 60)
+    _check("a single-line field is anchored as a whole",
+           visual_frame(field, caret, area), field)
+    page = Rect(200, 100, 1200, 800)
+    _check("a page-sized field is anchored on the caret's line",
+           visual_frame(page, caret, area), Rect(200, 500, 1200, 18))
+    _check("a field around the caret is reasonable",
+           is_reasonable_field(field, caret, area), True)
+    _check("a field away from the caret is not",
+           is_reasonable_field(Rect(900, 900, 100, 30), caret, area), False)
+    _check("a full-screen pane is not",
+           is_reasonable_field(Rect(0, 0, 1900, 1000), caret, area), False)
+    _check("a full-screen frame is not a HUD target",
+           usable_target(Rect(0, 0, 1900, 900), area), False)
+    _check("a line is",
+           usable_target(Rect(200, 500, 1200, 18), area), True)
+
+
+def test_target_stabilizer() -> None:
+    """RecordingHUDTargetStabilizer: believe the start app, doubt blips."""
+    from .focus_target import Rect, TargetFrame, TargetIdentity, TargetStabilizer
+
+    def frame(pid: int, element: int) -> TargetFrame:
+        rect = Rect(10, 10, 2, 16)
+        return TargetFrame(rect, rect, "test", TargetIdentity(pid, 1, (element,)))
+
+    stabilizer = TargetStabilizer()
+    stabilizer.reset(100)
+    _check("the starting app is believed at once",
+           stabilizer.observe(frame(100, 1))[0], "switch")
+    _check("then just followed", stabilizer.observe(frame(100, 1))[0], "update")
+    _check("another field of the same app needs a second look",
+           stabilizer.observe(frame(100, 2))[0], "none")
+    _check("and gets it", stabilizer.observe(frame(100, 2))[0], "switch")
+    _check("another app needs three",
+           [stabilizer.observe(frame(200, 9))[0] for _ in range(3)],
+           ["none", "none", "switch"])
+    _check("a blip resets the count",
+           [stabilizer.observe(t)[0] for t in (frame(300, 1), None, frame(300, 1))],
+           ["none", "none", "none"])
+
+    other = TargetStabilizer()
+    other.reset(100)
+    _check("a different app at the start is doubted too",
+           other.observe(frame(555, 1))[0], "none")
 
 
 # -- post-processing shortcuts --------------------------------------------
@@ -1188,6 +1287,11 @@ _TESTS = [
     test_vocabulary_store,
     test_hud_elapsed_format,
     test_hud_timer_activation,
+    test_hud_phase_speeds,
+    test_hud_outline_path,
+    test_contrast_color,
+    test_caret_geometry,
+    test_target_stabilizer,
     test_postprocessing_chords,
     test_pause_segmentation,
     test_overlap_windows,

@@ -52,9 +52,11 @@ from ..keynames import hotkey_name
 from ..settings import (
     DICTATION_LANGUAGES,
     AccentColor,
+    CONTRAST_COLOR,
     ColorSpec,
     CompletionBehavior,
     Correction,
+    HUDBackgroundStyle,
     HUDDisplayMode, HUDSize,
     PasteSuffix,
     Settings,
@@ -101,16 +103,28 @@ class ColorField(QWidget):
         self._gradient = QCheckBox(i18n.tr("settings_color_gradient"))
         self._gradient.setChecked(spec.is_gradient)
         self._gradient.toggled.connect(self._toggle_gradient)
+        # Black on a light capsule, white on a dark one (macOS "Contrast").
+        self._contrast = QCheckBox(i18n.tr("settings_color_contrast"))
+        self._contrast.setChecked(spec.is_contrast)
+        self._contrast.toggled.connect(self._toggle_contrast)
 
         row.addWidget(self._start_button, 1)
+        row.addWidget(self._contrast)
         row.addWidget(self._gradient)
         row.addWidget(self._end_button, 1)
         self._refresh()
 
     def _refresh(self) -> None:
-        self._start_button.setText(self._spec.start.upper())
-        self._start_button.setIcon(icons.swatch(self._spec.start, 13))
-        gradient = self._spec.is_gradient
+        contrast = self._spec.is_contrast
+        self._start_button.setEnabled(not contrast)
+        self._gradient.setEnabled(not contrast)
+        if contrast:
+            self._start_button.setText(i18n.tr("settings_color_contrast"))
+            self._start_button.setIcon(icons.swatch("#808080", 13))
+        else:
+            self._start_button.setText(self._spec.start.upper())
+            self._start_button.setIcon(icons.swatch(self._spec.start, 13))
+        gradient = self._spec.is_gradient and not contrast
         self._end_button.setVisible(gradient)
         if gradient:
             self._end_button.setText(str(self._spec.end).upper())
@@ -125,6 +139,18 @@ class ColorField(QWidget):
                                    self._spec.end or _shifted(self._spec.start))
         else:
             self._spec = ColorSpec(self._spec.start)
+        self._refresh()
+
+    def _toggle_contrast(self, enabled: bool) -> None:
+        if enabled:
+            self._remembered = self._spec
+            self._spec = ColorSpec(CONTRAST_COLOR)
+            self._gradient.setChecked(False)
+        else:
+            previous = getattr(self, "_remembered", None)
+            self._spec = (previous if previous is not None and not previous.is_contrast
+                          else ColorSpec("#ffffff"))
+            self._gradient.setChecked(self._spec.is_gradient)
         self._refresh()
 
     def _pick(self, *, is_end: bool) -> None:
@@ -458,6 +484,16 @@ class SettingsWindow(QDialog):
         self._color_row(hud, "settings_hud_transcribing_color",
                         "hud_transcribing_color", AccentColor.BLUE,
                         hint=i18n.tr("settings_color_hint"))
+        self._color_row(hud, "settings_hud_correcting_color",
+                        "hud_correcting_color", AccentColor.PURPLE,
+                        hint=i18n.tr("settings_hud_correcting_hint"))
+        self._hud_background = self._combo(
+            hud, "settings_hud_background", "hud_background_style",
+            [(HUDBackgroundStyle.SYSTEM.value, i18n.tr("settings_hud_background_system")),
+             (HUDBackgroundStyle.DARK.value, i18n.tr("settings_hud_background_dark")),
+             (HUDBackgroundStyle.LIGHT.value, i18n.tr("settings_hud_background_light"))],
+            hint=i18n.tr("settings_hud_background_hint"),
+        )
         self._live_preview = self._checkbox(
             hud, "settings_live_preview", "live_preview",
             i18n.tr("settings_live_preview_hint"))

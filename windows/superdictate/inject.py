@@ -175,6 +175,21 @@ def clear_stuck_modifiers() -> list[int]:
     return stray
 
 
+# An unassigned virtual key: no app binds it, no keyboard layout maps it.
+VK_UNASSIGNED = 0xE8
+
+
+def nudge_foreground_lock() -> None:
+    """Make this process the last one to have sent input.
+
+    Windows lets only that process (or the foreground owner) move the
+    foreground, which is what returning to the dictation's window needs.
+    The key chosen does nothing anywhere, and the marker keeps our own
+    hook from seeing it.
+    """
+    _send([_make_input(VK_UNASSIGNED), _make_input(VK_UNASSIGNED, key_up=True)])
+
+
 # -- clipboard -----------------------------------------------------------
 
 

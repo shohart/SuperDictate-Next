@@ -55,6 +55,12 @@ if (-not $SkipEngines) {
     if ($LASTEXITCODE) { throw "build-engines failed." }
 }
 
+# comtypes writes its UI Automation wrappers into comtypes.gen the first
+# time they are asked for. A frozen app cannot write there, so they are
+# generated now and bundled (SuperDictate.spec lists them).
+& $python -c "import comtypes.client; comtypes.client.GetModule('UIAutomationCore.dll')"
+if ($LASTEXITCODE -ne 0) { throw "Could not generate the UI Automation wrappers." }
+
 Write-Host "Packaging with PyInstaller..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm SuperDictate.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }

@@ -310,6 +310,24 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_hud_size_large": ("Крупный", "Large"),
     "settings_hud_recording_color": ("Цвет записи", "Recording color"),
     "settings_hud_transcribing_color": ("Цвет расшифровки", "Transcribing color"),
+    "settings_hud_correcting_color": ("Цвет улучшения текста", "Improving color"),
+    "settings_hud_correcting_hint": (
+        "Пока ИИ исправляет или переписывает текст, полоски перетекают из "
+        "цвета расшифровки в этот цвет.",
+        "While the AI corrects or rewrites the text, the bars flow from the "
+        "transcribing colour into this one.",
+    ),
+    "settings_hud_background": ("Фон капсулы", "Capsule background"),
+    "settings_hud_background_system": ("Как в системе", "System"),
+    "settings_hud_background_dark": ("Тёмный", "Dark"),
+    "settings_hud_background_light": ("Светлый", "Light"),
+    "settings_hud_background_hint": (
+        "«Как в системе» следует теме приложений Windows (Параметры → "
+        "Персонализация → Цвета).",
+        "\"System\" follows the Windows app theme (Settings → "
+        "Personalization → Colors).",
+    ),
+    "settings_color_contrast": ("Контрастный", "Contrast"),
     "settings_color_gradient": ("Градиент", "Gradient"),
     "settings_color_pick": ("Выбор цвета", "Pick a color"),
     "settings_color_hint": (
@@ -319,6 +337,18 @@ _STRINGS: dict[str, tuple[str, str]] = {
         "filled with a ramp between the two.",
     ),
     "settings_history_limit": ("Быстрая история", "Quick history"),
+    "paste_target_gone": (
+        "Окно, в котором вы начали диктовку ({app}), закрыто. Текст "
+        "скопирован в буфер обмена — вставьте его Ctrl+V.",
+        "The window you started dictating in ({app}) has closed. The text "
+        "is on the clipboard — paste it with Ctrl+V.",
+    ),
+    "paste_target_unreachable": (
+        "Не удалось вернуться в окно, где началась диктовка ({app}). Текст "
+        "скопирован в буфер обмена — вставьте его Ctrl+V.",
+        "Could not return to the window the dictation started in ({app}). "
+        "The text is on the clipboard — paste it with Ctrl+V.",
+    ),
     "settings_history_off": ("Выключена", "Off"),
     "settings_history_last": ("Последние {n}", "Last {n}"),
     "settings_speech_model": ("Модель распознавания", "Speech model"),

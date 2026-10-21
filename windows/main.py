@@ -103,6 +103,8 @@ def main(argv: list[str]) -> int:
     # coming back to. Anything wrong with the dictation itself goes to the
     # capsule instead, and is gone with it.
     controller.error_raised.connect(windows.show_system_notification)
+    controller.error_raised.connect(lambda _: windows.flash_error())
+    controller.paste_redirected.connect(windows.show_warning)
     controller.dictation_failed.connect(windows.show_dictation_failure)
     controller.transcript_ready.connect(lambda _: windows.refresh_history())
     controller.vocabulary_learned.connect(windows.show_learned_toast)
@@ -300,10 +302,16 @@ class _Windows:
         if self._hud is None:
             from superdictate.ui.hud import RecordingHUD
 
-            self._hud = RecordingHUD()
+            self._hud = RecordingHUD(self._controller.focus)
             self._hud.hover_changed.connect(self._on_hud_hover)
             self._apply_hud_settings()
         return self._hud
+
+    def flash_error(self) -> None:
+        """flashErrorFeedback: the yellow capsule, wherever the user is."""
+        if self._controller.settings.show_recording_waveform:
+            self.on_preview("")
+            self.hud.show_error()
 
     def _on_hud_hover(self, inside: bool) -> None:
         """Explain the outcome glyph in the bubble the preview text uses."""
@@ -385,6 +393,8 @@ class _Windows:
                 size=settings.hud_size,
                 recording=settings.hud_recording_color,
                 transcribing=settings.hud_transcribing_color,
+                correcting=settings.hud_correcting_color,
+                background=settings.hud_background_style,
                 display_mode=settings.hud_display_mode,
             )
 
@@ -398,17 +408,21 @@ class _Windows:
         if state is AppState.RECORDING:
             self.hud.show_recording()
             return
-        if state in (AppState.TRANSCRIBING, AppState.CORRECTING):
-            # Both are "the machine is working on it" as far as the capsule
-            # is concerned; the difference is what the tray tooltip says.
+        if state is AppState.TRANSCRIBING:
             self.hud.show_transcribing()
+            return
+        if state is AppState.CORRECTING:
+            # Its own animation, as on macOS: the transcription wave being
+            # re-written into the correcting colour, so the wait reads as
+            # "improving the text" rather than "still recognising".
+            self.hud.show_correcting()
             return
         # Idle. Both windows go now, together. The finished sentence used to
         # hold the bubble open for another couple of seconds, which made the
         # whole HUD outlive a dictation with the preview switched on and
         # vanish immediately with it switched off; the same key press should
         # not clear the screen at two different speeds.
-        if self._hud is not None and self._hud.mode != "result":
+        if self._hud is not None and self._hud.mode not in ("result", "error"):
             self._hud.hide_hud()
         self.on_preview("")
 

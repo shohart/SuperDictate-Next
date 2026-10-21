@@ -22,6 +22,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -29,7 +30,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import asr, audio, i18n, inject, system, textproc, transcription
+from . import asr, audio, focus_target, i18n, inject, system, textproc, transcription
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
@@ -75,6 +76,9 @@ class _Job:
     behavior: CompletionBehavior
     enqueued_at: float
     recovered: bool = False
+    # Resolves to the focus_target.InsertionTarget captured when the
+    # recording started: where the text goes, wherever the user is now.
+    target: Optional[Future] = None
 
 
 class DictationController(QObject):
@@ -110,6 +114,9 @@ class DictationController(QObject):
     # A persistent "loading the model" card, shown while a cold LLM host
     # starts. Empty text dismisses it.
     loading_toast_requested = Signal(str)
+    # The window the dictation started in was closed (or would not come
+    # back): the text went to the clipboard instead of into another app.
+    paste_redirected = Signal(str)
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
@@ -150,6 +157,10 @@ class DictationController(QObject):
         self._worker: Optional[threading.Thread] = None
         self._model: Optional[asr.SpeechModel] = None
         self._preview_stop: Optional[threading.Event] = None
+        # Every focus/caret query, for the HUD and for the paste. One
+        # thread, shared, so UI Automation is only ever touched from it.
+        self.focus = focus_target.FocusProbe()
+        self._insertion_target: Optional[Future] = None
         self._terminating = False
         self.last_error: str = ""
         # What the last dictation produced, kept so the editor has
@@ -257,6 +268,7 @@ class DictationController(QObject):
         # After the worker has joined: a host torn down mid-request would
         # turn a finished dictation into a lost one.
         self.postprocessor.shutdown()
+        self.focus.close()
 
     def _prepare_model(self) -> None:
         model = asr.SpeechModel(profile=self.settings.speech_model_profile)
@@ -437,7 +449,12 @@ class DictationController(QObject):
         # muting would silence and the start cue would fill with our own tone.
         if self.settings.pause_media_while_recording:
             self.media_pause.pause()
+        # The field the user is in right now is where the text goes, even if
+        # they switch windows while speaking (PendingTextInsertionTargetStore
+        # on macOS). Captured off the Qt thread; the paste waits for it.
+        self._insertion_target = self.focus.capture()
         if not self.recorder.start(self.settings.input_device):
+            self._drop_insertion_target()
             self._restore_playback()
             message = self._microphone_error_message(self.recorder.last_error or "")
             self.last_error = message
@@ -492,12 +509,14 @@ class DictationController(QObject):
             # on, so the next press emits a discarded .release and the
             # hotkey looks dead until it is pressed a third time.
             self.listener.reset_toggle()
+            self._drop_insertion_target()
             self._set_state(AppState.READY)
             self.dictation_failed.emit("clock", i18n.tr("error_too_short"))
             return
 
         self._set_state(AppState.TRANSCRIBING)
-        self._jobs.put(_Job(samples, behavior, time.monotonic()))
+        target, self._insertion_target = self._insertion_target, None
+        self._jobs.put(_Job(samples, behavior, time.monotonic(), target=target))
 
     def cancel_recording(self) -> None:
         if self.state is not AppState.RECORDING:
@@ -506,6 +525,7 @@ class DictationController(QObject):
         self.recorder.discard()
         self._restore_playback()
         self.listener.reset_toggle()
+        self._drop_insertion_target()
         self._set_state(AppState.READY)
         log.info("Recording cancelled")
 
@@ -681,11 +701,46 @@ class DictationController(QObject):
             return
 
         payload = text + self.settings.paste_suffix.text
+        if not self._return_to_target(job, payload):
+            return
         inject.paste_text(
             payload,
             press_enter=job.behavior.presses_enter,
             enter_delay_ms=self.settings.enter_delay_milliseconds,
         )
+
+    def _return_to_target(self, job: _Job, payload: str) -> bool:
+        """Back to the field the dictation began in. False: do not paste.
+
+        The macOS rule (textInsertionRoute): a target that is still there
+        gets the text even if the user has moved on; one that is gone gets
+        nothing, because "whatever is in front now" is exactly the wrong
+        place. The text is not lost — it is on the clipboard.
+        """
+        target = None
+        if job.target is not None:
+            try:
+                target = job.target.result(timeout=1.0)
+            except Exception as exc:
+                log.warning("Insertion target was not captured: %s", exc)
+        if target is None:
+            return True
+        outcome = self.focus.restore(target)
+        if outcome in (focus_target.RestoreOutcome.TARGET_GONE,
+                       focus_target.RestoreOutcome.NOT_ACTIVATED):
+            inject.write_clipboard_text(payload)
+            key = ("paste_target_gone"
+                   if outcome is focus_target.RestoreOutcome.TARGET_GONE
+                   else "paste_target_unreachable")
+            self.paste_redirected.emit(i18n.tr(key, app=target.process))
+            return False
+        return True
+
+    def _drop_insertion_target(self) -> None:
+        pending, self._insertion_target = self._insertion_target, None
+        if pending is not None:
+            pending.add_done_callback(
+                lambda done: self.focus.release(done.result()) if not done.exception() else None)
 
     def _postprocessed(self, text: str) -> str:
         """Run the enabled LLM stages, or return ``text`` untouched.

@@ -32,19 +32,16 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .editor import _take_foreground
 from .hud import (
     ANIMATE_IN_SECONDS,
     ANIMATE_OUT_SECONDS,
-    BOTTOM_MARGIN,
-    BUBBLE_TEXT,
-    CAPSULE_BORDER,
-    CAPSULE_FILL,
-    _clamped_to_screen,
     _cursor_position,
+    bubble_corner,
+    palette,
 )
 
 # Enough to cover "the thing I said a moment ago and the few before it".
@@ -61,10 +58,8 @@ GAP = 9
 
 # The selected bubble is lifted out of the stack rather than outlined in a
 # colour: the accent already belongs to the capsule's bars, and a coloured
-# ring around one bubble made the stack look like an error state.
-SELECTED_FILL = QColor(58, 58, 62, 236)
-SELECTED_BORDER = QColor(255, 255, 255, 92)
-DIM_TEXT = QColor(236, 236, 240, 140)
+# ring around one bubble made the stack look like an error state. The
+# lifted shades live in the capsule palette, light or dark.
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 user32.GetForegroundWindow.restype = wt.HWND
@@ -270,16 +265,7 @@ class BubbleHistory(QWidget):
         count = max(1, len(self._entries))
         height = count * ROW_HEIGHT + (count - 1) * ROW_SPACING
 
-        if self._anchor is not None and self._anchor.isVisible():
-            capsule = self._anchor.geometry()
-            bottom = capsule.top() - GAP
-            centre_x = capsule.center().x()
-        else:
-            bottom = area.bottom() - BOTTOM_MARGIN
-            centre_x = area.center().x()
-        corner = _clamped_to_screen(
-            QPoint(int(centre_x - width // 2), int(bottom - height)),
-            width, height)
+        corner = bubble_corner(self._anchor, width, height, GAP)
         self.setGeometry(QRect(corner.x(), corner.y(), width, height))
 
         # Each bubble keeps its own width and is centred, so the stack
@@ -296,6 +282,7 @@ class BubbleHistory(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         metrics = self.fontMetrics()
+        colors = palette()
 
         for index, rect in enumerate(self._rows):
             selected = index == self._selected
@@ -303,8 +290,8 @@ class BubbleHistory(QWidget):
             radius = body.height() / 2.0
             path = QPainterPath()
             path.addRoundedRect(body, radius, radius)
-            painter.fillPath(path, SELECTED_FILL if selected else CAPSULE_FILL)
-            painter.setPen(QPen(SELECTED_BORDER if selected else CAPSULE_BORDER,
+            painter.fillPath(path, colors.selected_fill if selected else colors.fill)
+            painter.setPen(QPen(colors.selected_border if selected else colors.border,
                                 1.0))
             painter.drawPath(path)
 
@@ -314,7 +301,7 @@ class BubbleHistory(QWidget):
             text = metrics.elidedText(self._entries[index],
                                       Qt.TextElideMode.ElideRight,
                                       int(inner.width()))
-            painter.setPen(BUBBLE_TEXT if selected else DIM_TEXT)
+            painter.setPen(colors.text if selected else colors.dim_text)
             painter.drawText(inner,
                              Qt.AlignmentFlag.AlignLeft
                              | Qt.AlignmentFlag.AlignVCenter,

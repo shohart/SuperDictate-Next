@@ -28,7 +28,6 @@ from typing import Optional
 from PySide6.QtCore import (
     Property,
     QEvent,
-    QPoint,
     QPropertyAnimation,
     QRect,
     QRectF,
@@ -47,12 +46,9 @@ from PySide6.QtWidgets import QApplication, QTextEdit, QWidget
 from .hud import (
     ANIMATE_IN_SECONDS,
     ANIMATE_OUT_SECONDS,
-    BOTTOM_MARGIN,
-    BUBBLE_TEXT,
-    CAPSULE_BORDER,
-    CAPSULE_FILL,
-    _clamped_to_screen,
     _cursor_position,
+    bubble_corner,
+    palette,
 )
 
 # Wide enough that correcting a word does not reflow the whole sentence,
@@ -68,7 +64,6 @@ MAX_LINES = 6
 # The same gap the preview bubble leaves above the capsule.
 GAP = 9
 CORNER_RADIUS = 16
-SELECTION_FILL = "#3f5f9e"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -166,15 +161,7 @@ class TranscriptEditor(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._field.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._field.setStyleSheet(
-            "QTextEdit {"
-            " background: transparent;"
-            " border: none;"
-            f" color: {BUBBLE_TEXT.name()};"
-            f" selection-background-color: {SELECTION_FILL};"
-            f" selection-color: {BUBBLE_TEXT.name()};"
-            " }"
-        )
+        self._apply_palette()
         self._field.document().setDocumentMargin(0)
         # Centred, like the preview bubble's text and the capsule's bars.
         # Left-aligned text in a bubble sized to the text puts the last
@@ -195,6 +182,19 @@ class TranscriptEditor(QWidget):
 
         self._fade = QPropertyAnimation(self, b"fadeOpacity", self)
         self._fade.finished.connect(self._fade_finished)
+
+    def _apply_palette(self) -> None:
+        """Light or dark, the same as the capsule under it."""
+        colors = palette()
+        self._field.setStyleSheet(
+            "QTextEdit {"
+            " background: transparent;"
+            " border: none;"
+            f" color: {colors.text.name()};"
+            f" selection-background-color: {colors.selection.name()};"
+            f" selection-color: {colors.text.name()};"
+            " }"
+        )
 
     def set_anchor(self, anchor: QWidget) -> None:
         self._anchor = anchor
@@ -218,6 +218,7 @@ class TranscriptEditor(QWidget):
         self._settled = False
         self._previous_window = int(user32.GetForegroundWindow() or 0)
         self._width = self._preferred_width(text)
+        self._apply_palette()
 
         self._field.blockSignals(True)
         self._field.setPlainText(text)
@@ -306,17 +307,7 @@ class TranscriptEditor(QWidget):
                                     int(document.size().height()) + 1))
         height = text_height + PADDING_Y * 2
 
-        area = self._screen().availableGeometry()
-        if self._anchor is not None and self._anchor.isVisible():
-            capsule = self._anchor.geometry()
-            bottom = capsule.top() - GAP
-            centre_x = capsule.center().x()
-        else:
-            bottom = area.bottom() - BOTTOM_MARGIN
-            centre_x = area.center().x()
-        corner = _clamped_to_screen(
-            QPoint(int(centre_x - self._width // 2), int(bottom - height)),
-            self._width, height)
+        corner = bubble_corner(self._anchor, self._width, height, GAP)
         self.setGeometry(QRect(corner.x(), corner.y(), self._width, height))
         self._field.ensureCursorVisible()
 
@@ -335,7 +326,8 @@ class TranscriptEditor(QWidget):
         radius = min(CORNER_RADIUS, rect.height() / 2.0)
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
-        painter.fillPath(path, CAPSULE_FILL)
-        painter.setPen(QPen(CAPSULE_BORDER, 1.0))
+        colors = palette()
+        painter.fillPath(path, colors.fill)
+        painter.setPen(QPen(colors.border, 1.0))
         painter.drawPath(path)
         painter.end()
