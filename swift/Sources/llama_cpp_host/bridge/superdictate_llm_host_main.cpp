@@ -42,6 +42,7 @@
 #include <chrono>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -193,6 +194,7 @@ struct GenerationResult {
     std::string error;
     std::string content;
     int32_t     prompt_tokens = 0;
+    int32_t     prompt_tokens_reused = 0;   // restored from the prefix snapshot
     int32_t     completion_tokens = 0;
 };
 
@@ -227,6 +229,19 @@ public:
         // same CPU-only behavior this host always had, backend-registered-
         // but-unused Vulkan support notwithstanding).
         params.n_gpu_layers = cfg.n_gpu_layers;
+        if (cfg.n_gpu_layers == 0) {
+            // CPU-only must mean no GPU at all. With zero layers offloaded,
+            // llama.cpp still sends large batches (the whole prompt) to any
+            // compiled-in GPU backend ("op offload") -- a 688 MiB Vulkan
+            // compute buffer was allocated for it with --gpu-layers 0, and
+            // prompts ran on the GPU. That defeats the CPU fallback for a
+            // GPU that computes wrong (NaN logits from MoltenVK on a Radeon
+            // Instinct MI50 / Vega 20) and made a Windows run with an
+            // integrated GPU minutes slower. An empty device list keeps the
+            // GPU out of the model, and no_op_offload out of the context.
+            params.devices = { nullptr };
+            params.no_op_offload = true;
+        }
         const int32_t resolved_threads =
             cfg.n_threads > 0 ? cfg.n_threads : static_cast<int32_t>(std::thread::hardware_concurrency());
         params.cpuparams.n_threads = resolved_threads;
@@ -324,21 +339,72 @@ public:
             return out;
         }
 
-        // Reset KV cache + sampler state: each request is an independent,
-        // stateless single-turn completion -- this process serves many
-        // unrelated dictation segments over its lifetime, never a
-        // multi-turn conversation.
+        // Each request is an independent, stateless single-turn completion
+        // -- this process serves many unrelated dictation segments over its
+        // lifetime, never a multi-turn conversation -- so the sampler and
+        // the memory start clean every time.
+        //
+        // What the requests do share is their opening: the correction
+        // system prompt and its few-shot turns are ~270 of the ~295 prompt
+        // tokens, identical for every sentence. Decoding them once and
+        // restoring that state saves most of the prompt work. The model is
+        // a hybrid (Qwen3.5: recurrent + attention layers), whose memory
+        // cannot be trimmed back to a prefix with llama_memory_seq_rm, so
+        // the prefix is kept as a full sequence-state snapshot
+        // (llama_state_seq_get_data) and restored with
+        // llama_state_seq_set_data. Measured with llama.cpp b11826 on a
+        // Core Ultra 5 225H CPU, 65-sentence correction corpus: p50 0.75 s
+        // -> 0.32 s per sentence, identical outputs (65/65).
+        //
+        // The prefix is learned, not configured: it is the part of this
+        // prompt shared with the previous one. The first request after a
+        // start decodes in full; the second snapshots the shared part;
+        // every later one restores it and decodes only its own sentence. A
+        // changed system prompt (custom prompt, other stage) simply makes
+        // the snapshot miss and be taken again at the new shared length.
+        common_sampler_reset(sampler_);
         llama_memory_t mem = llama_get_memory(ctx_);
         llama_memory_seq_rm(mem, 0, -1, -1);
-        common_sampler_reset(sampler_);
+
+        size_t shared = 0;
+        while (prefix_reuse_enabled_ && shared < tokens.size() && shared < previous_tokens_.size() &&
+               tokens[shared] == previous_tokens_[shared]) {
+            shared++;
+        }
 
         int n_past = 0;
-        if (!common_prompt_batch_decode(ctx_, tokens, static_cast<int>(tokens.size()), n_past,
-                                        llama_n_batch(ctx_), "", false)) {
+        if (prefix_len_ > 0 && shared >= prefix_len_ && tokens.size() > prefix_len_ &&
+            llama_state_seq_set_data(ctx_, prefix_state_.data(), prefix_state_.size(), 0) ==
+                prefix_state_.size()) {
+            n_past = static_cast<int>(prefix_len_);
+        } else {
+            llama_memory_seq_rm(mem, 0, -1, -1);  // a failed restore may leave part of it
+            prefix_state_.clear();
+            prefix_len_ = 0;
+            if (shared >= kMinPrefixTokens && shared < tokens.size()) {
+                if (llama_decode(ctx_, llama_batch_get_one(tokens.data(), static_cast<int32_t>(shared)))) {
+                    out.error = "prompt decode failed";
+                    return out;
+                }
+                n_past = static_cast<int>(shared);
+                const size_t size = llama_state_seq_get_size(ctx_, 0);
+                prefix_state_.resize(size);
+                if (size > 0 && llama_state_seq_get_data(ctx_, prefix_state_.data(), size, 0) == size) {
+                    prefix_len_ = shared;
+                } else {
+                    prefix_state_.clear();
+                }
+            }
+        }
+        previous_tokens_ = tokens;
+
+        const int n_rest = static_cast<int>(tokens.size()) - n_past;
+        if (!common_prompt_batch_decode(ctx_, tokens, n_rest, n_past, llama_n_batch(ctx_), "", false)) {
             out.error = "prompt decode failed";
             return out;
         }
         out.prompt_tokens = static_cast<int32_t>(tokens.size());
+        out.prompt_tokens_reused = static_cast<int32_t>(tokens.size()) - n_rest;
 
         std::string content;
         for (int32_t i = 0; i < max_new; ++i) {
@@ -373,6 +439,17 @@ private:
     common_chat_templates_ptr  templates_;
     int32_t                    n_ctx_ = 0;
     std::mutex                 mutex_;
+    // Prompt-prefix reuse (see generate()). A shorter shared opening is not
+    // worth a snapshot: the copy would cost more than the tokens it saves.
+    static constexpr size_t    kMinPrefixTokens = 32;
+    // SUPERDICTATE_LLM_PREFIX_REUSE=0 turns it off, for A/B measurements.
+    const bool                 prefix_reuse_enabled_ = [] {
+        const char * v = std::getenv("SUPERDICTATE_LLM_PREFIX_REUSE");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    std::vector<llama_token>   previous_tokens_;
+    std::vector<uint8_t>       prefix_state_;
+    size_t                     prefix_len_ = 0;
 };
 
 sdlh_json make_error_json(const std::string & message) {
@@ -531,6 +608,8 @@ int main(int argc, char ** argv) {
             {"prompt_tokens", gen.prompt_tokens},
             {"completion_tokens", gen.completion_tokens},
             {"total_tokens", gen.prompt_tokens + gen.completion_tokens},
+            // OpenAI's own field for prompt tokens served from a cache.
+            {"prompt_tokens_details", sdlh_json{{"cached_tokens", gen.prompt_tokens_reused}}},
         };
         res.set_content(resp.dump(), "application/json");
     });
