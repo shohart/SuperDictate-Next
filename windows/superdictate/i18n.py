@@ -16,6 +16,8 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "status_starting": ("Запуск…", "Starting…"),
     "status_downloading": ("Загрузка модели", "Downloading model"),
     "status_loading": ("Загрузка модели в память", "Loading model"),
+    "status_loading_npu": ("Подготовка модели для NPU (в первый раз — до 5 минут)",
+                           "Preparing the model for the NPU (up to 5 minutes the first time)"),
     "status_ready": ("Работает", "Ready"),
     "status_recording": ("Запись", "Recording"),
     "status_correcting": ("Обработка текста", "Post-processing"),
@@ -357,12 +359,26 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_model_gigaam_v3": ("GigaAM v3 · только русский",
                                  "GigaAM v3 · Russian only"),
     "settings_speech_model_hint": (
-        "Распознавание идёт на процессоре, как и на macOS. GigaAM заметно "
-        "точнее на русском, но других языков не знает. Модель скачивается "
-        "при первом выборе (~600 / ~220 МБ).",
-        "Recognition runs on the CPU, as on macOS. GigaAM is noticeably more "
-        "accurate on Russian but knows no other language. The model "
-        "downloads the first time it is chosen (~600 / ~220 MB)."),
+        "GigaAM заметно точнее на русском, но других языков не знает. "
+        "Модель скачивается при первом выборе (~600 / ~220 МБ).",
+        "GigaAM is noticeably more accurate on Russian but knows no other "
+        "language. The model downloads the first time it is chosen "
+        "(~600 / ~220 MB)."),
+    "settings_speech_backend": ("Где распознавать", "Recognition runs on"),
+    "settings_speech_backend_cpu": ("Процессор", "CPU"),
+    "settings_speech_backend_npu": ("Нейропроцессор · {name}", "NPU · {name}"),
+    "settings_speech_backend_hint": (
+        "На нейропроцессоре Intel распознавание не нагружает процессор и "
+        "расходует меньше батареи. Для него скачивается своя сборка модели "
+        "(Parakeet ~1,2 ГБ, GigaAM ~220 МБ). При первом запуске модель "
+        "компилируется под NPU — это занимает до 5 минут, дальше загрузка "
+        "идёт за секунды. Если NPU не заработает, распознавание останется "
+        "на процессоре.",
+        "On the Intel NPU, recognition leaves the CPU free and uses less "
+        "battery. It downloads its own build of the model (Parakeet "
+        "~1.2 GB, GigaAM ~220 MB). The first start compiles the model for "
+        "the NPU, which takes up to 5 minutes; after that it loads in "
+        "seconds. If the NPU fails, recognition stays on the CPU."),
     "settings_save_restart": ("Сохранить и перезапустить", "Save and restart"),
     "settings_cancel": ("Отмена", "Cancel"),
 

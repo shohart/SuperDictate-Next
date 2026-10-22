@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "comment": "OpenVINO IR speech models for the Intel NPU (SuperDictateOvHost). Same rules as onnx-models.json: pinned revisions, sizes and SHA-256; nothing resolved at run time.",
+  "models": [
+    {
+      "model_id": "parakeet-tdt-0.6b-v3-ov",
+      "display_name": "Parakeet TDT 0.6B v3 (OpenVINO, NPU)",
+      "family": "nemo_tdt_ov",
+      "source": "https://huggingface.co/VoiceScribe/voicescribe-parakeet",
+      "revision": "2cf18a954b8448fa3153792d7a7c427b6bcc59d0",
+      "upstream": "FluidInference/parakeet-tdt-0.6b-v3-ov@dfd55eb6c85a9a8546a162bed84784245d5743c2",
+      "base_model": "nvidia/parakeet-tdt-0.6b-v3",
+      "license": "CC-BY-4.0",
+      "attribution": "NVIDIA (parakeet-tdt-0.6b-v3), FluidInference (OpenVINO conversion), Voice Scribe (mirror)",
+      "files": {
+        "preprocessor": {
+          "path": "parakeet_melspectogram.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_melspectogram.xml",
+          "size": 49228,
+          "sha256": "720a6f85ec6ed40571366af5335d55497ed06eeb4377528406849ca334176f8d"
+        },
+        "preprocessor_weights": {
+          "path": "parakeet_melspectogram.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_melspectogram.bin",
+          "size": 477078,
+          "sha256": "a20c3299f863b03ccb0b91465fd02f1d5eddd749bc44418e3674e7a6b88b1116"
+        },
+        "encoder": {
+          "path": "parakeet_encoder.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_encoder.xml",
+          "size": 2087748,
+          "sha256": "bc7369ef23f15e2f40049c808419f0cf33a996f546f678f3058eb29b1d54344b"
+        },
+        "encoder_weights": {
+          "path": "parakeet_encoder.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_encoder.bin",
+          "size": 1185869036,
+          "sha256": "52999e4ed1595470a80b9e0666ddcf9948c0b36f437967cb319c5c332c13e88e"
+        },
+        "decoder": {
+          "path": "parakeet_decoder.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_decoder.xml",
+          "size": 35652,
+          "sha256": "56f7b82cd7b92f015f015f127c03244a13b157f3fef9dd931ae8e598fa892e56"
+        },
+        "decoder_weights": {
+          "path": "parakeet_decoder.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_decoder.bin",
+          "size": 23604560,
+          "sha256": "d32d703eed045f38564362b3f07a2405ff274b192001b9088d363b7b832edf8d"
+        },
+        "joiner": {
+          "path": "parakeet_joint.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_joint.xml",
+          "size": 13798,
+          "sha256": "40eed670feca317031450f9700f3813b2e7d3d634780a6ca418ee5d09c8ab56c"
+        },
+        "joiner_weights": {
+          "path": "parakeet_joint.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_joint.bin",
+          "size": 12642332,
+          "sha256": "e88f298ad8ca8d90ff50b0147281a3ca8cf677550619513c0013a3160b57f001"
+        },
+        "tokens": {
+          "path": "parakeet_vocab.json",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-parakeet/resolve/2cf18a954b8448fa3153792d7a7c427b6bcc59d0/parakeet_vocab.json",
+          "size": 119760,
+          "sha256": "8a98bc7de07683588c8bd420a57b38c8842d8d860085d9e8f788f975dda36ca8"
+        }
+      }
+    },
+    {
+      "model_id": "gigaam-v3-e2e-rnnt-ov-npu",
+      "display_name": "GigaAM v3 e2e RNN-T (OpenVINO, NPU, Russian)",
+      "family": "gigaam_rnnt_ov",
+      "source": "https://huggingface.co/VoiceScribe/voicescribe-gigaam-npu",
+      "revision": "b938c8cf2f6f1f6b52699244d5ce808f06f22f39",
+      "upstream": "Andrewsab/gigaam-v3-e2e-rnnt-ov-npu@1ce5e166d15d92f8b78c3d376c8052abd066ec7f (encoder), VoiceScribe/voicescribe-gigaam@4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33 (decoder, joint, tokenizer)",
+      "base_model": "ai-sage/GigaAM-v3 (e2e_rnnt)",
+      "license": "MIT",
+      "attribution": "SberDevices / GigaChat Team (GigaAM v3), Andrewsab (OpenVINO + NPU calibration), Voice Scribe (mirror)",
+      "files": {
+        "encoder": {
+          "path": "v3_e2e_rnnt_encoder_static.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam-npu/resolve/b938c8cf2f6f1f6b52699244d5ce808f06f22f39/v3_e2e_rnnt_encoder_static.xml",
+          "size": 2669957,
+          "sha256": "15a6a822b87e592cfebd2068319b0a41c30802513bf28040f92cf6d2a58d039b"
+        },
+        "encoder_weights": {
+          "path": "v3_e2e_rnnt_encoder_static.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam-npu/resolve/b938c8cf2f6f1f6b52699244d5ce808f06f22f39/v3_e2e_rnnt_encoder_static.bin",
+          "size": 224705282,
+          "sha256": "d77c4c798ab701d2e819bdf5a768ed07a973b59089ceb1be498acdc7354d9337"
+        },
+        "decoder": {
+          "path": "v3_e2e_rnnt_decoder.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam/resolve/4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33/v3_e2e_rnnt_decoder.xml",
+          "size": 17648,
+          "sha256": "d4ab6b9fb31c455d15b5cbbb9d1e4630fcaee0ef4e215b4d6d6e8cf4e06a3a99"
+        },
+        "decoder_weights": {
+          "path": "v3_e2e_rnnt_decoder.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam/resolve/4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33/v3_e2e_rnnt_decoder.bin",
+          "size": 2297032,
+          "sha256": "2c2ba6cc1e7e1263ed220a98151ea3f1c9423be776d8b3a63e59284112746a07"
+        },
+        "joiner": {
+          "path": "v3_e2e_rnnt_joint.xml",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam/resolve/4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33/v3_e2e_rnnt_joint.xml",
+          "size": 13726,
+          "sha256": "4f039cbd7848ca8fcc0359853e4f59c37ca4a769b8a732975242e27ea3b8d269"
+        },
+        "joiner_weights": {
+          "path": "v3_e2e_rnnt_joint.bin",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam/resolve/4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33/v3_e2e_rnnt_joint.bin",
+          "size": 1355666,
+          "sha256": "2249d6b447c773706f6a1211637db0646662711f9ce19738510c006a01b10dc4"
+        },
+        "tokens": {
+          "path": "tokenizer.model",
+          "url": "https://huggingface.co/VoiceScribe/voicescribe-gigaam/resolve/4ebe33418d1dc81dcf5c375f3e40ed2dfb306b33/tokenizer.model",
+          "size": 255336,
+          "sha256": "828c12c991019eef952a960661f25a92d6ad279591e2ea466b4aeddf1d20a18a"
+        }
+      }
+    }
+  ]
+}

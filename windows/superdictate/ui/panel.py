@@ -301,11 +301,18 @@ class ControlPanel(QMainWindow):
             if settings.speech_model_profile == asr.PROFILE_GIGAAM_V3
             else "settings_model_parakeet_ultra"))
         model = getattr(self._controller, "_model", None)
+        if (state is AppState.LOADING and model is not None
+                and model.backend == asr.BACKEND_NPU):
+            self._status_text.setText(i18n.tr("status_loading_npu"))
         if model is not None and model.active_providers:
+            providers = ", ".join(model.active_providers).upper()
+            # Threads are a CPU setting; the NPU has none to show.
             self._compute_label.setText(
-                f"{', '.join(model.active_providers).upper()} · {model.threads}")
+                providers if providers == "NPU" else f"{providers} · {model.threads}")
+            self._compute_label.setToolTip(model.fallback_reason)
         else:
             self._compute_label.setText("-")
+            self._compute_label.setToolTip("")
         self._microphone_label.setText(
             settings.input_device or i18n.tr("settings_device_default"))
         self._stats.refresh()

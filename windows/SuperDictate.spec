@@ -15,11 +15,18 @@ imports ONNX Runtime.
 The speech model is NOT bundled. It is ~600 MB, it is licensed
 separately, and the app already downloads it on first run with a progress
 bar into %LOCALAPPDATA%\\SuperDictate\\Models\\onnx.
+
+Recognition on the Intel NPU runs in a second executable,
+SuperDictateOvHost.exe (ov_host_main.py): OpenVINO and the NPU builds of
+the models (assets/openvino-models.json, downloaded into Models\\openvino).
+It is a console program because it speaks binary frames on stdin/stdout;
+the app starts it with CREATE_NO_WINDOW. Both executables share one folder.
 """
 
 import os
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata  # noqa: F401
+from PyInstaller.utils.hooks import (collect_data_files, collect_dynamic_libs,  # noqa: F401
+                                     copy_metadata)
 
 if not os.path.isfile(os.path.join("onnx-asr", "SuperDictateOnnxHost.exe")):
     raise SystemExit("onnx-asr\\ is not staged: run tools\\build-onnx-host.ps1 first")
@@ -33,6 +40,8 @@ datas += [("assets/SuperDictate.png", "assets")]
 datas += [("assets/record-start.wav", "assets"),
           ("assets/record-stop.wav", "assets")]
 datas += [("onnx-asr", "onnx-asr")]
+# The pinned catalog of the NPU models (onnx_models.openvino_catalog_path).
+datas += [("assets/openvino-models.json", "assets")]
 # silero-vad.dll, and in experimental builds superdictate-llm-host.exe,
 # built by tools/build-engines.ps1 from the vendored macOS sources.
 # Optional: without the VAD, seams fall back to mel energy. Release builds
@@ -74,11 +83,66 @@ a = Analysis(
         "PySide6.QtDataVisualization", "PySide6.QtPdf", "PySide6.QtSql",
         "PySide6.QtTest", "PySide6.QtDesigner",
         "tkinter", "unittest", "pydoc_data",
+        # OpenVINO belongs to SuperDictateOvHost alone; the app only starts it.
+        "openvino", "openvino_telemetry",
     ],
     noarchive=False,
 )
 
 pyz = PYZ(a.pure)
+
+# -- SuperDictateOvHost.exe ----------------------------------------------
+#
+# OpenVINO finds its plugins next to openvino.dll, so its libraries keep
+# their openvino\libs layout. Only what the NPU path loads is kept: the
+# core, the CPU and NPU plugins with the NPU compiler, the IR reader and
+# TBB. The GPU plugin and the ONNX/TF/PyTorch/Paddle/JAX/GGUF frontends
+# (~50 MB) are never touched.
+_OPENVINO_UNUSED = (
+    "openvino_intel_gpu_plugin", "openvino_onnx_frontend", "openvino_tensorflow_frontend",
+    "openvino_tensorflow_lite_frontend", "openvino_pytorch_frontend",
+    "openvino_paddle_frontend", "openvino_jax_frontend", "openvino_gguf_frontend",
+)
+
+
+def _openvino_needed(entry) -> bool:
+    name = os.path.basename(entry[0]).lower()
+    return not any(name.startswith(prefix) for prefix in _OPENVINO_UNUSED)
+
+
+ov_binaries = [b for b in collect_dynamic_libs("openvino") if _openvino_needed(b)]
+
+ov = Analysis(
+    ["ov_host_main.py"],
+    pathex=[],
+    binaries=ov_binaries,
+    datas=[],
+    hiddenimports=["superdictate.openvino_asr"],
+    hookspath=[],
+    runtime_hooks=[],
+    # The converter (openvino.tools) and its telemetry are for building IR,
+    # not for running it.
+    excludes=["PySide6", "openvino.tools", "openvino_telemetry",
+              "tkinter", "unittest", "pydoc_data"],
+    noarchive=False,
+)
+ov.binaries = [b for b in ov.binaries if _openvino_needed(b)]
+ov_pyz = PYZ(ov.pure)
+
+ov_exe = EXE(
+    ov_pyz,
+    ov.scripts,
+    [],
+    exclude_binaries=True,
+    name="SuperDictateOvHost",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,           # real stdin/stdout for the IPC frames
+    disable_windowed_traceback=False,
+    icon="assets/SuperDictate.ico",
+)
 
 exe = EXE(
     pyz,
@@ -99,6 +163,9 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    ov_exe,
+    ov.binaries,
+    ov.datas,
     strip=False,
     upx=False,
     name="SuperDictate",

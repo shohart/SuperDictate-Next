@@ -30,6 +30,27 @@ Python + PySide6 вместо Swift + AppKit, но поведение и име�
 Видеокарта отдана языковой модели: Parakeet на ней не выигрывает, а
 постобработка ускоряется в разы.
 
+**Нейропроцессор Intel (NPU).** На ноутбуках с Intel Core Ultra
+(«Intel AI Boost») в «Настройки → Дополнительно → Где распознавать»
+появляется пункт «Нейропроцессор». Там работают те же два профиля, но в
+сборках OpenVINO, во втором хосте `SuperDictateOvHost.exe`
+(`superdictate/openvino_host.py`, тот же IPC v1). Модели ставятся в
+`Models\openvino\` по своему закреплённому каталогу
+(`assets/openvino-models.json`):
+
+| профиль | модель для NPU | размер |
+|---|---|---|
+| Parakeet | [Parakeet TDT 0.6B v3, OpenVINO](https://huggingface.co/VoiceScribe/voicescribe-parakeet) | ~1,2 ГБ |
+| GigaAM | [GigaAM v3, энкодер откалиброван под NPU](https://huggingface.co/VoiceScribe/voicescribe-gigaam-npu) + декодер из [voicescribe-gigaam](https://huggingface.co/VoiceScribe/voicescribe-gigaam) | ~220 МБ |
+
+При первом запуске модель компилируется под NPU: Parakeet около 20 с,
+GigaAM около 4–5 минут. Результат кэшируется в `Models\openvino\compiled`,
+и дальше загрузка занимает 1–3 с. Компилируется встроенным в OpenVINO
+NPU-компилятором, а не драйверным: драйверный (32.0.100.3159) не
+принимает гибридный энкодер GigaAM. Если NPU не поднялся, распознавание
+остаётся на процессоре. Проверка без интерфейса:
+`python main.py --benchmark-transcribe gigaam_v3_onnx --npu файл.wav`.
+
 **Постобработка локальной языковой моделью** — то же, что на маке, теми
 же весами и теми же промптами:
 

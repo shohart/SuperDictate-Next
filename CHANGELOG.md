@@ -6,6 +6,35 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Windows 0.8.2 — 2026-10-22
+
+Windows only, tag `win-v0.8.2`. macOS stays on 0.8.0.
+
+### Added
+- **Speech recognition on the Intel NPU.** On Intel Core Ultra laptops ("Intel AI Boost"), Settings → Advanced → "Recognition runs on" offers the NPU. The option appears only where OpenVINO finds an NPU. Both profiles run there as OpenVINO builds in a second helper, `SuperDictateOvHost.exe`, which speaks the same IPC as the ONNX host:
+  - Parakeet runs as [Parakeet TDT 0.6B v3](https://huggingface.co/VoiceScribe/voicescribe-parakeet), ~1.2 GB.
+  - GigaAM runs with the [NPU-calibrated GigaAM v3 encoder](https://huggingface.co/VoiceScribe/voicescribe-gigaam-npu), ~220 MB.
+  - Downloads are pinned and checksummed like the ONNX models.
+  - The first start compiles the model for the NPU: ~20 s for Parakeet, ~4–5 min for GigaAM. After that it loads from the cache in 1–3 s.
+  - Compilation uses the NPU compiler bundled with OpenVINO 2026.4.1, not the driver's. Driver 32.0.100.3159 rejects the GigaAM encoder and crashes on its fast-compile option.
+  - If the NPU cannot be brought up, recognition stays on the CPU.
+- **Long dictations are transcribed while you speak on Windows too**, a port of the macOS recording-time transcription. Overlap windows that are already final are recognised during the recording; the release path reuses them only on an exact match (same start, length, audio checksum and loaded model). The text is identical to transcribing after release.
+- `--benchmark-transcribe <profile> --npu file.wav` runs the NPU path. Every benchmark also prints a "streamed" line: a simulated recording with recording-time transcription, compared with the batch text.
+
+### Changed
+- **Pause segments fit the model's input.** The NPU Parakeet takes 15 s at a time, so its segments are capped at 15 s; the minimum is scaled to 9 s. Every cut still lands on a pause and every seam is still placed by the VAD. Other models keep the 25 s / 15 s limits.
+
+### Validation
+- Windows 0.8.2: 59 self-tests pass, 9 of them new. They cover NPU windows and stitching, word rules, the SentencePiece reader, GigaAM features, the NPU setting and catalog, the OpenVINO host over IPC, stable recording-time windows, streamed = batch, and segment limits.
+- Tested on a Core Ultra 5 225H (NPU driver 32.0.100.3159), using Russian (10 s, 58 s) and English (11 s) test speech:
+  - Text on the NPU matches the OpenVINO CPU text word for word.
+  - The NPU runs 35–55× faster than real time.
+  - A 58 s simulated recording leaves 0.2–0.3 s of work after release: 5 of 6 windows (Parakeet) or 3 of 4 (GigaAM) are done while recording, and the text is identical to the batch path.
+- On the build PC (CPU, ONNX host), a 71 s recording leaves less work after release with recording-time transcription, and the text is identical to the batch path:
+  - Parakeet: 1.41 s instead of 4.92 s.
+  - GigaAM: 0.89 s instead of 3.69 s.
+- The installer was built on that PC, installed silently there, and its OpenVINO host was run on the NPU laptop. `SuperDictate-0.8.2-setup.exe` SHA-256: `40fceb786fc89457cae23a7a4babcaa32b613d3e47baa88f6bfea70bf025413a`.
+
 ## Windows 0.8.1 — 2026-10-21
 
 Windows only, tag `win-v0.8.1`. macOS stays on 0.8.0.

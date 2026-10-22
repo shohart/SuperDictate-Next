@@ -163,6 +163,8 @@ class OnnxHost:
         self.provider_fallback_reason = ""
         self.model_id = ""
         self.load_seconds = 0.0
+        #: Longest audio the model takes in one pass; 0 means any length.
+        self.window_seconds = 0.0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -177,12 +179,20 @@ class OnnxHost:
         }
         if expected_model_id:
             config["model_id"] = expected_model_id
+        self.create_with(config, timeout=120.0)
+
+    def create_with(self, config: dict, *, timeout: float) -> None:
+        """CREATE with a host-specific config (``SuperDictateOvHost`` takes its own)."""
         started = time.monotonic()
-        status, _ = self._round_trip(TYPE_CREATE, config, b"", timeout=120.0)
+        status, _ = self._round_trip(TYPE_CREATE, config, b"", timeout=timeout)
         self.load_seconds = time.monotonic() - started
         self.provider_actual = str(status.get("provider_actual", "cpu"))
         self.provider_fallback_reason = str(status.get("provider_fallback_reason", ""))
         self.model_id = str(status.get("model_id", ""))
+        try:
+            self.window_seconds = float(status.get("window_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self.window_seconds = 0.0
 
     def shutdown(self) -> None:
         if not self.is_alive:

@@ -1,6 +1,6 @@
 # SuperDictate for Windows, runtime dependencies.
 #
-# Speech recognition is not a Python dependency: it runs in
+# CPU speech recognition is not a Python dependency: it runs in
 # SuperDictateOnnxHost.exe (native/asr-runtime), built and staged by
 # tools/build-onnx-host.ps1.
 #
@@ -13,3 +13,7 @@ sounddevice==0.5.5           # PortAudio capture (WASAPI)
 pycaw==20251023              # system-audio muting while recording
 comtypes==1.4.16             # pycaw's COM layer
 pywin32==312
+# Intel NPU speech recognition, in SuperDictateOvHost.exe only (ov_host_main.py).
+# Its bundled NPU compiler is used instead of the driver's (openvino_asr.py),
+# so this pin decides which models compile.
+openvino==2026.4.1

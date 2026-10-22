@@ -12,6 +12,14 @@ already here; this is the driver that puts them on the dictation path.
 * Anything at all going wrong on the overlap path falls back to the plain
   path: each pause-bounded segment transcribed on its own and the texts
   joined. A failed segment loses only itself, never the dictation.
+
+Windows already transcribed during the recording (:mod:`incremental`) are
+taken from its exact-match cache instead of being transcribed again.
+
+A model with a fixed input length (the NPU builds: Parakeet takes 15 s at a
+time) caps the segments at that length (:func:`segment_limits`), so every
+cut still lands on a pause and every seam is still placed by the VAD, and
+no window ever has to be cut again by the clock inside the model host.
 """
 
 from __future__ import annotations
@@ -28,7 +36,7 @@ from .audio import SAMPLE_RATE
 from .boundary import MelEnergyBoundaryOracle, MidpointBoundaryOracle, VadBoundaryOracle
 from .logging_setup import get as get_logger
 from .overlap import OverlapAssemblyError, Word, add_overlap, assemble
-from .segmentation import segment
+from .segmentation import DEFAULT_MAX_SEGMENT_SECONDS, DEFAULT_MIN_SEGMENT_SECONDS, segment
 
 log = get_logger("transcription")
 
@@ -62,11 +70,32 @@ class SegmentedResult(TranscriptionResult):
     segments: int = 1
     overlap_path: bool = False
     had_segment_failure: bool = False
+    #: Windows whose words came from recording-time transcription.
+    windows_reused: int = 0
 
 
-def transcribe(model: SpeechModel, samples: np.ndarray, enqueued_at: float) -> SegmentedResult:
+def segment_limits(model) -> tuple[float, float]:
+    """``(max, min)`` segment seconds for this model.
+
+    The defaults (25 s / 15 s) unless the model takes a fixed window shorter
+    than 25 s; then the cap is that window, since an overlap window is never
+    longer than the cap (:func:`overlap.add_overlap`), and the minimum keeps
+    the defaults' proportion.
+    """
+    window = float(getattr(model, "max_window_seconds", 0.0) or 0.0)
+    if window <= 0 or window >= DEFAULT_MAX_SEGMENT_SECONDS:
+        return DEFAULT_MAX_SEGMENT_SECONDS, DEFAULT_MIN_SEGMENT_SECONDS
+    ratio = DEFAULT_MIN_SEGMENT_SECONDS / DEFAULT_MAX_SEGMENT_SECONDS
+    return window, window * ratio
+
+
+def transcribe(model: SpeechModel, samples: np.ndarray, enqueued_at: float,
+               cache=None) -> SegmentedResult:
+    """``cache``: an :class:`incremental.WindowCache` from this recording, or None."""
     audio_seconds = len(samples) / SAMPLE_RATE
-    segments = segment(samples, SAMPLE_RATE)
+    max_segment, min_segment = segment_limits(model)
+    segments = segment(samples, SAMPLE_RATE, max_segment_seconds=max_segment,
+                       min_segment_seconds=min_segment)
     if len(segments) <= 1:
         plain = model.transcribe(samples, enqueued_at)
         return SegmentedResult(text=plain.text, audio_seconds=plain.audio_seconds,
@@ -76,12 +105,14 @@ def transcribe(model: SpeechModel, samples: np.ndarray, enqueued_at: float) -> S
     queue_seconds = time.monotonic() - enqueued_at
     started = time.monotonic()
     try:
-        text = _overlap_path(model, samples, segments)
-        log.info("overlap transcription path: succeeded (%d segments)", len(segments))
+        text, reused = _overlap_path(model, samples, segments, max_segment, cache)
+        log.info("overlap transcription path: succeeded (%d segments, %d from the "
+                 "recording-time cache)", len(segments), reused)
         return SegmentedResult(text=text, audio_seconds=audio_seconds,
                                queue_seconds=queue_seconds,
                                inference_seconds=time.monotonic() - started,
-                               segments=len(segments), overlap_path=True)
+                               segments=len(segments), overlap_path=True,
+                               windows_reused=reused)
     except Exception as exc:
         log.warning("overlap transcription path failed (%s), falling back to plain segmentation",
                     exc)
@@ -110,15 +141,24 @@ def transcribe(model: SpeechModel, samples: np.ndarray, enqueued_at: float) -> S
                            segments=len(segments), had_segment_failure=failed)
 
 
-def _overlap_path(model: SpeechModel, samples: np.ndarray, segments) -> str:
-    windows = add_overlap(segments, SAMPLE_RATE)
+def _overlap_path(model: SpeechModel, samples: np.ndarray, segments, max_segment: float,
+                  cache=None) -> tuple[str, int]:
+    # ``segments`` must be segment()'s direct output, never filtered or
+    # reordered: every start_sample, and so every seam time, depends on it.
+    windows = add_overlap(segments, SAMPLE_RATE, max_segment_seconds=max_segment)
     per_window: list[list[Word]] = []
+    reused = 0
     for window in windows:
         if not window.has_signal:
             per_window.append([])
             continue
-        result = model.transcribe_words(window.samples)
-        per_window.append([Word(text=word.text, start=word.start) for word in result.words])
+        cached = cache.lookup(window, model.generation) if cache is not None else None
+        if cached is not None:
+            reused += 1
+            words = cached.words
+        else:
+            words = model.transcribe_words(window.samples).words
+        per_window.append([Word(text=word.text, start=word.start) for word in words])
 
     oracles = []
     vad = _shared_vad()
@@ -130,4 +170,4 @@ def _overlap_path(model: SpeechModel, samples: np.ndarray, segments) -> str:
              len(windows), assembled.dropped_at_seams)
     if not assembled.text.strip():
         raise OverlapAssemblyError("empty transcript")
-    return assembled.text
+    return assembled.text, reused

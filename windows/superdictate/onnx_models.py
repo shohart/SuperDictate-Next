@@ -10,6 +10,9 @@ An install is a directory ``Models\\onnx\\<model_id>\\`` holding the files
 and a ``manifest.json``. The manifest is written last, after every file has
 been verified, and ``SuperDictateOnnxHost`` refuses a directory without one,
 so a download interrupted at any point leaves nothing the host will load.
+
+The OpenVINO models for the NPU (``assets/openvino-models.json``, Windows
+only) follow the same rules and install into ``Models\\openvino\\<model_id>\\``.
 """
 
 from __future__ import annotations
@@ -32,6 +35,11 @@ log = get_logger("onnx_models")
 
 PARAKEET_ULTRA_MODEL_ID = "parakeet-ultra-int8"
 GIGAAM_V3_MODEL_ID = "gigaam-v3-e2e-rnnt-int8"
+PARAKEET_OV_MODEL_ID = "parakeet-tdt-0.6b-v3-ov"
+GIGAAM_OV_MODEL_ID = "gigaam-v3-e2e-rnnt-ov-npu"
+
+RUNTIME_ONNX = "onnx"
+RUNTIME_OPENVINO = "openvino"
 
 #: Keys the manifest leaves out: ``url`` belongs to the downloader, the rest
 #: are presentation. Same split as ``tools/make_manifest.py``.
@@ -65,6 +73,7 @@ class CatalogModel:
     attribution: str
     files: tuple[ModelFile, ...]
     entry: dict
+    runtime: str = RUNTIME_ONNX
 
     @property
     def total_bytes(self) -> int:
@@ -95,6 +104,10 @@ def catalog_path() -> Path:
     return _source_tree_root() / "native" / "asr-runtime" / "catalog" / "onnx-models.json"
 
 
+def openvino_catalog_path() -> Path:
+    return paths.resource_path("assets", "openvino-models.json")
+
+
 def assets_directory() -> Path:
     packaged = runtime_directory()
     if (packaged / "nemo128.onnx").is_file():
@@ -118,6 +131,24 @@ def host_executable() -> Optional[Path]:
     return None
 
 
+def openvino_host_command() -> Optional[list[str]]:
+    """How to start ``SuperDictateOvHost``: the packaged helper beside the app,
+    or this interpreter running ``main.py --openvino-host`` in a checkout
+    (which then needs ``openvino`` in its environment)."""
+    if getattr(sys, "frozen", False):
+        packaged = Path(sys.executable).resolve().parent / "SuperDictateOvHost.exe"
+        return [str(packaged)] if packaged.is_file() else None
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("openvino") is None:
+            return None
+    except (ImportError, ValueError):
+        return None
+    main = Path(__file__).resolve().parent.parent / "main.py"
+    return [sys.executable, str(main), "--openvino-host"]
+
+
 # -- catalog ----------------------------------------------------------------
 
 _catalog_cache: Optional[dict[str, CatalogModel]] = None
@@ -128,11 +159,15 @@ def catalog() -> dict[str, CatalogModel]:
     global _catalog_cache
     with _catalog_lock:
         if _catalog_cache is None:
-            _catalog_cache = _read_catalog(catalog_path())
+            models = _read_catalog(catalog_path())
+            openvino = openvino_catalog_path()
+            if openvino.is_file():
+                models.update(_read_catalog(openvino, RUNTIME_OPENVINO))
+            _catalog_cache = models
         return _catalog_cache
 
 
-def _read_catalog(path: Path) -> dict[str, CatalogModel]:
+def _read_catalog(path: Path, runtime: str = RUNTIME_ONNX) -> dict[str, CatalogModel]:
     with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
     if raw.get("schema") != 1:
@@ -154,6 +189,7 @@ def _read_catalog(path: Path) -> dict[str, CatalogModel]:
             attribution=entry.get("attribution", ""),
             files=files,
             entry=entry,
+            runtime=runtime,
         )
     return models
 
@@ -176,7 +212,16 @@ def _check_relative(relative: str) -> None:
 # -- installs ---------------------------------------------------------------
 
 def model_directory(model_id: str) -> Path:
-    return paths.MODELS_DIR / "onnx" / model_id
+    try:
+        runtime = model(model_id).runtime
+    except (ModelInstallError, OSError, ValueError):
+        runtime = RUNTIME_ONNX
+    return paths.MODELS_DIR / runtime / model_id
+
+
+def openvino_cache_directory() -> Path:
+    """Compiled NPU blobs. The first compile takes minutes; later loads, seconds."""
+    return paths.MODELS_DIR / "openvino" / "compiled"
 
 
 def is_installed(model_id: str) -> bool:

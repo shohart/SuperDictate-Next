@@ -11,17 +11,28 @@ from the same pinned catalog (:mod:`superdictate.onnx_models`):
   capitalisation, ё and digits come from the model itself, with far fewer
   word-form errors on Russian than Parakeet.
 
-Recognition is CPU-only on both platforms. The GPU belongs to the LLM
-stages, which gain several times from it; Parakeet does not, and one device
-switch for both was always wrong for one of them.
+On the CPU, the GPU stays out of it: it belongs to the LLM stages, which
+gain several times from it; Parakeet does not, and one device switch for
+both was always wrong for one of them.
+
+**Intel NPU** (Windows only, ``speech_compute_backend = "npu"``): the same
+two profiles run as OpenVINO builds — Parakeet TDT 0.6B v3 and the
+NPU-calibrated GigaAM v3 — in ``SuperDictateOvHost``
+(:mod:`superdictate.openvino_host`), which speaks the same IPC as the ONNX
+host. The choice is offered only where OpenVINO sees an NPU (:func:`npu_info`).
+If the NPU host cannot be brought up at all, the model loads on the CPU
+path instead, so a driver problem costs speed, never dictation.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -38,14 +49,74 @@ PROFILE_GIGAAM_V3 = "gigaam_v3_onnx"
 DEFAULT_PROFILE = PROFILE_PARAKEET_ULTRA
 PROFILES = (PROFILE_PARAKEET_ULTRA, PROFILE_GIGAAM_V3)
 
+BACKEND_CPU = "cpu"
+BACKEND_NPU = "npu"
+BACKENDS = (BACKEND_CPU, BACKEND_NPU)
+
 _PROFILE_MODEL_IDS = {
     PROFILE_PARAKEET_ULTRA: onnx_models.PARAKEET_ULTRA_MODEL_ID,
     PROFILE_GIGAAM_V3: onnx_models.GIGAAM_V3_MODEL_ID,
 }
+_NPU_MODEL_IDS = {
+    PROFILE_PARAKEET_ULTRA: onnx_models.PARAKEET_OV_MODEL_ID,
+    PROFILE_GIGAAM_V3: onnx_models.GIGAAM_OV_MODEL_ID,
+}
+
+#: The first NPU compile of a model takes minutes (GigaAM's model card: 3.5
+#: minutes with the fast compiler options, far longer without); the blob is
+#: cached, so later loads take seconds. The CREATE deadline has to cover the
+#: first one.
+NPU_CREATE_TIMEOUT_SECONDS = 45 * 60.0
 
 
-def model_id_for(profile: str) -> str:
-    return _PROFILE_MODEL_IDS.get(profile, _PROFILE_MODEL_IDS[DEFAULT_PROFILE])
+def model_id_for(profile: str, backend: str = BACKEND_CPU) -> str:
+    table = _NPU_MODEL_IDS if backend == BACKEND_NPU else _PROFILE_MODEL_IDS
+    return table.get(profile, table[DEFAULT_PROFILE])
+
+
+# -- NPU detection ------------------------------------------------------
+
+_npu_lock = threading.Lock()
+_npu_probe: Optional[dict] = None
+
+
+def npu_info(timeout: float = 60.0) -> Optional[dict]:
+    """``{"name", "driver_build"}`` of the Intel NPU, or ``None``.
+
+    Asked of the host (``--probe``), not of OpenVINO in this process: loading
+    the runtime here would cost the app ~100 MB for one question. The answer
+    is kept for the session; the first call blocks, so the app asks once in
+    the background at startup (:func:`probe_npu_async`).
+    """
+    global _npu_probe
+    with _npu_lock:
+        if _npu_probe is None:
+            _npu_probe = _run_probe(timeout)
+        return _npu_probe.get("npu") or None
+
+
+def probe_npu_async() -> None:
+    threading.Thread(target=npu_info, name="npu-probe", daemon=True).start()
+
+
+def _run_probe(timeout: float) -> dict:
+    command = onnx_models.openvino_host_command()
+    if command is None:
+        return {"npu": None}
+    try:
+        completed = subprocess.run(
+            command + ["--probe"], capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        lines = completed.stdout.decode("utf-8", "replace").strip().splitlines()
+        result = json.loads(lines[-1]) if lines else {}
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        log.info("NPU probe failed: %s", exc)
+        return {"npu": None}
+    if not isinstance(result, dict):
+        return {"npu": None}
+    log.info("NPU probe: OpenVINO %s, devices %s, NPU %s", result.get("openvino"),
+             result.get("devices"), result.get("npu"))
+    return result
 
 
 class State(str, Enum):
@@ -88,23 +159,23 @@ class TranscriptionResult:
         return self.inference_seconds / self.audio_seconds
 
 
-def model_is_present(profile: str) -> bool:
-    return onnx_models.is_installed(model_id_for(profile))
+def model_is_present(profile: str, backend: str = BACKEND_CPU) -> bool:
+    return onnx_models.is_installed(model_id_for(profile, backend))
 
 
-def local_model_bytes(profile: str) -> int:
-    return onnx_models.installed_bytes(model_id_for(profile))
+def local_model_bytes(profile: str, backend: str = BACKEND_CPU) -> int:
+    return onnx_models.installed_bytes(model_id_for(profile, backend))
 
 
-def model_total_bytes(profile: str) -> int:
+def model_total_bytes(profile: str, backend: str = BACKEND_CPU) -> int:
     try:
-        return onnx_models.model(model_id_for(profile)).total_bytes
+        return onnx_models.model(model_id_for(profile, backend)).total_bytes
     except (onnx_models.ModelInstallError, OSError, ValueError):
         return 0
 
 
-def delete_model_cache(profile: Optional[str] = None) -> None:
-    onnx_models.delete(model_id_for(profile) if profile else None)
+def delete_model_cache(profile: Optional[str] = None, backend: str = BACKEND_CPU) -> None:
+    onnx_models.delete(model_id_for(profile, backend) if profile else None)
 
 
 class SpeechModel:
@@ -116,14 +187,19 @@ class SpeechModel:
     once; if that fails too the error surfaces to the dictation.
     """
 
-    def __init__(self, profile: str = DEFAULT_PROFILE, threads: Optional[int] = None) -> None:
+    def __init__(self, profile: str = DEFAULT_PROFILE, threads: Optional[int] = None,
+                 backend: str = BACKEND_CPU) -> None:
         self.profile = profile if profile in PROFILES else DEFAULT_PROFILE
-        self.model_id = model_id_for(self.profile)
+        self.requested_backend = backend if backend in BACKENDS else BACKEND_CPU
+        #: What actually runs; becomes "cpu" if the NPU host cannot start.
+        self.backend = self.requested_backend
+        self.model_id = model_id_for(self.profile, self.backend)
         self.threads = threads or resolved_thread_count()
         self._host: Optional[OnnxHost] = None
         self._lock = threading.Lock()
         self._state = State.IDLE
         self._error: Optional[str] = None
+        self._fallback_reason = ""
         #: Bumped on every load and unload, like the macOS
         #: ``TranscriptionWorker.engineGeneration``.
         self.generation = 0
@@ -149,6 +225,20 @@ class SpeechModel:
     def uses_gpu(self) -> bool:
         return False
 
+    @property
+    def max_window_seconds(self) -> float:
+        """Longest audio one pass takes (the NPU models' static input); 0 = any."""
+        host = self._host
+        return host.window_seconds if host is not None else 0.0
+
+    @property
+    def fallback_reason(self) -> str:
+        """Why the requested device is not the one running, or ``""``."""
+        host = self._host
+        if host is not None and host.provider_fallback_reason:
+            return host.provider_fallback_reason
+        return self._fallback_reason
+
     # -- loading -----------------------------------------------------
 
     def prepare(self, on_progress: Optional[Callable[[Progress], None]] = None) -> bool:
@@ -163,13 +253,21 @@ class SpeechModel:
                     pass
 
         try:
-            if not onnx_models.is_installed(self.model_id):
-                total = model_total_bytes(self.profile)
-                report(Progress(State.DOWNLOADING, 0, total))
-                onnx_models.install(
-                    self.model_id,
-                    lambda done, all_bytes: report(Progress(State.DOWNLOADING, done, all_bytes)))
+            if self.backend == BACKEND_NPU:
+                try:
+                    self._install(report)
+                    report(Progress(State.LOADING, message="compiling"))
+                    with self._lock:
+                        self._start_host()
+                    report(Progress(State.READY, message="ready"))
+                    return True
+                except Exception as exc:
+                    log.exception("NPU speech model failed; falling back to the CPU")
+                    self._fallback_reason = f"npu: {exc}"
+                    self.backend = BACKEND_CPU
+                    self.model_id = model_id_for(self.profile, BACKEND_CPU)
 
+            self._install(report)
             report(Progress(State.LOADING, message="loading"))
             with self._lock:
                 self._start_host()
@@ -181,7 +279,19 @@ class SpeechModel:
             report(Progress(State.FAILED, message=str(exc)))
             return False
 
+    def _install(self, report: Callable[[Progress], None]) -> None:
+        if onnx_models.is_installed(self.model_id):
+            return
+        total = model_total_bytes(self.profile, self.backend)
+        report(Progress(State.DOWNLOADING, 0, total))
+        onnx_models.install(
+            self.model_id,
+            lambda done, all_bytes: report(Progress(State.DOWNLOADING, done, all_bytes)))
+
     def _start_host(self) -> None:
+        if self.backend == BACKEND_NPU:
+            self._start_openvino_host()
+            return
         executable = onnx_models.host_executable()
         if executable is None:
             raise RuntimeError("SuperDictateOnnxHost.exe is missing from the installation")
@@ -203,6 +313,36 @@ class SpeechModel:
         log.info("ONNX model %s loaded in %.1fs (provider=%s, threads=%d)",
                  host.model_id or self.model_id, host.load_seconds,
                  host.provider_actual, self.threads)
+        self._warm_up(host)
+
+    def _start_openvino_host(self) -> None:
+        command = onnx_models.openvino_host_command()
+        if command is None:
+            raise RuntimeError("SuperDictateOvHost is missing from the installation")
+        if self._host is not None:
+            self._host.shutdown()
+            self._host = None
+        host = OnnxHost(command, cwd=Path(command[-1]).parent,
+                        stderr_path=paths.LOG_DIR / "OvHost.log")
+        entry = onnx_models.model(self.model_id).entry
+        try:
+            host.create_with({
+                "engine": "openvino",
+                "family": entry["family"],
+                "model_id": self.model_id,
+                "model_directory": str(onnx_models.model_directory(self.model_id)),
+                "cache_directory": str(onnx_models.openvino_cache_directory()),
+                "device": "NPU",
+            }, timeout=NPU_CREATE_TIMEOUT_SECONDS)
+        except Exception:
+            host.shutdown()
+            raise
+        self._host = host
+        self.generation += 1
+        log.info("OpenVINO model %s loaded in %.1fs (device=%s%s)", self.model_id,
+                 host.load_seconds, host.provider_actual,
+                 f", fallback: {host.provider_fallback_reason}"
+                 if host.provider_fallback_reason else "")
         self._warm_up(host)
 
     @staticmethod

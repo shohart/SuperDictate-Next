@@ -855,6 +855,19 @@ class SettingsWindow(QDialog):
              (asr.PROFILE_GIGAAM_V3, i18n.tr("settings_model_gigaam_v3"))],
             hint=i18n.tr("settings_speech_model_hint"),
         )
+        # The NPU choice exists only where there is an NPU. A stored "npu"
+        # on a machine without one (settings carried over) stays visible,
+        # so it can be switched back; the app runs it on the CPU meanwhile.
+        npu = asr.npu_info()
+        if npu is not None or self._draft.get("speech_compute_backend") == asr.BACKEND_NPU:
+            npu_label = i18n.tr("settings_speech_backend_npu",
+                                name=(npu or {}).get("name") or "Intel NPU")
+            self._speech_backend = self._combo(
+                engine, "settings_speech_backend", "speech_compute_backend",
+                [(asr.BACKEND_CPU, i18n.tr("settings_speech_backend_cpu")),
+                 (asr.BACKEND_NPU, npu_label)],
+                hint=i18n.tr("settings_speech_backend_hint"),
+            )
         return _page(system, engine)
 
     def _text_style_changed(self) -> None:
@@ -1180,8 +1193,8 @@ class SettingsWindow(QDialog):
 
         self._controller.apply_settings()
 
-        model_changed = (previous.get("speech_model_profile")
-                         != self._draft.get("speech_model_profile"))
+        model_changed = any(previous.get(key) != self._draft.get(key)
+                            for key in ("speech_model_profile", "speech_compute_backend"))
         if model_changed:
             self._controller.reload_model()
         self.accept()

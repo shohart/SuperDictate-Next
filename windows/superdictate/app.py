@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import asr, audio, focus_target, i18n, inject, system, textproc, transcription
+from . import asr, audio, focus_target, i18n, incremental, inject, system, textproc, transcription
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
@@ -79,6 +79,9 @@ class _Job:
     # Resolves to the focus_target.InsertionTarget captured when the
     # recording started: where the text goes, wherever the user is now.
     target: Optional[Future] = None
+    # Windows already transcribed while the recording ran (incremental.py);
+    # finished on the worker, right before the full buffer is transcribed.
+    speculative: Optional["incremental.IncrementalTranscriber"] = None
 
 
 class DictationController(QObject):
@@ -157,6 +160,7 @@ class DictationController(QObject):
         self._worker: Optional[threading.Thread] = None
         self._model: Optional[asr.SpeechModel] = None
         self._preview_stop: Optional[threading.Event] = None
+        self._speculative: Optional[incremental.IncrementalTranscriber] = None
         # Every focus/caret query, for the HUD and for the paste. One
         # thread, shared, so UI Automation is only ever touched from it.
         self.focus = focus_target.FocusProbe()
@@ -233,6 +237,11 @@ class DictationController(QObject):
                                         name="transcription-worker", daemon=True)
         self._worker.start()
 
+        # Whether this machine has an Intel NPU decides what the settings
+        # offer; asking takes a helper process a second or two, so it is
+        # asked now, long before anybody opens them.
+        asr.probe_npu_async()
+
     def load_model(self) -> None:
         """Start the model loading. Deliberately separate from :meth:`start`.
 
@@ -254,6 +263,7 @@ class DictationController(QObject):
     def shutdown(self) -> None:
         self._terminating = True
         self._stop_preview()
+        self._discard_speculative()
         try:
             if self.recorder.is_recording:
                 self.recorder.discard()
@@ -271,7 +281,11 @@ class DictationController(QObject):
         self.focus.close()
 
     def _prepare_model(self) -> None:
-        model = asr.SpeechModel(profile=self.settings.speech_model_profile)
+        backend = self.settings.speech_compute_backend
+        if backend == asr.BACKEND_NPU and asr.npu_info() is None:
+            log.warning("Speech backend is set to the NPU, but none was found; using the CPU")
+            backend = asr.BACKEND_CPU
+        model = asr.SpeechModel(profile=self.settings.speech_model_profile, backend=backend)
         self._model = model
 
         def on_progress(progress: asr.Progress) -> None:
@@ -481,6 +495,7 @@ class DictationController(QObject):
         else:
             self.sounds.play("start")
         self._start_preview()
+        self._start_speculative()
 
     @staticmethod
     def _microphone_error_message(reason: str) -> str:
@@ -496,6 +511,7 @@ class DictationController(QObject):
         if self.state is not AppState.RECORDING:
             return
         self._stop_preview(clear=False)
+        speculative, self._speculative = self._speculative, None
         samples = self.recorder.stop()
         self._restore_playback()
         audio.clear_pending_dictation()
@@ -510,18 +526,21 @@ class DictationController(QObject):
             # hotkey looks dead until it is pressed a third time.
             self.listener.reset_toggle()
             self._drop_insertion_target()
+            self._discard_speculative(speculative)
             self._set_state(AppState.READY)
             self.dictation_failed.emit("clock", i18n.tr("error_too_short"))
             return
 
         self._set_state(AppState.TRANSCRIBING)
         target, self._insertion_target = self._insertion_target, None
-        self._jobs.put(_Job(samples, behavior, time.monotonic(), target=target))
+        self._jobs.put(_Job(samples, behavior, time.monotonic(), target=target,
+                            speculative=speculative))
 
     def cancel_recording(self) -> None:
         if self.state is not AppState.RECORDING:
             return
         self._stop_preview()
+        self._discard_speculative()
         self.recorder.discard()
         self._restore_playback()
         self.listener.reset_toggle()
@@ -564,6 +583,36 @@ class DictationController(QObject):
     def _on_auto_stop(self) -> None:
         log.info("Auto-stopping after %d minutes", audio.MAX_RECORDING_SECONDS // 60)
         self._action_bridge.actions.emit([Action.RELEASE.value])
+
+    # -- transcription while recording --------------------------------
+
+    def _start_speculative(self) -> None:
+        """Transcribe the parts of a long recording that can no longer change
+        while it is still running (incremental.py). Does nothing until the
+        recording is long enough to be segmented at all."""
+        self._discard_speculative()
+        model = self._model
+        if model is None or not model.is_ready:
+            return
+        recorder = self.recorder
+
+        def snapshot():
+            # None once this recording is over: the driver then stops.
+            return recorder.snapshot() if recorder.is_recording else None
+
+        max_segment, min_segment = transcription.segment_limits(model)
+        self._speculative = incremental.IncrementalTranscriber(
+            model, snapshot, sample_rate=audio.SAMPLE_RATE,
+            max_segment_seconds=max_segment, min_segment_seconds=min_segment).start()
+
+    def _discard_speculative(self, speculative=None) -> None:
+        """Stop and drop recording-time work without waiting for it: the
+        window in flight finishes in the background."""
+        if speculative is None:
+            speculative, self._speculative = self._speculative, None
+        if speculative is not None:
+            threading.Thread(target=speculative.cancel, name="recording-time-asr-cancel",
+                             daemon=True).start()
 
     # -- live preview --------------------------------------------------
 
@@ -657,7 +706,10 @@ class DictationController(QObject):
         if model is None or not model.is_ready:
             raise RuntimeError("Speech model is not ready")
 
-        result = transcription.transcribe(model, job.samples, job.enqueued_at)
+        # Waits for the recording-time window in flight (one ASR call at a
+        # time), then transcribes the full buffer, reusing what matches.
+        cache = job.speculative.finish() if job.speculative is not None else None
+        result = transcription.transcribe(model, job.samples, job.enqueued_at, cache=cache)
         text, applied, removed = textproc.process_transcript(
             result.text,
             language=self.settings.dictation_language,
@@ -668,11 +720,13 @@ class DictationController(QObject):
             style=self.settings.text_style,
         )
         log.info(
-            "Transcribed %.1fs of audio in %.2fs (RTF %.2f, %d segment(s)%s, "
+            "Transcribed %.1fs of audio in %.2fs (RTF %.2f, %d segment(s)%s%s, "
             "%d corrections, %d fillers removed)",
             result.audio_seconds, result.inference_seconds,
             result.realtime_factor, result.segments,
-            ", overlap" if result.overlap_path else "", applied, removed,
+            ", overlap" if result.overlap_path else "",
+            f", {result.windows_reused} window(s) done while recording"
+            if result.windows_reused else "", applied, removed,
         )
 
         if not text:

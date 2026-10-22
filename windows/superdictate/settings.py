@@ -289,10 +289,14 @@ _DEFAULTS: dict[str, Any] = {
     "silence_stop_seconds": 2.5,
     "start_at_login": False,
     # Which speech model runs. Same key and values as the macOS build.
-    # Recognition is CPU-only (ONNX Runtime in SuperDictateOnnxHost); the
-    # GPU belongs to the LLM stages, which is why the LLM device below is
-    # its own setting.
+    # The GPU belongs to the LLM stages, which is why the LLM device below
+    # is its own setting.
     "speech_model_profile": "parakeet_ultra_onnx",  # parakeet_ultra_onnx | gigaam_v3_onnx
+    # Where recognition runs, Windows only: cpu (ONNX Runtime in
+    # SuperDictateOnnxHost) | npu (OpenVINO in SuperDictateOvHost, offered
+    # only on machines with an Intel NPU). Same profile either way; the NPU
+    # runs its own OpenVINO build of that model.
+    "speech_compute_backend": "cpu",
     # LLM only: gpu | cpu. CPU until the user opts in, as on macOS
     # (llmUseGPU): a GPU that computes wrong gives fluent-looking garbage,
     # and the CPU path is the one that is right everywhere.
@@ -564,6 +568,11 @@ class Settings:
     def speech_model_profile(self) -> str:
         value = str(self._get("speech_model_profile"))
         return value if value in ("parakeet_ultra_onnx", "gigaam_v3_onnx") else "parakeet_ultra_onnx"
+
+    @property
+    def speech_compute_backend(self) -> str:
+        value = str(self._get("speech_compute_backend"))
+        return value if value in ("cpu", "npu") else "cpu"
 
     # -- LLM post-processing ------------------------------------------
 

@@ -5,7 +5,8 @@ Usage::
     python main.py                 # normal launch (tray + control panel)
     python main.py --minimized     # launch to tray only, for autostart
     python main.py --self-test     # run the built-in checks and exit
-    python main.py --benchmark-transcribe <profile> <wav...>   # real host, no UI
+    python main.py --benchmark-transcribe <profile> [--npu] <wav...>   # real host, no UI
+    python main.py --openvino-host # the NPU speech host (IPC on stdin/stdout)
 
 ``--self-test`` mirrors the macOS ``Parakey --self-test all``: it exercises
 the pure logic (hotkey state machine, transcript processing, settings
@@ -16,6 +17,14 @@ model, so CI can run it headlessly.
 from __future__ import annotations
 
 import sys
+
+if __name__ == "__main__" and "--openvino-host" in sys.argv:
+    # The NPU speech host (superdictate.openvino_host) when running from a
+    # checkout; packaged builds ship it as SuperDictateOvHost.exe. Before
+    # the Qt imports: a helper process has no use for them.
+    from superdictate.openvino_host import main as _openvino_host_main
+
+    sys.exit(_openvino_host_main(sys.argv[1:]))
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon

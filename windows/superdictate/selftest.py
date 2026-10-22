@@ -1268,6 +1268,379 @@ def test_onnx_host_ipc() -> None:
         crashing.shutdown()
 
 
+def test_openvino_windows() -> None:
+    """Static NPU windows: overlapping, ending on the audio, cut mid-overlap."""
+    from .openvino_asr import SAMPLE_RATE, plan_windows
+
+    _check("short audio is one window",
+           plan_windows(SAMPLE_RATE * 5, SAMPLE_RATE * 15, SAMPLE_RATE * 3),
+           [(0, SAMPLE_RATE * 5, float("-inf"), float("inf"))])
+    spans = plan_windows(SAMPLE_RATE * 40, SAMPLE_RATE * 15, SAMPLE_RATE * 3)
+    _check("40 s in 15 s windows, 3 s overlap",
+           [(s // SAMPLE_RATE, e // SAMPLE_RATE) for s, e, _, _ in spans],
+           [(0, 15), (12, 27), (24, 39), (25, 40)])
+    _check("every window is full", {e - s for s, e, _, _ in spans}, {SAMPLE_RATE * 15})
+    _check("the cuts sit in the middle of each overlap",
+           [(a, b) for _, _, a, b in spans],
+           [(float("-inf"), 13.5), (13.5, 25.5), (25.5, 32.0), (32.0, float("inf"))])
+    _check("the keep spans tile the audio without a gap",
+           all(spans[i][3] == spans[i + 1][2] for i in range(len(spans) - 1)), True)
+
+    from .openvino_asr import Word, stitch
+
+    def words(*items):
+        return [Word(text, start, start + 0.3, 1.0) for text, start in items]
+
+    def texts(items):
+        return [w.w for w in items]
+
+    first = stitch([], words(("чтобы", 9.84), ("распознавание", 10.16), ("речи", 11.20),
+                             ("выполнялось", 11.68)), float("-inf"), 11.19, 0.08)
+    # The NPU case: "речи" lands just after the cut in one window and just
+    # before it in the next. A plain cut kept it in neither.
+    second = words(("распознавание", 10.18), ("речи", 11.14), ("выполнялось", 11.62),
+                   ("именно", 12.50))
+    _check("stitch: a word straddling the cut is kept once",
+           texts(stitch(first, second, 11.19, float("inf"), 0.08)),
+           ["чтобы", "распознавание", "речи", "выполнялось", "именно"])
+    early = stitch([], words(("а", 1.0), ("б", 11.10)), float("-inf"), 11.19, 0.08)
+    _check("stitch: a word heard on both sides of the cut is not doubled",
+           texts(stitch(early, words(("б", 11.30), ("в", 11.9)), 11.19, float("inf"), 0.08)),
+           ["а", "б", "в"])
+    # "за" 12.90, "внимание" 13.06: two real words exactly two frames apart.
+    _check("stitch: neighbouring words after the cut are both kept",
+           texts(stitch(words(("а", 1.0)), words(("за", 12.90), ("внимание", 13.06)), 8.07,
+                        float("inf"), 0.08)),
+           ["а", "за", "внимание"])
+    _check("stitch: a window does not reach back past its overlap",
+           texts(stitch(words(("а", 1.0)), words(("x", 8.0), ("в", 12.0)), 11.19,
+                        float("inf"), 0.08)),
+           ["а", "в"])
+
+
+def test_openvino_word_rules() -> None:
+    """Text and words exactly as the native families build them."""
+    from .openvino_asr import Token, words_space_rule, words_word_start_rule
+
+    pieces = ["▁При", "вет", ",", "▁мир", "."]
+    tokens = [Token(0, 0.0, 0.9), Token(1, 0.08, 0.5), Token(2, 0.16, 0.8),
+              Token(3, 0.4, 0.7), Token(4, 0.48, 0.6)]
+    nemo = words_word_start_rule(tokens, pieces, 0.08, 1.0)
+    _check("nemo: text", nemo.text, "Привет, мир.")
+    _check("nemo: words", [w.w for w in nemo.words], ["Привет,", "мир."])
+    _check("nemo: a word ends one frame after its last piece", nemo.words[0].end, 0.24)
+    _check("nemo: confidence is the weakest piece", nemo.words[0].conf, 0.5)
+
+    giga = words_space_rule(tokens, pieces, 0.04, 1.0)
+    _check("gigaam: text", giga.text, "Привет, мир.")
+    _check("gigaam: words", [w.w for w in giga.words], ["Привет,", "мир."])
+    spaced = words_space_rule([Token(0, 0.0, 1.0), Token(1, 0.1, 1.0)], ["▁a", "▁,"], 0.04, 1.0)
+    _check("gigaam: no space before punctuation", spaced.text, "a,")
+
+
+def test_sentencepiece_reader() -> None:
+    """Pieces come out of a ModelProto in id order, other fields skipped."""
+    import tempfile
+
+    from .openvino_asr import sentencepiece_pieces
+
+    def varint(value: int) -> bytes:
+        out = b""
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            out += bytes([byte | (0x80 if value else 0)])
+            if not value:
+                return out
+
+    def field(number: int, payload: bytes) -> bytes:
+        return varint(number << 3 | 2) + varint(len(payload)) + payload
+
+    def piece(text: str) -> bytes:
+        # piece (1), score (2, fixed32), type (3, varint)
+        return field(1, text.encode()) + bytes([2 << 3 | 5]) + b"\0\0\x80\xbf" + bytes([3 << 3, 1])
+
+    model = b"".join(field(1, piece(p)) for p in ("<unk>", "▁при", "вет"))
+    model += field(2, b"trainer spec, ignored")
+    path = Path(tempfile.mkdtemp()) / "tokenizer.model"
+    path.write_bytes(model)
+    _check("sentencepiece pieces", sentencepiece_pieces(path), ["<unk>", "▁при", "вет"])
+
+
+def test_gigaam_features() -> None:
+    """GigaAM log-mel: frame count, silence floor, and a tone where it belongs."""
+    import numpy as np
+
+    from .openvino_asr import gigaam_features
+
+    features, frames = gigaam_features(np.zeros(16000, dtype=np.float32))
+    _check("1 s gives 99 frames (center=False)", (features.shape, frames), ((64, 99), 99))
+    _check("silence sits on the clamp floor",
+           bool(np.allclose(features, np.log(1e-9), atol=1e-3)), True)
+    tone = np.sin(2 * np.pi * 1000 * np.arange(16000) / 16000).astype(np.float32)
+    loudest = int(np.argmax(gigaam_features(tone)[0].mean(axis=1)))
+    # 64 HTK bands up to 8 kHz: 1 kHz is 21.9 bands in, the peak of band 22.
+    _check("a 1 kHz tone lands in its mel band", loudest, 22)
+    _check("audio shorter than one frame has none", gigaam_features(np.zeros(100))[1], 0)
+
+
+def test_npu_backend_settings_and_catalog() -> None:
+    """The NPU choice: stored, coerced, and mapped to the OpenVINO models."""
+    import tempfile
+
+    from . import onnx_models, openvino_asr
+    from .asr import (BACKEND_CPU, BACKEND_NPU, PROFILE_GIGAAM_V3,
+                      PROFILE_PARAKEET_ULTRA, model_id_for)
+    from .settings import Settings
+
+    settings = Settings(path=tempfile.mktemp(suffix=".json"))
+    _check("recognition defaults to the CPU", settings.speech_compute_backend, "cpu")
+    settings._set("speech_compute_backend", "npu")
+    _check("the NPU can be chosen", settings.speech_compute_backend, "npu")
+    settings._set("speech_compute_backend", "gpu")
+    _check("anything else reads as the CPU", settings.speech_compute_backend, "cpu")
+
+    _check("CPU Parakeet is the ONNX model",
+           model_id_for(PROFILE_PARAKEET_ULTRA, BACKEND_CPU), onnx_models.PARAKEET_ULTRA_MODEL_ID)
+    _check("NPU Parakeet is the OpenVINO model",
+           model_id_for(PROFILE_PARAKEET_ULTRA, BACKEND_NPU), onnx_models.PARAKEET_OV_MODEL_ID)
+    _check("NPU GigaAM is the NPU-calibrated model",
+           model_id_for(PROFILE_GIGAAM_V3, BACKEND_NPU), onnx_models.GIGAAM_OV_MODEL_ID)
+
+    models = onnx_models.catalog()
+    for model_id in (onnx_models.PARAKEET_OV_MODEL_ID, onnx_models.GIGAAM_OV_MODEL_ID):
+        entry = models.get(model_id)
+        _check(f"{model_id} is in the catalog", entry is not None, True)
+        if entry is None:
+            continue
+        _check(f"{model_id} is an OpenVINO model", entry.runtime, onnx_models.RUNTIME_OPENVINO)
+        _check(f"{model_id} has a family the host knows",
+               entry.entry["family"] in openvino_asr.FAMILIES, True)
+        _check(f"{model_id} files are pinned",
+               all("/resolve/" in f.url and len(f.sha256) == 64 and f.size > 0
+                   for f in entry.files), True)
+        _check(f"{model_id} installs beside, not inside, the ONNX models",
+               onnx_models.model_directory(model_id).parent.name, "openvino")
+    _check("the ONNX models stay where they were",
+           onnx_models.model_directory(onnx_models.PARAKEET_ULTRA_MODEL_ID).parent.name, "onnx")
+
+
+_FAKE_OV_HOST = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from superdictate import openvino_asr, openvino_host
+
+class Fake:
+    device = "NPU"
+    window_samples = 240000
+    def transcribe(self, samples, cancelled):
+        if samples.size == 1600:
+            while not cancelled():
+                time.sleep(0.01)
+            raise openvino_asr.Cancelled("request cancelled")
+        word = openvino_asr.Word(str(samples.size), 0.25, 0.5, 0.9)
+        return openvino_asr.Transcript(f"samples {samples.size}", [word])
+
+def load(family, directory, device, cache):
+    if device == "NPU" and str(directory).endswith("nonpu"):
+        raise RuntimeError("compile failed\nZE_RESULT_ERROR_INVALID_ARGUMENT")
+    model = Fake(); model.device = device
+    return model
+
+openvino_asr.load = load
+sys.exit(openvino_host.main([]))
+"""
+
+
+def test_openvino_host_ipc() -> None:
+    """SuperDictateOvHost through the app's own client: the same framing v1."""
+    import sys
+    import tempfile
+
+    import numpy as np
+
+    from . import onnx_host
+
+    script = Path(tempfile.mkdtemp()) / "fake_ov_host.py"
+    script.write_text(_FAKE_OV_HOST, encoding="utf-8")
+    package_root = str(Path(__file__).resolve().parent.parent)
+    command = [sys.executable, "-I", str(script), package_root]
+
+    host = onnx_host.OnnxHost(command)
+    try:
+        host.create_with({"engine": "openvino", "family": "nemo_tdt_ov", "model_id": "x-ov",
+                          "model_directory": "m", "device": "NPU"}, timeout=30)
+        _check("ov CREATE reports the model", host.model_id, "x-ov")
+        _check("ov CREATE reports the NPU", host.provider_actual, "npu")
+        _check("ov CREATE reports the model's fixed window", host.window_seconds, 15.0)
+        result = host.transcribe(np.zeros(800, dtype=np.float32), timestamps=True)
+        _check("ov TRANSCRIBE round-trips the PCM", result.text, "samples 800")
+        _check("ov words carry their times",
+               [(w.text, w.start, w.end) for w in result.words], [("800", 0.25, 0.5)])
+
+        original = onnx_host.timeout_seconds
+        onnx_host.timeout_seconds = lambda count, rate=16000: 0.3
+        try:
+            _check("ov: a hung request times out via CANCEL",
+                   _raises(lambda: host.transcribe(np.zeros(1600, dtype=np.float32)),
+                           onnx_host.TimedOut), True)
+        finally:
+            onnx_host.timeout_seconds = original
+    finally:
+        host.shutdown()
+
+    fallback = onnx_host.OnnxHost(command)
+    try:
+        fallback.create_with({"engine": "openvino", "family": "gigaam_rnnt_ov",
+                              "model_directory": "nonpu", "device": "NPU"}, timeout=30)
+        _check("ov: an NPU that will not compile falls back to the CPU",
+               fallback.provider_actual, "cpu")
+        _check("ov: and says why",
+               "ZE_RESULT_ERROR_INVALID_ARGUMENT" in fallback.provider_fallback_reason, True)
+    finally:
+        fallback.shutdown()
+
+    refused = onnx_host.OnnxHost(command)
+    try:
+        error = None
+        try:
+            refused.create_with({"engine": "openvino", "family": "whisper"}, timeout=30)
+        except onnx_host.NativeError as exc:
+            error = exc.category
+        _check("ov: an unknown family is refused", error, "unsupported_model_family")
+    finally:
+        refused.shutdown()
+
+
+def _speech_like(seconds_pattern, sample_rate=16000, seed=7):
+    """Noise bursts (speech) and zeros (pauses): ``[(speech_s, pause_s), ...]``."""
+    import numpy as np
+
+    rng = np.random.RandomState(seed)
+    parts = []
+    for speech, pause in seconds_pattern:
+        parts.append((rng.randn(int(speech * sample_rate)) * 0.1).astype(np.float32))
+        parts.append(np.zeros(int(pause * sample_rate), dtype=np.float32))
+    return np.concatenate(parts)
+
+
+class _FakeWordModel:
+    """Deterministic words from the audio itself: same audio, same words."""
+
+    def __init__(self, window_seconds=0.0):
+        self.generation = 1
+        self.calls = 0
+        self.max_window_seconds = window_seconds
+        self.lock = __import__("threading").Lock()
+
+    def transcribe_words(self, samples):
+        from .incremental import window_checksum
+        from .onnx_host import HostTranscription, HostWord
+
+        with self.lock:
+            self.calls += 1
+        words = []
+        for index, start in enumerate(range(0, len(samples) - 8000, 8000)):
+            chunk = samples[start:start + 8000]
+            if float(abs(chunk).mean()) < 0.01:
+                continue
+            tag = window_checksum(chunk).hex()[:4]
+            words.append(HostWord(text=f"w{tag}", start=start / 16000, end=(start + 8000) / 16000))
+        return HostTranscription(" ".join(w.text for w in words), 0.0, tuple(words))
+
+    def transcribe(self, samples, enqueued_at):
+        from .asr import TranscriptionResult
+
+        return TranscriptionResult(self.transcribe_words(samples).text, len(samples) / 16000, 0, 0)
+
+
+def test_incremental_stable_windows() -> None:
+    """A window called stable on a prefix is exactly a window of the full buffer."""
+    from .incremental import stable_windows, window_checksum
+    from .overlap import add_overlap
+    from .segmentation import segment
+
+    full = _speech_like([(9, 0.6), (8, 0.7), (11, 0.5), (6, 0.8), (12, 0.6), (7, 0.1)])
+    final = {(w.start_sample, len(w.samples)): window_checksum(w.samples)
+             for w in add_overlap(segment(full, 16000), 16000)}
+    seen = set()
+    wrong = []
+    for end in range(16000, len(full), 16000 // 2):
+        for window in stable_windows(full[:end], 16000):
+            key = (window.start_sample, len(window.samples))
+            seen.add(key)
+            if final.get(key) != window_checksum(window.samples):
+                wrong.append((end, key))
+    _check("incremental: every stable window matches the final windowing", wrong, [])
+    _check("incremental: all but the last window or two become stable before the end",
+           len(seen) >= len(final) - 2, True)
+    _check("incremental: a short recording has no stable window",
+           stable_windows(full[:16000 * 10], 16000), [])
+
+
+def test_incremental_transcription_matches_batch() -> None:
+    """Recording-time work never changes the text, and saves the release work."""
+    import threading
+
+    from . import transcription
+    from .incremental import IncrementalTranscriber
+
+    full = _speech_like([(9, 0.6), (8, 0.7), (11, 0.5), (6, 0.8), (12, 0.6), (7, 0.1)])
+    batch_model = _FakeWordModel()
+    batch = transcription.transcribe(batch_model, full, 0.0)
+
+    model = _FakeWordModel()
+    captured = {"n": 0}
+    done = threading.Event()
+
+    def snapshot():
+        if done.is_set():
+            return None
+        captured["n"] = min(len(full), captured["n"] + 16000)   # 1 s per poll
+        return full[:captured["n"]]
+
+    driver = IncrementalTranscriber(model, snapshot, sample_rate=16000, poll_seconds=0.005).start()
+    deadline = __import__("time").monotonic() + 20
+    while captured["n"] < len(full) and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
+    done.set()
+    cache = driver.finish()
+    calls_while_recording = model.calls
+    streamed = transcription.transcribe(model, full, 0.0, cache=cache)
+
+    windows = batch.segments
+    _check("incremental: the text is identical to the batch path", streamed.text, batch.text)
+    _check("incremental: it really took the overlap path", streamed.overlap_path, True)
+    _check("incremental: at most two windows are left for the release",
+           streamed.windows_reused >= windows - 2, True)
+    _check("incremental: release transcribed only what was not cached",
+           model.calls - calls_while_recording, windows - streamed.windows_reused)
+
+    model.generation += 1   # the model was reloaded since: nothing may be reused
+    reloaded = transcription.transcribe(model, full, 0.0, cache=cache)
+    _check("incremental: a reloaded model ignores the cache", reloaded.windows_reused, 0)
+    _check("incremental: and still gives the same text", reloaded.text, batch.text)
+
+
+def test_segment_limits_follow_the_model_window() -> None:
+    """A 15 s NPU model gets segments (and so windows) no longer than 15 s."""
+    from . import transcription
+    from .overlap import add_overlap
+    from .segmentation import segment
+
+    _check("limits: an unbounded model keeps the defaults",
+           transcription.segment_limits(_FakeWordModel()), (25.0, 15.0))
+    _check("limits: a 30 s model keeps the defaults too",
+           transcription.segment_limits(_FakeWordModel(30.01)), (25.0, 15.0))
+    max_s, min_s = transcription.segment_limits(_FakeWordModel(15.0))
+    _check("limits: a 15 s model caps at 15 s", (max_s, min_s), (15.0, 9.0))
+    full = _speech_like([(7, 0.6), (5, 0.7), (9, 0.5), (14, 0.8), (6, 0.1)])
+    windows = add_overlap(segment(full, 16000, max_segment_seconds=max_s, min_segment_seconds=min_s),
+                          16000, max_segment_seconds=max_s)
+    _check("limits: no window exceeds the model's input",
+           max(len(w.samples) for w in windows) <= 15 * 16000, True)
+
+
 def test_vocabulary_transfer() -> None:
     """The exchange file must be the one the macOS build reads.
 
@@ -1370,6 +1743,15 @@ _TESTS = [
     test_asr_thread_policy,
     test_onnx_catalog_and_manifest,
     test_onnx_host_ipc,
+    test_openvino_windows,
+    test_openvino_word_rules,
+    test_sentencepiece_reader,
+    test_gigaam_features,
+    test_npu_backend_settings_and_catalog,
+    test_openvino_host_ipc,
+    test_incremental_stable_windows,
+    test_incremental_transcription_matches_batch,
+    test_segment_limits_follow_the_model_window,
     test_vocabulary_transfer,
 ]
 

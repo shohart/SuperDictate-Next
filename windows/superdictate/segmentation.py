@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -77,8 +77,37 @@ def segment(samples: np.ndarray, sample_rate: float, *,
             signal_min_windows: int = DEFAULT_SIGNAL_MIN_WINDOWS
             ) -> list[AudioSegment]:
     """Split ``samples`` into segments cut only at pauses."""
+    return segment_with_pending_pause(
+        samples, sample_rate,
+        max_segment_seconds=max_segment_seconds,
+        min_segment_seconds=min_segment_seconds,
+        pause_threshold_seconds=pause_threshold_seconds,
+        window_seconds=window_seconds,
+        silence_rms_threshold=silence_rms_threshold,
+        signal_min_windows=signal_min_windows,
+    )[0]
+
+
+def segment_with_pending_pause(
+        samples: np.ndarray, sample_rate: float, *,
+        max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
+        min_segment_seconds: float = DEFAULT_MIN_SEGMENT_SECONDS,
+        pause_threshold_seconds: float = DEFAULT_PAUSE_THRESHOLD_SECONDS,
+        window_seconds: float = DEFAULT_WINDOW_SECONDS,
+        silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD,
+        signal_min_windows: int = DEFAULT_SIGNAL_MIN_WINDOWS
+        ) -> tuple[list[AudioSegment], Optional[int]]:
+    """:func:`segment`, plus where the silent run still open at the end starts.
+
+    Port of ``PauseSegmenter.segmentWithPendingPause``. Recording-time
+    transcription (:mod:`incremental`) runs this on the audio captured so
+    far: the open run is where the last, still-growing segment can be cut
+    at the earliest — never before it — so it bounds how short that segment
+    can still become once more audio arrives. The cuts themselves are
+    exactly :func:`segment`'s: this IS that function's body.
+    """
     if samples is None or len(samples) == 0:
-        return []
+        return [], None
 
     total = len(samples)
     window_size = max(1, int(window_seconds * sample_rate))
@@ -142,7 +171,8 @@ def segment(samples: np.ndarray, sample_rate: float, *,
                 silent_run_start = None
 
     cut_at(total)
-    return segments
+    pending = silent_run_start * window_size if silent_run_start is not None else None
+    return segments, pending
 
 
 def _silence_flags(samples: np.ndarray, window_size: int,
