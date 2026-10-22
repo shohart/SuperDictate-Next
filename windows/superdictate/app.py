@@ -19,6 +19,7 @@ Thread layout:
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -30,7 +31,8 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import asr, audio, focus_target, i18n, incremental, inject, system, textproc, transcription
+from . import (asr, audio, edit_watch, focus_target, i18n, incremental, inject, system,
+               textproc, transcription)
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
@@ -105,8 +107,6 @@ class DictationController(QObject):
     # The last few transcripts as bubbles over the capsule, from the
     # shortcut. Carries them newest first.
     history_bubbles_requested = Signal(list)
-    # Carries the text of the last dictation, to be shown for editing.
-    transcript_edit_requested = Signal(str)
     settings_applied = Signal()
     # Rules just learned, as (source, replacement) pairs. The UI
     # offers an undo for them; see ui.learn_toast.
@@ -164,6 +164,12 @@ class DictationController(QObject):
         # Every focus/caret query, for the HUD and for the paste. One
         # thread, shared, so UI Automation is only ever touched from it.
         self.focus = focus_target.FocusProbe()
+        # Learns corrections from edits made to a dictation right after it
+        # was pasted (the macOS PostInsertionEditWatcher).
+        self.edit_watch = edit_watch.EditWatcher(
+            lambda: self.focus.read_field().result(timeout=1.0),
+            self._learn_from_edit,
+            own_pids=frozenset({os.getpid()}))
         self._insertion_target: Optional[Future] = None
         self._terminating = False
         self.last_error: str = ""
@@ -241,6 +247,10 @@ class DictationController(QObject):
         # offer; asking takes a helper process a second or two, so it is
         # asked now, long before anybody opens them.
         asr.probe_npu_async()
+        # Silero VAD places the seams of long dictations; its 885 KB model
+        # is fetched in the background, as on macOS.
+        from . import vad
+        threading.Thread(target=vad.ensure_model, name="vad-download", daemon=True).start()
 
     def load_model(self) -> None:
         """Start the model loading. Deliberately separate from :meth:`start`.
@@ -264,6 +274,7 @@ class DictationController(QObject):
         self._terminating = True
         self._stop_preview()
         self._discard_speculative()
+        self.edit_watch.stop()
         try:
             if self.recorder.is_recording:
                 self.recorder.discard()
@@ -347,7 +358,9 @@ class DictationController(QObject):
     def _apply_hotkey_settings(self) -> None:
         self.listener.hotkey = self.settings.hotkey
         self.listener.history_hotkey = self.settings.history_hotkey
-        self.listener.edit_hotkey = self.settings.edit_hotkey
+        # No transcript-editor shortcut: corrections are learned from edits
+        # made in place, right after the paste (edit_watch.py), as on macOS.
+        self.listener.edit_hotkey = None
         self.listener.correction_hotkey = self.settings.correction_hotkey
         self.listener.rewrite_hotkey = self.settings.rewrite_hotkey
         self.listener.rewrite_style_hotkey = self.settings.rewrite_style_hotkey
@@ -378,8 +391,6 @@ class DictationController(QObject):
                 self.cancel_recording()
             elif action is Action.SHOW_HISTORY:
                 self.request_history_bubbles()
-            elif action is Action.SHOW_EDITOR:
-                self.request_transcript_edit()
             elif action is Action.TOGGLE_CORRECTION:
                 self.toggle_correction()
             elif action is Action.TOGGLE_REWRITE:
@@ -467,6 +478,8 @@ class DictationController(QObject):
         # they switch windows while speaking (PendingTextInsertionTargetStore
         # on macOS). Captured off the Qt thread; the paste waits for it.
         self._insertion_target = self.focus.capture()
+        # A new dictation ends the watch on the previous one.
+        self.edit_watch.stop()
         if not self.recorder.start(self.settings.input_device):
             self._drop_insertion_target()
             self._restore_playback()
@@ -762,6 +775,9 @@ class DictationController(QObject):
             press_enter=job.behavior.presses_enter,
             enter_delay_ms=self.settings.enter_delay_milliseconds,
         )
+        if not job.behavior.presses_enter:
+            # A message already sent with Enter is not there to be fixed.
+            self.edit_watch.begin(payload)
 
     def _return_to_target(self, job: _Job, payload: str) -> bool:
         """Back to the field the dictation began in. False: do not paste.
@@ -840,47 +856,21 @@ class DictationController(QObject):
 
     # -- correcting the last dictation ---------------------------------
 
-    def request_transcript_edit(self) -> None:
-        """Open the editor on the last dictation, if there is one to open.
-
-        Refused mid-dictation: the capsule is the recording's, and the
-        text being corrected would be replaced a second later anyway.
-        """
-        if self.state is not AppState.READY or self._terminating:
-            self.sounds.play("rejected")
-            return
-        if not self.last_transcript:
-            self.sounds.play("rejected")
-            return
-        self.transcript_edit_requested.emit(self.last_transcript)
-
-    def apply_transcript_edit(self, edited: str) -> int:
-        """Learn from a hand-corrected transcript. Returns rules learned.
-
-        Nothing is typed anywhere. Windows does not let one application
-        read another's text field, so there is no way to tell whether the
-        dictation is still where it was put, let alone edit it in place;
-        what the correction is worth is the next dictation, where the
-        replacement dictionary turns the misheard word into the right one
-        before it is ever pasted.
-        """
-        original = self.last_transcript
-        edited = edited.strip()
-        if not edited or edited == original:
-            return 0
-
-        pairs = textproc.learned_corrections(original, edited)
-        records = self.corrections.learn(pairs)
-        learned = len(records)
-        if learned:
-            log.info("Learned %d correction(s) from an edited transcript", learned)
-            # The toast is what makes this reversible: a rule learned from a
-            # typo the user meant to keep is worse than no learning at all.
+    def _learn_from_edit(self, candidate) -> list:
+        """Save one rule found by the edit watcher (its thread). The toast
+        is what makes it reversible: a rule learned from a typo the user
+        meant to keep is worse than no learning at all."""
+        records = self.corrections.learn([(candidate.source, candidate.replacement)])
+        if records:
+            log.info("Learned a correction from an edit in place: %r -> %r",
+                     candidate.source, candidate.replacement)
             self.vocabulary_learned.emit([(r.source, r.replacement) for r in records])
-        self.last_transcript = edited
-        if self.history.amend(original, edited):
-            self.transcript_ready.emit(edited)
-        return learned
+            if self.last_transcript and candidate.source in self.last_transcript:
+                amended = self.last_transcript.replace(candidate.source, candidate.replacement, 1)
+                if self.history.amend(self.last_transcript, amended):
+                    self.transcript_ready.emit(amended)
+                self.last_transcript = amended
+        return records
 
     # -- manual insertion (history window) -----------------------------
 

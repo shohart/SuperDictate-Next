@@ -135,5 +135,13 @@ PROFILES: dict[BundledLLMModel, ModelProfile] = {
 }
 
 
+#: What the local host is offered for. Correction only, with the small
+#: models (VoiceScribe first); YandexGPT stays in the table for settings
+#: carried over from macOS, but is not offered: an 8B model is a rewrite
+#: model, and local rewrite is not part of this port yet.
+LOCAL_CORRECTION_MODELS: tuple[BundledLLMModel, ...] = (BundledLLMModel.VOICESCRIBE,)
+LOCAL_REWRITE_ENABLED = False
+
+
 def profile(model: BundledLLMModel) -> ModelProfile:
     return PROFILES[model]

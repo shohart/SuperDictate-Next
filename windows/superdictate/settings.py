@@ -616,12 +616,17 @@ class Settings:
     def correction_config(self):
         """Build the correction stage's config from stored settings."""
         from .llm import BundledLLMModel, CorrectionConfig, CustomEndpoint, LLMBackend
+        from .llm.models import LOCAL_CORRECTION_MODELS
 
+        model = _enum_or(BundledLLMModel, self._get("correction_bundled_model_v2"),
+                         BundledLLMModel.VOICESCRIBE)
+        if model not in LOCAL_CORRECTION_MODELS:
+            # Carried over from macOS, where the 8B quality tier exists.
+            model = BundledLLMModel.VOICESCRIBE
         return CorrectionConfig(
             enabled=self.correction_enabled,
             backend=self._llm_backend("llm_engine_backend_v1"),
-            model=_enum_or(BundledLLMModel, self._get("correction_bundled_model_v2"),
-                           BundledLLMModel.VOICESCRIBE),
+            model=model,
             endpoint=CustomEndpoint(
                 base_url=str(self._get("llm_custom_base_url_v1") or ""),
                 api_key=str(self._get("llm_custom_api_key_v1") or ""),
@@ -667,9 +672,15 @@ class Settings:
                         "name": str(entry.get("name", "")),
                         "instruction": str(entry.get("instruction", "")),
                     }
+        from .llm.models import LOCAL_REWRITE_ENABLED
+
+        backend = self._llm_backend("rewrite_engine_backend_v1")
+        if not LOCAL_REWRITE_ENABLED:
+            # The local host does correction only, for now.
+            backend = LLMBackend.CUSTOM_ENDPOINT
         return RewriteConfig(
             enabled=self.rewrite_enabled,
-            backend=self._llm_backend("rewrite_engine_backend_v1"),
+            backend=backend,
             model=_enum_or(BundledLLMModel, self._get("rewrite_bundled_model_v2"),
                            BundledLLMModel.YANDEXGPT),
             style=_enum_or(RewriteStyle, self._get("rewrite_style_v1"),

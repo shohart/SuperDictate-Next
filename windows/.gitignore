@@ -15,3 +15,5 @@ Thumbs.db
 /onnx-asr/
 # Staged by tools/build-engines.ps1
 /engines/
+# Downloads cached by tools/fetch-llama.ps1
+/tools/.cache/

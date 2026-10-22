@@ -113,20 +113,31 @@ class _Host:
             "model_id": self.model_id,
             "family": self.family,
             "provider_requested": self.provider_requested,
-            "provider_actual": self.provider_actual,
+            "provider_actual": self._device(),
             "load_seconds": round(self.load_seconds, 3),
             # The fixed input the model takes. Longer audio is cut inside
             # the host as a fallback; the app sizes its pause segments to
             # fit instead (transcription.segment_limits).
             "window_seconds": round(getattr(self.model, "window_samples", 0) / 16000, 3),
         }
-        if self.fallback_reason:
-            status["provider_fallback_reason"] = self.fallback_reason
+        reason = self._reason()
+        if reason:
+            status["provider_fallback_reason"] = reason
         return status
+
+    def _device(self) -> str:
+        """The encoder's device right now: it moves CPU -> NPU when a
+        background compile finishes (openvino_asr.EncoderSlot)."""
+        device = getattr(self.model, "device", "") or self.provider_actual
+        return str(device).lower()
+
+    def _reason(self) -> str:
+        return self.fallback_reason or str(getattr(self.model, "note", "") or "")
 
     def create(self, request_id: int, config: dict) -> None:
         from . import openvino_asr
 
+        openvino_asr.on_event = _log
         if self.model is not None:
             self.respond(request_id, INVALID_ARGUMENT,
                          _error_body(INVALID_ARGUMENT, "a model is already loaded in this host"))
@@ -203,7 +214,10 @@ class _Host:
             body = {"text": transcript.text,
                     "processing_seconds": round(time.monotonic() - started, 4),
                     "model_id": self.model_id,
-                    "provider_actual": self.provider_actual}
+                    # Every response carries the device, so the app sees the
+                    # move to the NPU without asking for it.
+                    "provider_actual": self._device(),
+                    "provider_fallback_reason": self._reason()}
             if timestamps:
                 body["words"] = [{"w": w.w, "start": round(w.start, 3), "end": round(w.end, 3),
                                   "conf": round(w.conf, 4)} for w in transcript.words]

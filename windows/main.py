@@ -106,7 +106,6 @@ def main(argv: list[str]) -> int:
     tray.messageClicked.connect(windows.open_update_page)
     controller.history_toggle_requested.connect(windows.toggle_history)
     controller.history_bubbles_requested.connect(windows.show_history_bubbles)
-    controller.transcript_edit_requested.connect(windows.show_editor)
     # Anything wrong with the machine goes to the Windows notification
     # centre, where it stays until it is read: "no microphone" is worth
     # coming back to. Anything wrong with the dictation itself goes to the
@@ -154,7 +153,6 @@ class _Windows:
         self._history = None
         self._hud = None
         self._bubble = None
-        self._editor = None
         self._bubble_history = None
         self._toasts = None
         self._learn_toast = None
@@ -334,23 +332,6 @@ class _Windows:
             self._bubble = TranscriptBubble(self.hud)
             self._apply_hud_settings()
         return self._bubble
-
-    # -- correcting the last dictation ----------------------------------
-
-    @property
-    def editor(self):
-        if self._editor is None:
-            from superdictate.ui.editor import TranscriptEditor
-
-            self._editor = TranscriptEditor(self.hud)
-            self._editor.applied.connect(self._controller.apply_transcript_edit)
-            self._editor.closed.connect(self._overlay_closed)
-        return self._editor
-
-    def show_editor(self, text: str) -> None:
-        """The capsule comes back for the look of it; the bubble is the point."""
-        self._begin_overlay()
-        self.editor.edit(text)
 
     # -- quick history over the capsule ---------------------------------
 

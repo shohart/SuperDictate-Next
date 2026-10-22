@@ -133,6 +133,17 @@ class QueryResult:
 
 
 @dataclass(frozen=True)
+class FieldSnapshot:
+    """The focused text field, as edit_watch.py sees it."""
+
+    element: tuple      # UIA runtime id: the same field across polls
+    pid: int
+    text: str
+    caret: Optional[int]  # characters before the caret, when the field says
+    secure: bool
+
+
+@dataclass(frozen=True)
 class InsertionTarget:
     """What was focused when recording started (PendingTextInsertionTarget)."""
 
@@ -399,6 +410,9 @@ UIA_DOCUMENT_CONTROL = 50030
 TEXT_UNIT_CHARACTER = 0
 ENDPOINT_START = 0
 ENDPOINT_END = 1
+#: Larger fields are not watched for edits (edit_watch.py): the whole text is
+#: read on every poll, and a long document is not a dictation box.
+MAX_FIELD_CHARS = 200_000
 
 
 def _load_uia():
@@ -557,6 +571,47 @@ class _Uia:
             pass
         return None
 
+    def field_text(self, element) -> Optional[tuple[str, Optional[int]]]:
+        """The whole text of a text field and the caret's character offset.
+
+        TextPattern first, because it also gives the caret (the length of
+        the document range up to the selection start); ValuePattern for the
+        plain edits that only have that, without a caret. ``None`` for a
+        field whose text cannot be read, or one too large to read on every
+        poll (a long document).
+        """
+        text = self._pattern(element, UIA_TEXT_PATTERN_ID, self.module.IUIAutomationTextPattern)
+        if text is not None:
+            try:
+                document = text.DocumentRange
+                value = document.GetText(MAX_FIELD_CHARS + 1)
+            except Exception:
+                value = None
+            if value is not None:
+                if len(value) > MAX_FIELD_CHARS:
+                    return None
+                caret = None
+                try:
+                    selection = text.GetSelection()
+                    if selection and selection.Length > 0:
+                        before = document.Clone()
+                        before.MoveEndpointByRange(ENDPOINT_END, selection.GetElement(0),
+                                                   ENDPOINT_START)
+                        caret = len(before.GetText(MAX_FIELD_CHARS + 1))
+                except Exception:
+                    caret = None
+                return value, caret
+        value_pattern = self._pattern(element, UIA_VALUE_PATTERN_ID,
+                                      self.module.IUIAutomationValuePattern)
+        if value_pattern is not None:
+            try:
+                value = value_pattern.CurrentValue
+            except Exception:
+                return None
+            if value is not None and len(value) <= MAX_FIELD_CHARS:
+                return str(value), None
+        return None
+
     @staticmethod
     def _first_rect(text_range) -> Optional[Rect]:
         try:
@@ -611,6 +666,10 @@ class FocusProbe:
                     if user32.GetForegroundWindow() == target.window
                     else RestoreOutcome.NOT_ACTIVATED)
 
+    def read_field(self) -> Future:
+        """The focused field's text and caret (a :class:`FieldSnapshot`), or None."""
+        return self._submit(self._read_field)
+
     def release(self, target: Optional[InsertionTarget]) -> None:
         if target is not None and target.token:
             self._submit(lambda: self._pinned.pop(target.token, None))
@@ -647,6 +706,26 @@ class FocusProbe:
                 self._uia_failed = True
                 log.warning("UI Automation unavailable, Win32 caret only: %s", exc)
         return self._uia
+
+    def _read_field(self) -> Optional[FieldSnapshot]:
+        uia = self._automation()
+        if uia is None:
+            return None
+        element = uia.focused(0)
+        if element is None:
+            return None
+        try:
+            pid = int(element.CurrentProcessId)
+            secure = bool(element.CurrentIsPassword)
+        except Exception:
+            return None
+        if secure:
+            return FieldSnapshot(uia.runtime_id(element), pid, "", None, True)
+        read = uia.field_text(element)
+        if read is None:
+            return None
+        text, caret = read
+        return FieldSnapshot(uia.runtime_id(element), pid, text, caret, False)
 
     # -- locating ---------------------------------------------------------
 

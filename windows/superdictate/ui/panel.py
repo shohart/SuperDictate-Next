@@ -243,7 +243,6 @@ class ControlPanel(QMainWindow):
         rows = (
             ("mic", "panel_hotkey", "hotkey"),
             ("clock", "panel_hotkey_history", "history_hotkey"),
-            ("replace", "panel_hotkey_edit", "edit_hotkey"),
         )
         for row, (icon_name, label_key, attribute) in enumerate(rows):
             glyph = QLabel()

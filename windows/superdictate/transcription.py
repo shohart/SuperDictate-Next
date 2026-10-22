@@ -24,6 +24,7 @@ no window ever has to be cut again by the clock inside the model host.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -43,20 +44,33 @@ log = get_logger("transcription")
 _vad_lock = threading.Lock()
 _vad = None
 _vad_tried = False
+#: True when the last attempt failed only for want of the model file, which
+#: downloads in the background at startup (vad.ensure_model): worth another
+#: try once it is there. Any other failure (no DLL) is final.
+_vad_waiting_for_model = False
 
 
 def _shared_vad():
     """Silero VAD, loaded once on first use; ``None`` when unavailable."""
-    global _vad, _vad_tried
+    global _vad, _vad_tried, _vad_waiting_for_model
     with _vad_lock:
+        if _vad_tried and _vad is None and _vad_waiting_for_model:
+            from .vad import VAD_MODEL_SIZE, model_path
+
+            try:
+                _vad_tried = os.path.getsize(model_path()) != VAD_MODEL_SIZE
+            except OSError:
+                pass
         if not _vad_tried:
             _vad_tried = True
+            _vad_waiting_for_model = False
             try:
                 from .vad import SileroVad
 
                 candidate = SileroVad()
                 _vad = candidate if candidate.is_available else None
                 if _vad is None:
+                    _vad_waiting_for_model = "not downloaded" in (candidate.error or "")
                     log.info("Silero VAD unavailable (%s); seams use mel energy",
                              candidate.error)
             except Exception as exc:

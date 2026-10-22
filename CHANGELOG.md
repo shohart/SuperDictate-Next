@@ -6,6 +6,31 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Windows 0.8.3 — 2026-10-22
+
+Windows only, tag `win-v0.8.3`. macOS stays on 0.8.0.
+
+### Added
+- **Local text correction on the CPU or the GPU, Intel Arc included.** The build now ships llama.cpp's own `llama-server` (Vulkan build b11826, pinned by SHA-256, staged by `tools/fetch-llama.ps1`) as the local LLM host. Correction runs on it with VoiceScribe (Qwen3.5-0.8B Q6_K + the dictation-corrector LoRA). Benchmarked on a Core Ultra 5 225H (Arc 130T) with the 65-sentence correction corpus:
+  - CPU: 0.32 s median per sentence, EM 0.646 (normalized, as in `benchmark/`).
+  - GPU: 0.50 s median, with the same result as the CPU on 64 of 65 sentences.
+  - Requests are greedy (temperature 0), as on macOS.
+  - Local rewrite is not part of this release: rewrite goes to an OpenAI-compatible endpoint, and the local model list offers the small correction model only.
+- **Corrections are learned from edits made in place, as on macOS.** For 45 s after a paste the field is watched through UI Automation (`edit_watch.py`, a port of `PostInsertionEditWatcher`). A swap of one to three words that stays unchanged for 4 s is saved as a rule, with the usual toast and undo. Deletions, casing-only edits, edits outside the pasted text and password fields are never learned. The separate transcript-editor shortcut and dialog are gone.
+- **Silero VAD downloads itself** (885 KB, pinned and checksummed), as on macOS since 0.8.0. Until now the Windows port never fetched it, so the seams of long dictations always fell back to mel energy.
+
+### Fixed
+- **GigaAM on the NPU no longer looks stuck on "preparing".** Its first NPU compile takes 4–10 minutes on this laptop, and an app restart lost it, so the next start began again from zero. The NPU compile now runs in the background. If it is not done within 15 s, the encoder starts on the CPU (same weights, same text) and moves to the NPU between dictations once compiled. A cached compile still starts on the NPU directly.
+- **Vulkan on Intel graphics returned empty or garbage corrections.** Its cooperative-matrix shaders break batched prompt processing on driver 32.0.101.6554. The host now turns them off (`GGML_VK_DISABLE_COOPMAT=1`), which is also faster: prompt processing goes from 870 to 1140 tok/s.
+
+### Validation
+- Windows 0.8.3: 61 self-tests pass. New ones cover the edit watcher (in place, half-typed, rebase, deletion, focus change, outside edits, password, 45 s window), the background NPU compile (slow, cached, failed), and the llama-server flags. Checked on this laptop:
+  - In Notepad, a word fixed by hand after a real Ctrl+V paste was learned 4 s later.
+  - Correction ran through the app's pipeline on both the CPU and the GPU.
+  - GigaAM was ready on the CPU in 19 s with an empty compile cache.
+- Not compared: SYCL, which crashes at device initialisation on this GPU driver; llama.cpp's OpenVINO backend, which does not run Qwen3.5 (graph compute error, with or without the LoRA); and OpenVINO GenAI, left for later.
+- Built on the build PC: 61 self-tests, `engines\llama` staged. Installed silently there (exit code 0). `SuperDictate-0.8.3-setup.exe` SHA-256: `cbabd4e12f1346df2b00985d5ba7d411ca0f37126da7c68d888bf0e949f6884f`.
+
 ## Windows 0.8.2 — 2026-10-22
 
 Windows only, tag `win-v0.8.2`. macOS stays on 0.8.0.

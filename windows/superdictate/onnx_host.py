@@ -241,6 +241,12 @@ class OnnxHost:
         text = result.get("text")
         if not isinstance(text, str):
             raise InvalidResponse("missing text")
+        # SuperDictateOvHost reports its device on every response: a model
+        # that started on the CPU moves to the NPU once its compile is done.
+        provider = result.get("provider_actual")
+        if isinstance(provider, str) and provider:
+            self.provider_actual = provider
+            self.provider_fallback_reason = str(result.get("provider_fallback_reason", "") or "")
         words = tuple(
             HostWord(text=str(item.get("w", "")), start=float(item.get("start", 0.0)),
                      end=float(item.get("end", 0.0)))

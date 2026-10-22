@@ -1,9 +1,10 @@
 """The local LLM host process, and the OpenAI-compatible client for it.
 
-``superdictate-llm-host.exe`` is the same hand-written C++ host the macOS
-build spawns (``swift/Sources/llama_cpp_host/bridge/``), built from the same
-vendored llama.cpp with the same CPU and Vulkan backends
-(``tools/build-engines.ps1``). It loads one GGUF model
+Release builds ship llama.cpp's own ``llama-server`` (Vulkan build, staged by
+``tools/fetch-llama.ps1`` into ``engines\\llama``). Experimental builds may
+instead carry ``superdictate-llm-host.exe``, the hand-written C++ host the
+macOS build spawns (``swift/Sources/llama_cpp_host/bridge/``, built by
+``tools/build-engines.ps1``). Either one loads one GGUF model
 (optionally with a LoRA adapter) and serves ``/health`` plus
 ``/v1/chat/completions`` over loopback HTTP — deliberately indistinguishable
 from a real OpenAI-compatible server, so the same client code below serves
@@ -64,19 +65,79 @@ def _free_loopback_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def llama_server_executable() -> "os.PathLike[str]":
+    """llama.cpp's own server, Vulkan build (tools/fetch-llama.ps1)."""
+    return paths.resource_path("engines", "llama", "llama-server.exe")
+
+
 def host_executable() -> "os.PathLike[str]":
-    """Where the bundled host binary lives."""
+    """Where the bundled host binary lives: llama-server when staged, else
+    the hand-written host of experimental builds (tools/build-engines.ps1)."""
+    server = llama_server_executable()
+    if os.path.isfile(server):
+        return server
     return paths.resource_path("engines", "superdictate-llm-host.exe")
 
 
 def bundled_host_available() -> bool:
-    """Whether this build ships the local host at all.
-
-    Release builds do not (tools/build-engines.ps1 builds it only with
-    ``-ExperimentalLlmHost``): post-processing then runs through a
-    user-supplied OpenAI-compatible endpoint only.
-    """
+    """Whether this build ships a local host at all. Without one,
+    post-processing runs through a user-supplied OpenAI-compatible endpoint."""
     return os.path.isfile(host_executable())
+
+
+def host_command(executable: str, spec: "HostSpec", port: int) -> tuple[list[str], Optional[str],
+                                                                          dict[str, str]]:
+    """``(argv, cwd, extra environment)`` for one host process.
+
+    llama-server takes the macOS host's flags with three differences, all
+    measured on the target (Core Ultra 5 225H, Arc 130T, driver
+    32.0.101.6554) with the VoiceScribe correction set:
+
+    * A LoRA scale is ``--lora-scaled FILE:SCALE``, and the parser splits on
+      ':' — so a drive letter breaks it. The adapter is passed by bare file
+      name, with the process started in its directory.
+    * On the GPU, Vulkan's cooperative-matrix shaders return empty or
+      garbage answers for any prompt processed as a batch on Intel's
+      driver; ``GGML_VK_DISABLE_COOPMAT=1`` makes the output match the CPU
+      (64 of 65 answers identical) and is faster as well (prompt 1140 vs
+      870 tok/s).
+    * Qwen3.5 is a hybrid model, so the server reuses a cached prompt
+      prefix through context checkpoints, and restoring one on Vulkan feeds
+      the rest of the prompt a token at a time (~35 tok/s). Processing the
+      whole prompt each time is faster there (p50 0.50 s vs 0.85 s). The
+      CPU is the other way round (0.32 s with the cache, 0.75 s without), so
+      it keeps them. Either way one request at a time (``--parallel 1``),
+      as the dictation is sequential.
+    """
+    if os.path.basename(str(executable)).lower() != "llama-server.exe":
+        argv = [str(executable),
+                "--model", spec.model_path,
+                "--host", "127.0.0.1",
+                "--port", str(port),
+                "--ctx-size", str(spec.context_size),
+                "--gpu-layers", str(spec.gpu_layers)]
+        if spec.lora_path:
+            argv += ["--lora", spec.lora_path, "--lora-scale", str(spec.lora_scale)]
+        return argv, None, {}
+
+    argv = [str(executable),
+            "--model", spec.model_path,
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--ctx-size", str(spec.context_size),
+            "--parallel", "1",
+            "--no-webui"]
+    env: dict[str, str] = {}
+    if spec.gpu_layers > 0:
+        argv += ["--gpu-layers", str(spec.gpu_layers), "--ctx-checkpoints", "0"]
+        env["GGML_VK_DISABLE_COOPMAT"] = "1"
+    else:
+        argv += ["--device", "none", "--gpu-layers", "0"]
+    cwd = None
+    if spec.lora_path:
+        cwd = os.path.dirname(spec.lora_path)
+        argv += ["--lora-scaled", f"{os.path.basename(spec.lora_path)}:{spec.lora_scale:g}"]
+    return argv, cwd, env
 
 
 def _engine_environment() -> dict[str, str]:
@@ -143,17 +204,10 @@ class LLMHostProcess:
             raise LLMHostError(f"host binary not found: {executable}")
 
         self._port = _free_loopback_port()
-        argv = [
-            str(executable),
-            "--model", self.spec.model_path,
-            "--host", "127.0.0.1",
-            "--port", str(self._port),
-            "--ctx-size", str(self.spec.context_size),
-            "--gpu-layers", str(self.spec.gpu_layers),
-        ]
-        if self.spec.lora_path:
-            argv += ["--lora", self.spec.lora_path,
-                     "--lora-scale", str(self.spec.lora_scale)]
+        argv, cwd, extra_env = host_command(str(executable), self.spec, self._port)
+        env = _engine_environment()
+        for key, value in extra_env.items():
+            env.setdefault(key, value)  # a value set by hand wins, for debugging
 
         started = time.monotonic()
         # The host's own stderr (model load, device, errors) goes to a log
@@ -165,7 +219,8 @@ class LLMHostProcess:
         try:
             self._process = subprocess.Popen(
                 argv,
-                env=_engine_environment(),
+                env=env,
+                cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
@@ -212,8 +267,13 @@ class LLMHostProcess:
 
     def complete(self, messages: Sequence[Message], *,
                  max_tokens: int = 512,
-                 temperature: Optional[float] = None) -> str:
-        """One chat completion. Returns the assistant's content."""
+                 temperature: Optional[float] = 0.0) -> str:
+        """One chat completion. Returns the assistant's content.
+
+        Greedy unless asked otherwise: the macOS host always is, and
+        llama-server would otherwise sample at its default of 0.8, which
+        makes the corrector answer differently to the same sentence.
+        """
         return chat_completion(self.base_url, messages,
                                max_tokens=max_tokens, temperature=temperature)
 

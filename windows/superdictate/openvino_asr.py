@@ -26,6 +26,7 @@ most requests inside one window.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -399,16 +400,137 @@ def stitch(kept: list[Word], words: Sequence[Word], keep_from: float, keep_until
 CancelCheck = Callable[[], bool]
 
 
+#: How long a load waits for the NPU compile before it starts on the CPU and
+#: lets the compile finish in the background. A cached blob loads in 1-3 s;
+#: a first compile of the GigaAM encoder takes minutes (4-5 on a Core Ultra 5
+#: 225H on mains power, longer on battery). Nobody should wait that out, nor
+#: lose it to an app restart and start again from zero.
+NPU_QUICK_WAIT_SECONDS = 15.0
+
+#: Set by the host to its log: background compile outcomes are reported here.
+on_event: Optional[Callable[[str], None]] = None
+
+
+def _emit(message: str) -> None:
+    if on_event is not None:
+        try:
+            on_event(message)
+        except Exception:
+            pass
+
+
+class EncoderSlot:
+    """The encoder of one model, on the NPU as soon as it is compiled.
+
+    Everything else (features, prediction net, joint) is small and always
+    runs on the CPU. For the encoder an NPU compile starts in the background;
+    if it is done within :data:`NPU_QUICK_WAIT_SECONDS` (a cached blob is)
+    the model starts on the NPU. Otherwise it starts on the CPU right away,
+    same weights, same text, and :meth:`swap` moves it to the NPU between
+    two requests once the compile finishes. A compile that fails leaves it
+    on the CPU, with the reason in :attr:`npu_error`.
+    """
+
+    def __init__(self, path: Path, device: str, cache_directory: Optional[Path],
+                 quick_wait: float = NPU_QUICK_WAIT_SECONDS) -> None:
+        self.path = path
+        self.device = ""
+        self.compiled = None
+        self.request = None
+        self.npu_error = ""
+        self._pending = None
+        self._lock = threading.Lock()
+        self._compiling = threading.Event()
+        if not path.is_file():
+            raise InvalidModel(f"missing model file {path.name}")
+        if device != "NPU":
+            self._use(_compile(_core(cache_directory), path, device), device)
+            return
+
+        done = threading.Event()
+        self._compiling.set()
+
+        def build() -> None:
+            started = time.monotonic()
+            try:
+                core = _core(cache_directory)
+                _configure_npu(core)
+                compiled = _compile(core, path, "NPU")
+                with self._lock:
+                    self._pending = compiled
+                _emit(f"{path.name}: NPU ready after {time.monotonic() - started:.0f}s")
+            except Exception as exc:
+                lines = str(exc).strip().splitlines() or [type(exc).__name__]
+                self.npu_error = lines[-1][:300]
+                _emit(f"{path.name}: NPU compile failed, staying on the CPU: {self.npu_error}")
+            finally:
+                self._compiling.clear()
+                done.set()
+
+        threading.Thread(target=build, name="npu-compile", daemon=True).start()
+        if done.wait(quick_wait):
+            self.swap()
+        if self.device != "NPU":
+            if not self.npu_error:
+                _emit(f"{path.name}: compiling for the NPU in the background; "
+                      f"running on the CPU meanwhile")
+            # No CACHE_DIR: the CPU copy is a stopgap, and its blob would be
+            # another gigabyte on disk for Parakeet.
+            self._use(_compile(_core(None), path, "CPU"), "CPU")
+
+    @property
+    def compiling(self) -> bool:
+        return self._compiling.is_set()
+
+    def _use(self, compiled, device: str) -> None:
+        self.compiled = compiled
+        self.request = compiled.create_infer_request()
+        self.device = device
+
+    def swap(self) -> bool:
+        """Move to the NPU if its compile has finished. Call between requests."""
+        with self._lock:
+            pending, self._pending = self._pending, None
+        if pending is None:
+            return False
+        self._use(pending, "NPU")
+        return True
+
+    @property
+    def outputs(self):
+        return self.compiled.outputs
+
+    @property
+    def inputs(self):
+        return self.compiled.inputs
+
+
 class OvFamily:
     """One loaded model. ``transcribe`` is not reentrant; the host serialises."""
 
     window_samples: int
     overlap_samples: int
     frame_sec: float
-    device: str = "CPU"
     load_seconds: float = 0.0
+    encoder: EncoderSlot
+
+    @property
+    def device(self) -> str:
+        return self.encoder.device
+
+    @property
+    def note(self) -> str:
+        """Why the encoder is not (yet) on the NPU it was asked for, or ``""``."""
+        if self.encoder.device == "NPU":
+            return ""
+        if self.encoder.compiling:
+            return "NPU: compiling in the background, running on the CPU meanwhile"
+        if self.encoder.npu_error:
+            return f"NPU: {self.encoder.npu_error}"
+        return ""
 
     def transcribe(self, samples: np.ndarray, cancelled: CancelCheck = lambda: False) -> Transcript:
+        self.encoder.swap()
         samples = np.ascontiguousarray(samples, dtype=np.float32)
         spans = plan_windows(samples.size, self.window_samples, self.overlap_samples)
         if len(spans) == 1:
@@ -459,16 +581,13 @@ class ParakeetTdt(OvFamily):
     def __init__(self, directory: Path, device: str, cache_directory: Optional[Path]) -> None:
         started = time.monotonic()
         core = _core(cache_directory)
-        if device == "NPU":
-            _configure_npu(core)
-        self.device = device
         vocab = json.loads((directory / "parakeet_vocab.json").read_text(encoding="utf-8"))
         self.pieces = list(vocab["id_to_token"])
         if len(self.pieces) != self.BLANK:
             raise InvalidModel("parakeet vocabulary is not 8192 pieces")
 
         self.mel = _compile(core, directory / "parakeet_melspectogram.xml", "CPU")
-        self.encoder = _compile(core, directory / "parakeet_encoder.xml", device)
+        self.encoder = EncoderSlot(directory / "parakeet_encoder.xml", device, cache_directory)
         self.decoder = _compile(core, directory / "parakeet_decoder.xml", "CPU")
         self.joint = _compile(core, directory / "parakeet_joint.xml", "CPU")
 
@@ -482,11 +601,8 @@ class ParakeetTdt(OvFamily):
             raise InvalidModel(f"parakeet joint width {logits}")
 
         self._mel = self.mel.create_infer_request()
-        self._enc = self.encoder.create_infer_request()
         self._dec = self.decoder.create_infer_request()
         self._joint = self.joint.create_infer_request()
-        self._enc_out = self.encoder.outputs[0]
-        self._enc_len = self.encoder.outputs[1]
         self._dec_out = [_port(self.decoder, n) for n in ("decoder_output", "h_out", "c_out")]
         self.load_seconds = time.monotonic() - started
 
@@ -505,10 +621,11 @@ class ParakeetTdt(OvFamily):
         feature_len = int(mel[self.mel.outputs[1]].reshape(-1)[0])
         self._check(cancelled)
 
-        enc = self._enc.infer({"melspectogram": features,
-                               "melspectogram_length": np.array([feature_len], dtype=np.int32)})
-        encoded = enc[self._enc_out][0]                 # [D, T]
-        frames = min(int(enc[self._enc_len].reshape(-1)[0]), encoded.shape[1])
+        enc = self.encoder.request.infer({
+            "melspectogram": features,
+            "melspectogram_length": np.array([feature_len], dtype=np.int32)})
+        encoded = enc[self.encoder.outputs[0]][0]                 # [D, T]
+        frames = min(int(enc[self.encoder.outputs[1]].reshape(-1)[0]), encoded.shape[1])
         frame_major = np.ascontiguousarray(encoded[:, :frames].T)
         self._check(cancelled)
 
@@ -552,14 +669,12 @@ class GigaamRnnt(OvFamily):
     def __init__(self, directory: Path, device: str, cache_directory: Optional[Path]) -> None:
         started = time.monotonic()
         core = _core(cache_directory)
-        if device == "NPU":
-            _configure_npu(core)
-        self.device = device
         self.pieces = sentencepiece_pieces(directory / "tokenizer.model")
         if len(self.pieces) != self.BLANK:
             raise InvalidModel(f"GigaAM tokenizer has {len(self.pieces)} pieces, expected 1024")
 
-        self.encoder = _compile(core, directory / "v3_e2e_rnnt_encoder_static.xml", device)
+        self.encoder = EncoderSlot(directory / "v3_e2e_rnnt_encoder_static.xml", device,
+                                   cache_directory)
         self.decoder = _compile(core, directory / "v3_e2e_rnnt_decoder.xml", "CPU")
         self.joint = _compile(core, directory / "v3_e2e_rnnt_joint.xml", "CPU")
 
@@ -572,7 +687,6 @@ class GigaamRnnt(OvFamily):
         self.window_samples = (self.feature_frames - 1) * 160 + 320
         self.overlap_samples = 4 * SAMPLE_RATE
 
-        self._enc = self.encoder.create_infer_request()
         self._dec = self.decoder.create_infer_request()
         self._joint = self.joint.create_infer_request()
         self._dec_out = [_port(self.decoder, n) for n in ("dec", "h", "c")]
@@ -592,7 +706,8 @@ class GigaamRnnt(OvFamily):
         padded[0, :, :valid] = features[:, :valid]
         self._check(cancelled)
 
-        enc = self._enc.infer({"audio_signal": padded, "length": np.array([valid], dtype=np.int64)})
+        enc = self.encoder.request.infer({"audio_signal": padded,
+                                          "length": np.array([valid], dtype=np.int64)})
         encoded = enc[self.encoder.outputs[0]][0]
         frames = min(int(enc[self.encoder.outputs[1]].reshape(-1)[0]), encoded.shape[1])
         frame_major = np.ascontiguousarray(encoded[:, :frames].T)

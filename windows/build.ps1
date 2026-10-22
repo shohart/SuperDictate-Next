@@ -53,6 +53,10 @@ if (-not $SkipEngines) {
     Write-Host "Building Silero VAD..." -ForegroundColor Cyan
     & .\tools\build-engines.ps1
     if ($LASTEXITCODE) { throw "build-engines failed." }
+    # After build-engines, which recreates engines\.
+    Write-Host "Staging the local LLM host (llama.cpp Vulkan)..." -ForegroundColor Cyan
+    & .\tools\fetch-llama.ps1
+    if ($LASTEXITCODE) { throw "fetch-llama failed." }
 }
 
 # comtypes writes its UI Automation wrappers into comtypes.gen the first

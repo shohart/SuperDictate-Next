@@ -335,7 +335,7 @@ class HotkeyStateMachine:
         is_recording: bool,
         can_start_recording: bool = True,
         history_hotkey: HotkeyChoice = DEFAULT_HISTORY_HOTKEY,
-        edit_hotkey: HotkeyChoice = DEFAULT_EDIT_HOTKEY,
+        edit_hotkey: Optional[HotkeyChoice] = DEFAULT_EDIT_HOTKEY,
         correction_hotkey: HotkeyChoice = DEFAULT_CORRECTION_HOTKEY,
         rewrite_hotkey: HotkeyChoice = DEFAULT_REWRITE_HOTKEY,
         rewrite_style_hotkey: HotkeyChoice = DEFAULT_REWRITE_STYLE_HOTKEY,
@@ -357,6 +357,8 @@ class HotkeyStateMachine:
             (self._rewrite, rewrite_hotkey, Action.TOGGLE_REWRITE),
             (self._correction, correction_hotkey, Action.TOGGLE_CORRECTION),
         ):
+            if shortcut is None:
+                continue  # not assigned
             handled = self._transition_chord(
                 state, event, is_recording, shortcut, action)
             if handled is not None:

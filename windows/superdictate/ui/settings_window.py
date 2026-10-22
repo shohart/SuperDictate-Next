@@ -357,9 +357,6 @@ class SettingsWindow(QDialog):
         self._history_hotkey_button = self._shortcut_row(
             keys, "settings_history_hotkey", "history_hotkey",
             i18n.tr("settings_history_hotkey_hint"))
-        self._edit_hotkey_button = self._shortcut_row(
-            keys, "settings_edit_hotkey", "edit_hotkey",
-            i18n.tr("settings_edit_hotkey_hint"))
 
         behaviour = Section(i18n.tr("settings_section_behaviour"))
         self._trigger = self._combo(
@@ -642,9 +639,9 @@ class SettingsWindow(QDialog):
         choice. The weights are gigabytes, so the download is offered here
         rather than happening on the first dictation that wants them.
         """
-        from ..llm import BundledLLMModel, RewriteStyle
+        from ..llm import RewriteStyle
         from ..llm.host import bundled_host_available
-        from ..llm.models import PROFILES
+        from ..llm.models import LOCAL_CORRECTION_MODELS, LOCAL_REWRITE_ENABLED, PROFILES
 
         bundled = bundled_host_available()
         engines = [("bundledLocal", i18n.tr("settings_llm_engine_bundled")),
@@ -662,7 +659,7 @@ class SettingsWindow(QDialog):
             self._correction_model = self._combo(
                 correction, "settings_correction_model", "correction_bundled_model_v2",
                 [(model.value, i18n.tr(f"llm_model_{model.value}"))
-                 for model in BundledLLMModel],
+                 for model in LOCAL_CORRECTION_MODELS],
             )
         self._endpoint_fields(correction, "llm_custom")
         self._correction_prompt = self._prompt_editor(
@@ -677,12 +674,12 @@ class SettingsWindow(QDialog):
             [(style.value, i18n.tr(f"rewrite_style_{style.value}"))
              for style in RewriteStyle],
         )
-        if bundled:
+        if bundled and LOCAL_REWRITE_ENABLED:
             self._combo(rewrite, "settings_llm_engine", "rewrite_engine_backend_v1", engines)
             self._rewrite_model = self._combo(
                 rewrite, "settings_rewrite_model", "rewrite_bundled_model_v2",
                 [(model.value, i18n.tr(f"llm_model_{model.value}"))
-                 for model in BundledLLMModel],
+                 for model in PROFILES],
             )
         self._endpoint_fields(rewrite, "rewrite_custom")
         for style in RewriteStyle:
@@ -704,8 +701,9 @@ class SettingsWindow(QDialog):
         models = Section(i18n.tr("settings_llm_models"),
                          i18n.tr("settings_llm_models_hint"))
         self._model_rows = {}
-        for model, model_profile in PROFILES.items():
-            self._model_rows[model] = self._model_row(models, model, model_profile)
+        offered = LOCAL_CORRECTION_MODELS if not LOCAL_REWRITE_ENABLED else tuple(PROFILES)
+        for model in offered:
+            self._model_rows[model] = self._model_row(models, model, PROFILES[model])
 
         return _page(correction, rewrite, device, models)
 

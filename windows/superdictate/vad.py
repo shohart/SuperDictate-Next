@@ -59,8 +59,50 @@ class _VadContextParams(ctypes.Structure):
     ]
 
 
+VAD_MODEL_SIZE = 885_098
+
+
 def model_path() -> str:
     return str(paths.MODELS_DIR / "vad" / VAD_MODEL_FILENAME)
+
+
+def ensure_model() -> bool:
+    """Download the model if it is not there yet. True when it is in place.
+
+    Port of ``downloadSileroVadModelIfNeeded``: macOS fetches the model in
+    the background at startup, and the Windows port never did, so the seams
+    of long dictations fell back to mel energy on every machine. 885 KB,
+    pinned by revision, size and SHA-256; written to a ``.part`` file and
+    renamed only once verified.
+    """
+    import hashlib
+    import urllib.request
+
+    target = model_path()
+    if os.path.isfile(target) and os.path.getsize(target) == VAD_MODEL_SIZE:
+        return True
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    partial = target + ".part"
+    try:
+        request = urllib.request.Request(VAD_MODEL_URL, headers={"User-Agent": "SuperDictate"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read(VAD_MODEL_SIZE + 1)
+        if len(data) != VAD_MODEL_SIZE:
+            raise OSError(f"got {len(data)} bytes, expected {VAD_MODEL_SIZE}")
+        if hashlib.sha256(data).hexdigest() != VAD_MODEL_SHA256:
+            raise OSError("SHA-256 mismatch")
+        with open(partial, "wb") as handle:
+            handle.write(data)
+        os.replace(partial, target)
+    except Exception as exc:
+        log.info("Silero VAD model download failed (seams use mel energy): %s", exc)
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        return False
+    log.info("Silero VAD model downloaded to %s", target)
+    return True
 
 
 def _engine_directory() -> str:

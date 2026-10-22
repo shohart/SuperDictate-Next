@@ -16,8 +16,7 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "status_starting": ("Запуск…", "Starting…"),
     "status_downloading": ("Загрузка модели", "Downloading model"),
     "status_loading": ("Загрузка модели в память", "Loading model"),
-    "status_loading_npu": ("Подготовка модели для NPU (в первый раз — до 5 минут)",
-                           "Preparing the model for the NPU (up to 5 minutes the first time)"),
+    "status_loading_npu": ("Загрузка модели для NPU", "Loading the model for the NPU"),
     "status_ready": ("Работает", "Ready"),
     "status_recording": ("Запись", "Recording"),
     "status_correcting": ("Обработка текста", "Post-processing"),
@@ -99,20 +98,22 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_model_absent": ("Не загружена · {size} МБ", "Not downloaded · {size} MB"),
     "settings_model_failed": ("Ошибка: {error}", "Failed: {error}"),
     "settings_model_download": ("Скачать", "Download"),
-    "llm_model_voicescribe": ("Быстрая (0.8B + адаптер)", "Fast (0.8B + adapter)"),
+    "llm_model_voicescribe": ("VoiceScribe (0.8B + адаптер)", "VoiceScribe (0.8B + adapter)"),
     "llm_model_yandexgpt": ("Качественная (8B)", "Quality (8B)"),
 
     # -- compute devices, one per engine -----------------------------
     "settings_llm_device": ("Где считать", "Where it runs"),
     "settings_llm_device_hint": (
-        "Настраивается отдельно от распознавания речи: языковая модель "
-        "заметно быстрее на видеокарте, а Parakeet на этих машинах "
-        "оказывается быстрее и точнее на процессоре.",
-        "Set independently of speech recognition: the language model is "
-        "much faster on the GPU, while Parakeet turns out faster and more "
-        "accurate on the CPU on these machines."),
+        "Настраивается отдельно от распознавания речи. Видеокарта (Vulkan) "
+        "освобождает процессор; маленькой модели коррекции на встроенной "
+        "графике Intel хватает и процессора — около 0,3–0,5 с на фразу "
+        "в обоих случаях, результат одинаковый.",
+        "Set independently of speech recognition. The GPU (Vulkan) leaves "
+        "the CPU free; for the small correction model on Intel integrated "
+        "graphics the CPU is just as good: about 0.3-0.5 s per sentence "
+        "either way, with the same result."),
     "settings_llm_backend": ("Обработка текста", "Text post-processing"),
-    "settings_llm_backend_gpu": ("Видеокарта (экспериментально)", "GPU (experimental)"),
+    "settings_llm_backend_gpu": ("Видеокарта (Vulkan)", "GPU (Vulkan)"),
     "settings_llm_backend_cpu": ("Процессор", "CPU"),
 
     # -- HUD ---------------------------------------------------------
@@ -370,15 +371,19 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_speech_backend_hint": (
         "На нейропроцессоре Intel распознавание не нагружает процессор и "
         "расходует меньше батареи. Для него скачивается своя сборка модели "
-        "(Parakeet ~1,2 ГБ, GigaAM ~220 МБ). При первом запуске модель "
-        "компилируется под NPU — это занимает до 5 минут, дальше загрузка "
-        "идёт за секунды. Если NPU не заработает, распознавание останется "
-        "на процессоре.",
+        "(Parakeet ~1,2 ГБ, GigaAM ~220 МБ). В первый раз модель "
+        "компилируется под NPU в фоне (GigaAM — несколько минут), а "
+        "диктовка тем временем уже работает на процессоре и сама переходит "
+        "на NPU, когда компиляция закончится. Дальше загрузка идёт за "
+        "секунды. Если NPU не заработает, распознавание останется на "
+        "процессоре.",
         "On the Intel NPU, recognition leaves the CPU free and uses less "
         "battery. It downloads its own build of the model (Parakeet "
-        "~1.2 GB, GigaAM ~220 MB). The first start compiles the model for "
-        "the NPU, which takes up to 5 minutes; after that it loads in "
-        "seconds. If the NPU fails, recognition stays on the CPU."),
+        "~1.2 GB, GigaAM ~220 MB). The first time, the model is compiled "
+        "for the NPU in the background (minutes for GigaAM); dictation "
+        "already works on the CPU meanwhile and moves to the NPU by itself "
+        "when the compile is done. After that it loads in seconds. If the "
+        "NPU fails, recognition stays on the CPU."),
     "settings_save_restart": ("Сохранить и перезапустить", "Save and restart"),
     "settings_cancel": ("Отмена", "Cancel"),
 

@@ -1086,6 +1086,7 @@ def test_llm_backend_without_bundled_host() -> None:
     # Release builds ship no LLM host: a stored "bundledLocal" (the macOS
     # default) must read as the endpoint, and the endpoint must get the
     # zero-shot prompt and the macOS default model name.
+    import os
     import tempfile
     from unittest import mock
 
@@ -1105,6 +1106,34 @@ def test_llm_backend_without_bundled_host() -> None:
     from .llm.models import BundledLLMModel, profile
     _check("the VoiceScribe rsLoRA runs at the macOS scale",
            profile(BundledLLMModel.VOICESCRIBE).lora_scale, 4.0)
+    with mock.patch("superdictate.llm.host.bundled_host_available", return_value=True):
+        settings._set("rewrite_engine_backend_v1", "bundledLocal")
+        _check("local host: rewrite still goes to the endpoint (correction only)",
+               settings.rewrite_config().backend, LLMBackend.CUSTOM_ENDPOINT)
+        settings._set("correction_bundled_model_v2", "yandexgpt")
+        _check("local host: an 8B correction model from macOS reads as VoiceScribe",
+               settings.correction_config().model, BundledLLMModel.VOICESCRIBE)
+
+    from .llm.host import HostSpec, host_command
+    lora = r"C:\Program Files\SuperDictate\_internal\assets\models\gec-lora-adapter.gguf"
+    gpu = HostSpec(model_path=r"C:\m\Qwen.gguf", lora_path=lora, lora_scale=4.0, gpu_layers=99)
+    argv, cwd, env = host_command(r"C:\x\engines\llama\llama-server.exe", gpu, 5000)
+    _check("llama-server: the LoRA goes by bare name, with its scale",
+           argv[argv.index("--lora-scaled") + 1], "gec-lora-adapter.gguf:4")
+    _check("llama-server: started in the adapter's folder", cwd, os.path.dirname(lora))
+    _check("llama-server on the GPU: no cooperative-matrix shaders",
+           env.get("GGML_VK_DISABLE_COOPMAT"), "1")
+    _check("llama-server on the GPU: no context checkpoints",
+           argv[argv.index("--ctx-checkpoints") + 1], "0")
+    _check("llama-server: one request at a time", argv[argv.index("--parallel") + 1], "1")
+    cpu = HostSpec(model_path=r"C:\m\Qwen.gguf", gpu_layers=0)
+    argv, cwd, env = host_command(r"C:\x\engines\llama\llama-server.exe", cpu, 5000)
+    _check("llama-server on the CPU: no GPU device at all",
+           (argv[argv.index("--device") + 1], "--ctx-checkpoints" in argv, env), ("none", False, {}))
+    legacy, _, _ = host_command(r"C:\x\engines\superdictate-llm-host.exe", gpu, 5000)
+    _check("the macOS-style host keeps its own flags",
+           legacy[legacy.index("--lora-scale") + 1], "4.0")
+
     endpoint = CustomEndpoint(base_url="http://127.0.0.1:1234")
     _check("an endpoint needs only its address", endpoint.is_configured, True)
     _check("an empty model name falls back to the macOS default",
@@ -1512,6 +1541,135 @@ def test_openvino_host_ipc() -> None:
         refused.shutdown()
 
 
+def test_npu_encoder_background_compile() -> None:
+    """A slow NPU compile starts the model on the CPU and moves it over later;
+    a cached (fast) one starts on the NPU; a failed one stays on the CPU."""
+    import tempfile
+    import threading
+    import time
+    import types
+
+    from . import openvino_asr
+
+    path = Path(tempfile.mkdtemp()) / "encoder.xml"
+    path.write_text("<net/>", encoding="utf-8")
+    release = threading.Event()
+    behaviour = {"npu": "slow"}
+
+    def fake_compile(core, model_path, device):
+        if device == "NPU":
+            if behaviour["npu"] == "fail":
+                raise RuntimeError("compile\nZE_RESULT_ERROR_INVALID_ARGUMENT")
+            if behaviour["npu"] == "slow":
+                release.wait(5)
+        return types.SimpleNamespace(device=device, outputs=[], inputs=[],
+                                     create_infer_request=lambda: f"request-{device}")
+
+    saved = (openvino_asr._compile, openvino_asr._core, openvino_asr._configure_npu)
+    openvino_asr._compile = fake_compile
+    openvino_asr._core = lambda cache: object()
+    openvino_asr._configure_npu = lambda core: None
+    try:
+        slot = openvino_asr.EncoderSlot(path, "NPU", None, quick_wait=0.05)
+        _check("npu slow: starts on the CPU", (slot.device, slot.request), ("CPU", "request-CPU"))
+        _check("npu slow: says it is compiling", slot.compiling, True)
+        _check("npu slow: nothing to swap yet", slot.swap(), False)
+        release.set()
+        deadline = time.monotonic() + 5
+        while slot.compiling and time.monotonic() < deadline:
+            time.sleep(0.01)
+        _check("npu slow: moves to the NPU once compiled",
+               (slot.swap(), slot.device, slot.request), (True, "NPU", "request-NPU"))
+
+        behaviour["npu"] = "fast"
+        _check("npu cached: starts on the NPU",
+               openvino_asr.EncoderSlot(path, "NPU", None, quick_wait=2).device, "NPU")
+
+        behaviour["npu"] = "fail"
+        failed = openvino_asr.EncoderSlot(path, "NPU", None, quick_wait=2)
+        _check("npu failed: stays on the CPU", failed.device, "CPU")
+        _check("npu failed: keeps the reason", failed.npu_error, "ZE_RESULT_ERROR_INVALID_ARGUMENT")
+    finally:
+        openvino_asr._compile, openvino_asr._core, openvino_asr._configure_npu = saved
+
+
+def _run_edit_watch(states, inserted, *, pid=42):
+    """Drive edit_watch.EditWatcher through ``states``: ``[(at_seconds, text, element)]``,
+    each field state holding from its time until the next one. Returns the
+    candidates it saved."""
+    import time as _time
+
+    from . import edit_watch
+    from .focus_target import FieldSnapshot
+
+    clock = {"t": 0.0}
+    learned = []
+
+    def read():
+        current = None
+        for at, text, element in states:
+            if clock["t"] >= at:
+                current = (text, element)
+        if current is None or current[0] is None:
+            return None
+        text, element = current
+        return FieldSnapshot(element=element, pid=pid, text=text,
+                             caret=None, secure=text == "<password>")
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+
+    watcher = edit_watch.EditWatcher(read, lambda c: learned.append((c.source, c.replacement)) or True,
+                                     clock=lambda: clock["t"], sleep=fake_sleep)
+    watcher.begin(inserted)
+    deadline = _time.monotonic() + 10
+    while watcher._thread is not None and watcher._thread.is_alive() and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    watcher.stop()
+    return learned
+
+
+def test_edit_watch_learns_like_macos() -> None:
+    """Corrections made in place right after a paste are learned, as on macOS."""
+    from .edit_watch import inserted_range
+
+    before, after = "Письмо: ", " Спасибо."
+    dictated = "напиши на инглиш пожалуйста"
+    field = before + dictated + after
+    fixed = field.replace("инглиш", "English")
+    _check("edit watch: the inserted span is found",
+           inserted_range(dictated, field, None), (len(before), len(before) + len(dictated)))
+    _check("edit watch: the occurrence nearest the caret wins",
+           inserted_range("да", "да или да", 9), (7, 9))
+    _check("edit watch: no-break spaces read as spaces",
+           inserted_range("a b ", "x a b", None), (2, 5))
+
+    _check("edit watch: a word fixed in place is learned after the pause",
+           _run_edit_watch([(0, field, 1), (2, field.replace("инглиш", "Eng"), 1),
+                            (2.1, fixed, 1)], dictated),
+           [("инглиш", "English")])
+    _check("edit watch: an edit still being typed is not learned half done",
+           _run_edit_watch([(0, field, 1), (2, field.replace("инглиш", "Eng"), 1),
+                            (5, fixed, 1)], dictated),
+           [("инглиш", "English")])
+    _check("edit watch: a second fix after the first is learned on its own",
+           _run_edit_watch([(0, field, 1), (1, fixed, 1),
+                            (8, fixed.replace("пожалуйста", "please"), 1)], dictated),
+           [("инглиш", "English"), ("пожалуйста", "please")])
+    _check("edit watch: a pure deletion teaches nothing",
+           _run_edit_watch([(0, field, 1), (1, field.replace(" инглиш", ""), 1)], dictated), [])
+    _check("edit watch: focus moving away ends the watch",
+           _run_edit_watch([(0, field, 1), (1, fixed, 2)], dictated), [])
+    _check("edit watch: an edit outside the dictation ends the watch",
+           _run_edit_watch([(0, field, 1), (1, "Привет! " + fixed, 1)], dictated), [])
+    _check("edit watch: a password field is never watched",
+           _run_edit_watch([(0, "<password>", 1)], dictated), [])
+    _check("edit watch: text that never shows up is not guessed at",
+           _run_edit_watch([(0, "что-то другое", 1), (1, "что-то иное", 1)], dictated), [])
+    _check("edit watch: nothing is learned after the 45 s window",
+           _run_edit_watch([(0, field, 1), (50, fixed, 1)], dictated), [])
+
+
 def _speech_like(seconds_pattern, sample_rate=16000, seed=7):
     """Noise bursts (speech) and zeros (pauses): ``[(speech_s, pause_s), ...]``."""
     import numpy as np
@@ -1749,6 +1907,8 @@ _TESTS = [
     test_gigaam_features,
     test_npu_backend_settings_and_catalog,
     test_openvino_host_ipc,
+    test_npu_encoder_background_compile,
+    test_edit_watch_learns_like_macos,
     test_incremental_stable_windows,
     test_incremental_transcription_matches_batch,
     test_segment_limits_follow_the_model_window,
