@@ -192,6 +192,8 @@ enum ParakeySelfTest {
             return runSuite("llm-gec", testLLMGECIntegration)
         case "llm-rewrite":
             return runSuite("llm-rewrite", testLLMRewriteIntegration)
+        case "llm-prefix-primer":
+            return runSuite("llm-prefix-primer", testLLMPrefixPrimer)
         case "full-pipeline":
             return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
         case "silero-vad-download":
@@ -3146,6 +3148,31 @@ enum ParakeySelfTest {
     /// tried and rejected. This test only asserts what the model layer
     /// itself demonstrably does reliably: term/casing correction, and not
     /// corrupting an already-correct term it's handed.
+    /// The pre-warm primes the bundled host's prompt-prefix snapshot, so
+    /// the very first dictation after it reuses the shared system prompt and
+    /// few-shot turns instead of decoding them. Real model, so not in `all`.
+    private static func testLLMPrefixPrimer() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP llm-prefix-primer: SUPERDICTATE_GEC_MODEL not set to an existing file")
+            return
+        }
+        let coordinator = LLMPostprocessingCoordinator()
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-prefix-primer")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.textPostprocessingMode = .correction
+        settings.llmEngineBackend = .bundledLocal
+        settings.llmUseGPU = ProcessInfo.processInfo.environment["SUPERDICTATE_PRIMER_CPU"] == nil
+        try runParakeetEngineSynchronously { await coordinator.prewarmNeededHosts(settings: settings) }
+        let cached = try runParakeetEngineSynchronously {
+            await coordinator.correctionCachedTokensForTest("я развернул дебиан сервер", settings: settings)
+        }
+        print("LLM prefix primer: first request after pre-warm reused \(cached.map(String.init) ?? "nil") prompt tokens")
+        try runParakeetEngineSynchronously { await coordinator.stop() }
+        try expect((cached ?? 0) >= 200, equals: true,
+                   "the first correction after pre-warm must reuse the system prompt and few-shot turns")
+    }
+
     private static func testLLMGECIntegration() throws {
         guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
               FileManager.default.fileExists(atPath: modelPath) else {

@@ -264,20 +264,20 @@ actor LLMPostprocessingCoordinator {
     /// lazy start in `finalizedText` to try again.
     func prewarmNeededHosts(settings: Settings) async {
         await unloadHostsNoLongerNeeded(settings: settings)
-        var models: [(identity: String, model: BundledLLMModel)] = []
+        var models: [(identity: String, model: BundledLLMModel, rewrite: Bool)] = []
         if settings.textPostprocessingMode == .correction, settings.llmEngineBackend == .bundledLocal {
             let model = settings.correctionBundledModel
-            models.append((Self.correctionHostIdentity(model: model), model))
+            models.append((Self.correctionHostIdentity(model: model), model, false))
         }
         if settings.rewriteEnabled, settings.rewriteEngineBackend == .bundledLocal {
             let model = settings.rewriteBundledModel
             let identity = Self.rewriteHostIdentity(model: model)
             if !models.contains(where: { $0.identity == identity }) {
-                models.append((identity, model))
+                models.append((identity, model, true))
             }
         }
         let usedGPU = useGPU(settings)
-        for (identity, model) in models where bundledLLMModelExists(model) {
+        for (identity, model, rewrite) in models where bundledLLMModelExists(model) {
             let hostProcess = hostProcess(forIdentity: identity)
             guard !(await hostProcess.isRunning) else { continue }
             let startedAt = ProcessInfo.processInfo.systemUptime
@@ -306,6 +306,26 @@ actor LLMPostprocessingCoordinator {
                                                                 userText: "Привет.",
                                                                 maxTokens: 4)
             }
+            // The host reuses the prompt opening a request shares with the
+            // previous one (system prompt + few-shot turns, ~270 of ~295
+            // tokens for correction): the first request of a kind decodes
+            // in full, the second snapshots the shared opening. Two requests
+            // shaped like the real ones do both here, so the very first
+            // dictation already decodes only its own sentence.
+            let primer = rewrite ? rewritePrompt(settings: settings)
+                                 : correctionPrompt(model: model, settings: settings)
+            for sample in ["Проверка связи.", "Раз, два, три."] {
+                _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
+                                                                apiKey: nil,
+                                                                model: "primer-\(model.rawValue)",
+                                                                systemPrompt: primer.system,
+                                                                exampleTurns: primer.examples,
+                                                                userText: rewrite
+                                                                    ? LLMRewritePrompt.userText(for: sample, token: primer.modeToken)
+                                                                    : sample,
+                                                                temperature: 0,
+                                                                maxTokens: 1)
+            }
             log("LLM postprocessing: pre-warmed \(model.displayName) in \(String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startedAt)) s")
         }
     }
@@ -320,6 +340,35 @@ actor LLMPostprocessingCoordinator {
 
     /// Test-only hook: whether any bundled host subprocess is currently
     /// running.
+    /// Test-only: sends one correction-shaped request to the running
+    /// correction host and returns how many prompt tokens the host served
+    /// from its prefix snapshot (`usage.prompt_tokens_details.cached_tokens`).
+    func correctionCachedTokensForTest(_ text: String, settings: Settings) async -> Int? {
+        let model = settings.correctionBundledModel
+        guard let host = hostProcesses[Self.correctionHostIdentity(model: model)],
+              let baseURL = await host.baseURL else { return nil }
+        let prompt = correctionPrompt(model: model, settings: settings)
+        let messages = [OpenAICompatibleMessage(role: .system, content: prompt.system)]
+            + prompt.examples + [OpenAICompatibleMessage(role: .user, content: text)]
+        var req = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let encoded = try? JSONEncoder().encode(messages),
+              let messagesJSON = try? JSONSerialization.jsonObject(with: encoded),
+              let body = try? JSONSerialization.data(withJSONObject: [
+                  "messages": messagesJSON, "max_tokens": 1,
+                  "chat_template_kwargs": ["enable_thinking": false],
+              ]) else { return nil }
+        req.httpBody = body
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]  // loopback; see OpenAICompatibleClient
+        guard let (data, _) = try? await URLSession(configuration: config).data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = json["usage"] as? [String: Any],
+              let details = usage["prompt_tokens_details"] as? [String: Any] else { return nil }
+        return details["cached_tokens"] as? Int
+    }
+
     func isHostProcessRunningForTest() async -> Bool {
         for host in hostProcesses.values where await host.isRunning {
             return true
@@ -414,24 +463,47 @@ actor LLMPostprocessingCoordinator {
                                        settings: settings)
     }
 
+    private typealias StagePrompt = (system: String, examples: [OpenAICompatibleMessage], modeToken: String)
+
+    private func correctionPrompt(model: BundledLLMModel, settings: Settings) -> StagePrompt {
+        // A user-edited system prompt replaces the built-in default —
+        // EXCEPT for models with a mandatory prompt (Loqira): the lock is
+        // enforced here, at the single point where prompts are built.
+        let override = model.allowsCustomSystemPrompt
+            ? settings.correctionSystemPromptOverride
+            : ""
+        let system = override.isEmpty
+            ? LLMCorrectionPrompt.systemPrompt(vocabulary: settings.transcriptCorrections, model: model)
+            : override
+        return (system, LLMCorrectionPrompt.exampleTurns(vocabulary: settings.transcriptCorrections, model: model), "")
+    }
+
+    private func rewritePrompt(settings: Settings) -> StagePrompt {
+        // Active style: built-in or user-created
+        // (docs/specs/custom-rewrite-styles-spec.md). Per-style user-edited
+        // system prompt; empty = the built-in default. The «Режим:»
+        // user-turn suffix is NOT editable for built-ins (benchmark
+        // contract); user-created modes use their uppercased name.
+        let examples = LLMRewritePrompt.exampleTurns(style: .polish)
+        switch settings.rewriteStyleSelection() {
+        case .builtin(let style):
+            let override = settings.rewriteSystemPromptOverride(for: style)
+            return (override.isEmpty ? LLMRewritePrompt.systemPrompt(style: style) : override,
+                    examples, LLMRewritePrompt.modeToken(style))
+        case .custom(let custom):
+            let override = settings.rewriteSystemPromptOverride(forStyleID: custom.id)
+            return (override.isEmpty ? LLMRewritePrompt.systemPrompt(custom: custom) : override,
+                    examples, custom.name.uppercased())
+        }
+    }
+
     private func requestCorrection(baseURL: URL,
                                    apiKey: String?,
                                    model: String,
                                    bundledModel: BundledLLMModel,
                                    text: String,
                                    settings: Settings) async -> String {
-        // A user-edited system prompt replaces the built-in default —
-        // EXCEPT for models with a mandatory prompt (Loqira): the lock is
-        // enforced here, at the single point where prompts are built.
-        let override = bundledModel.allowsCustomSystemPrompt
-            ? settings.correctionSystemPromptOverride
-            : ""
-        let systemPrompt = override.isEmpty
-            ? LLMCorrectionPrompt.systemPrompt(vocabulary: settings.transcriptCorrections,
-                                               model: bundledModel)
-            : override
-        let exampleTurns = LLMCorrectionPrompt.exampleTurns(vocabulary: settings.transcriptCorrections,
-                                                            model: bundledModel)
+        let (systemPrompt, exampleTurns, _) = correctionPrompt(model: bundledModel, settings: settings)
         // One request per sentence-bounded chunk (see
         // LLMCorrectionGuardrail.correctionChunks): a long dictation in one
         // request is where the model loses or replaces text, and the
@@ -566,31 +638,14 @@ actor LLMPostprocessingCoordinator {
                                 model: String,
                                 text: String,
                                 settings: Settings) async -> String {
-        // Active style: built-in or user-created
-        // (docs/specs/custom-rewrite-styles-spec.md). Per-style user-edited
-        // system prompt; empty = the built-in default. The «Режим:»
-        // user-turn suffix is NOT editable for built-ins (benchmark
-        // contract); user-created modes use their uppercased name.
         let selection = settings.rewriteStyleSelection()
-        let override: String
-        let systemPrompt: String
-        let modeToken: String
-        switch selection {
-        case .builtin(let style):
-            override = settings.rewriteSystemPromptOverride(for: style)
-            systemPrompt = override.isEmpty ? LLMRewritePrompt.systemPrompt(style: style) : override
-            modeToken = LLMRewritePrompt.modeToken(style)
-        case .custom(let custom):
-            override = settings.rewriteSystemPromptOverride(forStyleID: custom.id)
-            systemPrompt = override.isEmpty ? LLMRewritePrompt.systemPrompt(custom: custom) : override
-            modeToken = custom.name.uppercased()
-        }
+        let (systemPrompt, exampleTurns, modeToken) = rewritePrompt(settings: settings)
         let result = await OpenAICompatibleClient.chatCompletion(
             baseURL: baseURL,
             apiKey: apiKey,
             model: model,
             systemPrompt: systemPrompt,
-            exampleTurns: LLMRewritePrompt.exampleTurns(style: .polish),
+            exampleTurns: exampleTurns,
             userText: LLMRewritePrompt.userText(for: text, token: modeToken),
             enableThinking: false,
             temperature: 0,
