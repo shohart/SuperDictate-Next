@@ -6,6 +6,25 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.4 — 2026-10-23
+
+macOS only, tag `mac-v0.8.4`. The version number follows the Windows port (0.8.1–0.8.3 were Windows-only releases).
+
+### Changed
+- **Local correction and rewrite are about three times faster.** Every correction request opens with the same system prompt and few-shot turns, 276 of its ~295 tokens. The LLM host now keeps a snapshot of the model state after that shared opening and decodes only the sentence itself. The opening is learned from consecutive requests, with no settings. A changed prompt (custom prompt, a newly learned vocabulary rule) just takes a new snapshot. Pre-warm sends two requests shaped like real ones, so the first dictation after a start is already fast. Rewrite benefits in the same way. Measured on the Mac Pro (Xeon E5-2696 v3, Radeon Instinct MI50) with VoiceScribe and the 65-sentence correction corpus:
+  - GPU: 1.28 → 0.44 s median per sentence.
+  - CPU: 2.01 → 0.44 s median.
+  - Quality unchanged: normalized EM 0.646.
+- **The LLM host uses one thread per physical core** (performance cores on Apple silicon) instead of every hyperthread. On the 18-core / 36-thread Xeon this alone takes CPU correction from 2.5 to 0.47 s median, with identical output.
+
+### Fixed
+- **A GPU that computes garbage no longer breaks correction.** With MoltenVK on a Radeon Instinct MI50 the model returned NaN logits. The host then crashed on every dictation and was reloaded on the next one, so no correction was ever applied. The host now reports NaN logits as an error instead of aborting. A short canary request checks every fresh GPU host. On a GPU fault, every local model moves to the CPU, with a toast, until the GPU setting is changed.
+- **"GPU off" now really means the CPU only.** With zero layers offloaded, llama.cpp still sent the prompt to the GPU and allocated a 688 MiB Vulkan buffer for it.
+
+### Validation
+- Self-tests pass: `all`, `llm-guardrail`, `llm-gec` (GPU), `llm-rewrite` (YandexGPT-5-Lite 8B), `full-pipeline` (Parakeet), and the new `llm-prefix-primer` (the first correction after pre-warm reuses 276 prompt tokens, on the GPU and on the CPU).
+- macOS 0.8.4 (build 61), bundle id `com.local.superdictate`, macOS 14.0+, x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `bf5f87b2f13e6b4acd3dd5be70431282771aea5a65ee7d60d26959228e4e42ae`.
+
 ## Windows 0.8.3 — 2026-10-22
 
 Windows only, tag `win-v0.8.3`. macOS stays on 0.8.0.
