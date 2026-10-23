@@ -148,6 +148,12 @@ VK_S = 0x53
 DEFAULT_CORRECTION_HOTKEY = HotkeyChoice(VK_C, MOD_CTRL | MOD_ALT)
 DEFAULT_REWRITE_HOTKEY = HotkeyChoice(VK_R, MOD_CTRL | MOD_ALT)
 DEFAULT_REWRITE_STYLE_HOTKEY = HotkeyChoice(VK_S, MOD_CTRL | MOD_ALT)
+# The alternate finish ("enterHotkey" on macOS, Right Command + Option
+# there): pressed while a recording runs, it ends it and finishes the other
+# way -- pastes and presses Enter when the primary shortcut only pastes, and
+# the reverse. Built on the dictation key, like the macOS default, so it is
+# the same key with one modifier more.
+DEFAULT_ENTER_HOTKEY = HotkeyChoice(VK_RCONTROL, MOD_ALT)
 
 
 class TriggerMode(str, Enum):
@@ -158,6 +164,9 @@ class TriggerMode(str, Enum):
 class Action(str, Enum):
     PRESS = "press"
     RELEASE = "release"
+    # Ends the recording with the opposite completion behaviour
+    # (macOS .releaseAlternate).
+    RELEASE_ALTERNATE = "release_alternate"
     CANCEL = "cancel"
     SHOW_HISTORY = "show_history"
     SHOW_EDITOR = "show_editor"
@@ -310,8 +319,10 @@ class HotkeyStateMachine:
         self._correction = _ShortcutState()
         self._rewrite = _ShortcutState()
         self._rewrite_style = _ShortcutState()
+        self._enter = _ShortcutState()
         self._toggle_active = False
         self._suppress_escape_up = False
+        self._was_recording = False
 
     def reset_all(self) -> None:
         self._standard.reset()
@@ -320,8 +331,10 @@ class HotkeyStateMachine:
         self._correction.reset()
         self._rewrite.reset()
         self._rewrite_style.reset()
+        self._enter.reset()
         self._toggle_active = False
         self._suppress_escape_up = False
+        self._was_recording = False
 
     def reset_toggle(self) -> None:
         self._toggle_active = False
@@ -339,9 +352,27 @@ class HotkeyStateMachine:
         correction_hotkey: HotkeyChoice = DEFAULT_CORRECTION_HOTKEY,
         rewrite_hotkey: HotkeyChoice = DEFAULT_REWRITE_HOTKEY,
         rewrite_style_hotkey: HotkeyChoice = DEFAULT_REWRITE_STYLE_HOTKEY,
+        enter_hotkey: Optional[HotkeyChoice] = None,
     ) -> _Result:
+        # Recording-start edge (macOS adoptPrimaryModifierDown): an
+        # alternate finish built on the dictation key itself has that key
+        # down already -- pressing it is what started the recording -- but
+        # its state only listens while recording, so it never saw the
+        # press. Adopted here, the first modifier pressed mid-recording can
+        # complete the chord. Harmless when the key is up by now: the chord
+        # still needs the real modifier state to match.
+        if (is_recording and not self._was_recording and enter_hotkey is not None
+                and hotkey.is_modifier and enter_hotkey.vk == hotkey.vk):
+            self._enter.primary_down = True
+        self._was_recording = is_recording
+
         if event.vk == VK_ESCAPE:
             return self._transition_escape(event, is_recording)
+
+        if enter_hotkey is not None and (is_recording or self._enter.is_engaged):
+            finished = self._transition_enter(event, is_recording, enter_hotkey)
+            if finished is not None:
+                return finished
 
         # The chords are tried before the bare dictation key, and this is
         # not a nicety: quick history is built on the dictation key itself,
@@ -389,6 +420,20 @@ class HotkeyStateMachine:
             return _Result(consumed.suppress, [Action.REJECTED_BUSY_PRESS])
         self._toggle_active = True
         return _Result(consumed.suppress, [Action.PRESS])
+
+    def _transition_enter(self, event: _Event, is_recording: bool,
+                          enter_hotkey: HotkeyChoice) -> Optional[_Result]:
+        """The alternate finish: only while recording (or finishing a chord
+        it started), so outside a recording its keys belong to everything
+        else. ``None`` when the event was not its."""
+        consumed = self._enter.consume(event, enter_hotkey)
+        if consumed.edge == _Edge.PRESS and is_recording:
+            self._standard.reset()
+            self._toggle_active = False
+            return _Result(consumed.suppress, [Action.RELEASE_ALTERNATE])
+        if consumed.edge != _Edge.PASS and consumed.suppress:
+            return _suppress_only()
+        return None
 
     def _transition_chord(
         self, state: _ShortcutState, event: _Event, is_recording: bool,
@@ -532,6 +577,8 @@ class HotkeyListener:
         self.correction_hotkey = DEFAULT_CORRECTION_HOTKEY
         self.rewrite_hotkey = DEFAULT_REWRITE_HOTKEY
         self.rewrite_style_hotkey = DEFAULT_REWRITE_STYLE_HOTKEY
+        #: None turns the alternate finish off.
+        self.enter_hotkey: Optional[HotkeyChoice] = DEFAULT_ENTER_HOTKEY
         self.trigger_mode = TriggerMode.TOGGLE
         self.is_recording_active: Callable[[], bool] = lambda: False
         self.can_start_recording: Callable[[], bool] = lambda: True
@@ -685,6 +732,7 @@ class HotkeyListener:
                     correction_hotkey=self.correction_hotkey,
                     rewrite_hotkey=self.rewrite_hotkey,
                     rewrite_style_hotkey=self.rewrite_style_hotkey,
+                    enter_hotkey=self.enter_hotkey,
                     trigger_mode=self.trigger_mode,
                     is_recording=self.is_recording_active(),
                     can_start_recording=self.can_start_recording(),

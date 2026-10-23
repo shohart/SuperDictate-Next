@@ -24,6 +24,7 @@ from .hotkeys import (
     DEFAULT_HOTKEY,
     DEFAULT_REWRITE_HOTKEY,
     DEFAULT_REWRITE_STYLE_HOTKEY,
+    DEFAULT_ENTER_HOTKEY,
     HotkeyChoice,
     TriggerMode,
 )
@@ -36,6 +37,12 @@ class CompletionBehavior(str, Enum):
     @property
     def presses_enter(self) -> bool:
         return self is CompletionBehavior.INSERT_AND_ENTER
+
+    @property
+    def opposite(self) -> "CompletionBehavior":
+        """What the alternate finish does (macOS DictationCompletionBehavior.opposite)."""
+        return (CompletionBehavior.INSERT_AND_ENTER if self is CompletionBehavior.INSERT
+                else CompletionBehavior.INSERT)
 
 
 class TextStyle(str, Enum):
@@ -255,6 +262,11 @@ _DEFAULTS: dict[str, Any] = {
     "correction_hotkey": DEFAULT_CORRECTION_HOTKEY.to_json(),
     "rewrite_hotkey": DEFAULT_REWRITE_HOTKEY.to_json(),
     "rewrite_style_hotkey": DEFAULT_REWRITE_STYLE_HOTKEY.to_json(),
+    # The alternate finish: pressed mid-recording, it ends the recording
+    # the other way (paste + Enter when the primary shortcut only pastes).
+    # Same idea and defaults as macOS enterHotkey / alternate_completion_enabled_v1.
+    "enter_hotkey": DEFAULT_ENTER_HOTKEY.to_json(),
+    "alternate_completion_enabled": True,
     "primary_completion_behavior": CompletionBehavior.INSERT.value,
     "text_style": TextStyle.FORMAL.value,
     "interface_language": "ru",
@@ -426,6 +438,14 @@ class Settings:
     def rewrite_style_hotkey(self) -> HotkeyChoice:
         return HotkeyChoice.from_json(self._get("rewrite_style_hotkey"),
                                       DEFAULT_REWRITE_STYLE_HOTKEY)
+
+    @property
+    def enter_hotkey(self) -> HotkeyChoice:
+        return HotkeyChoice.from_json(self._get("enter_hotkey"), DEFAULT_ENTER_HOTKEY)
+
+    @property
+    def alternate_completion_enabled(self) -> bool:
+        return bool(self._get("alternate_completion_enabled"))
 
     @property
     def primary_completion_behavior(self) -> CompletionBehavior:

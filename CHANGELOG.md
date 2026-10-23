@@ -6,6 +6,21 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Windows 0.8.4 — 2026-10-23
+
+Windows only, tag `win-v0.8.4`. Same version number as macOS 0.8.4, but a different release.
+
+### Added
+- **A second shortcut that finishes the dictation the other way**, as on macOS (`enterHotkey`). Pressed during a recording, it ends the recording with the opposite of the primary shortcut's action: insert + Enter when the primary only inserts, and the reverse. This sends an instruction to an agent or a chat message without a separate Enter.
+  - Default **Alt + Right Ctrl**. It can be re-recorded and switched off under Settings → Shortcuts.
+  - When it is built on the dictation key itself, holding that key and adding the modifier works in hold mode too (macOS `adoptPrimaryModifierDown`).
+  - Outside a recording it never fires.
+  - The control panel shows it next to the dictation shortcut.
+- **The text-processing shortcuts can be re-recorded:** correction on/off, rewrite on/off and next rewrite style (defaults Ctrl+Alt+C / R / S). They worked before but could not be changed in Settings.
+
+### Validation
+- 63 self-tests pass. The new one covers the second shortcut in toggle and hold mode, its silence outside a recording, the toggle reset after it, and the opposite behaviour.
+
 ## Windows 0.8.3.1 — 2026-10-23
 
 Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.

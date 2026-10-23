@@ -185,6 +185,32 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_section_capture": ("Запись", "Capture"),
     "settings_primary_hotkey": ("Основное сочетание", "Primary shortcut"),
     "settings_history_hotkey": ("Последние расшифровки", "Recent transcripts"),
+    "settings_alternate_enabled": ("Второе сочетание для завершения",
+                                   "Second shortcut to finish"),
+    "settings_alternate_hint": (
+        "Нажатое во время записи, второе сочетание завершает диктовку "
+        "по-другому. Если основное только вставляет текст, второе вставит "
+        "его и нажмёт Enter: удобно отправлять указания агенту или "
+        "сообщение в чат одним движением. И наоборот, если основное "
+        "нажимает Enter.",
+        "Pressed during a recording, the second shortcut finishes the "
+        "dictation the other way. If the primary shortcut only inserts the "
+        "text, this one inserts it and presses Enter, which sends an "
+        "instruction to an agent or a chat message in one go. And the "
+        "reverse if the primary one presses Enter."),
+    "settings_enter_hotkey": ("Второе сочетание", "Second shortcut"),
+    "settings_section_processing_keys": ("Обработка текста", "Text processing"),
+    "settings_section_processing_keys_hint": (
+        "Работают в любой момент, как на macOS: включают и выключают "
+        "коррекцию и рерайт и переключают стиль рерайта. Каждое нажатие "
+        "показывает, что сейчас включено.",
+        "Work at any time, as on macOS: turn correction and rewrite on and "
+        "off and switch the rewrite style. Every press shows what is on now."),
+    "settings_correction_hotkey": ("Коррекция вкл/выкл", "Correction on/off"),
+    "settings_rewrite_hotkey": ("Рерайт вкл/выкл", "Rewrite on/off"),
+    "settings_rewrite_style_hotkey": ("Следующий стиль рерайта", "Next rewrite style"),
+    "panel_hotkey_enter": ("Вставить + Enter", "Insert + Enter"),
+    "panel_hotkey_insert": ("Только вставить", "Insert only"),
     "settings_history_hotkey_hint": (
         "Показывает последние расшифровки пузырьками над капсулой. Стрелки "
         "выбирают, Enter вставляет выбранную в то поле, где вы были, Delete "

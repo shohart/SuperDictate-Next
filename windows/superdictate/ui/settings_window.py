@@ -357,6 +357,24 @@ class SettingsWindow(QDialog):
         self._history_hotkey_button = self._shortcut_row(
             keys, "settings_history_hotkey", "history_hotkey",
             i18n.tr("settings_history_hotkey_hint"))
+        # The alternate finish, as on macOS: pressed during a recording it
+        # ends it the other way (paste + Enter when the primary only pastes).
+        self._alternate_enabled = self._checkbox(
+            keys, "settings_alternate_enabled", "alternate_completion_enabled",
+            i18n.tr("settings_alternate_hint"))
+        self._enter_hotkey_button = self._shortcut_row(
+            keys, "settings_enter_hotkey", "enter_hotkey")
+
+        # Post-processing from the keyboard, as on macOS: the toggles and
+        # the rewrite style are where dictation happens, not in this window.
+        processing = Section(i18n.tr("settings_section_processing_keys"),
+                             i18n.tr("settings_section_processing_keys_hint"))
+        self._correction_hotkey_button = self._shortcut_row(
+            processing, "settings_correction_hotkey", "correction_hotkey")
+        self._rewrite_hotkey_button = self._shortcut_row(
+            processing, "settings_rewrite_hotkey", "rewrite_hotkey")
+        self._rewrite_style_hotkey_button = self._shortcut_row(
+            processing, "settings_rewrite_style_hotkey", "rewrite_style_hotkey")
 
         behaviour = Section(i18n.tr("settings_section_behaviour"))
         self._trigger = self._combo(
@@ -380,7 +398,7 @@ class SettingsWindow(QDialog):
         self._enter_delay.valueChanged.connect(
             lambda value: self._draft.update(enter_delay_milliseconds=value))
         behaviour.add_row(i18n.tr("settings_enter_delay"), self._enter_delay)
-        return _page(keys, behaviour)
+        return _page(keys, behaviour, processing)
 
     def _build_dictation_tab(self) -> QWidget:
         recognition = Section(i18n.tr("settings_section_recognition"))

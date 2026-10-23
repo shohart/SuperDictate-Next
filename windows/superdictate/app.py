@@ -377,6 +377,8 @@ class DictationController(QObject):
         self.listener.correction_hotkey = self.settings.correction_hotkey
         self.listener.rewrite_hotkey = self.settings.rewrite_hotkey
         self.listener.rewrite_style_hotkey = self.settings.rewrite_style_hotkey
+        self.listener.enter_hotkey = (self.settings.enter_hotkey
+                                      if self.settings.alternate_completion_enabled else None)
         self.listener.trigger_mode = self.settings.trigger_mode
         self.listener.reset_state()
 
@@ -400,6 +402,10 @@ class DictationController(QObject):
                 self.begin_recording()
             elif action is Action.RELEASE:
                 self.finish_recording(self.settings.primary_completion_behavior)
+            elif action is Action.RELEASE_ALTERNATE:
+                # The other finish: paste + Enter when the primary only
+                # pastes, and the reverse.
+                self.finish_recording(self.settings.primary_completion_behavior.opposite)
             elif action is Action.CANCEL:
                 self.cancel_recording()
             elif action is Action.SHOW_HISTORY:

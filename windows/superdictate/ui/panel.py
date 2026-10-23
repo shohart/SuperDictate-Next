@@ -241,8 +241,11 @@ class ControlPanel(QMainWindow):
         grid.setColumnStretch(2, 1)
 
         self._shortcut_labels: dict[str, QLabel] = {}
+        self._shortcut_keys: dict[str, QLabel] = {}
         rows = (
             ("mic", "panel_hotkey", "hotkey"),
+            # The alternate finish; its name follows what it does (refresh).
+            ("keyboard", "panel_hotkey_enter", "enter_hotkey"),
             ("clock", "panel_hotkey_history", "history_hotkey"),
         )
         for row, (icon_name, label_key, attribute) in enumerate(rows):
@@ -258,6 +261,7 @@ class ControlPanel(QMainWindow):
             grid.addWidget(key, row, 1)
             grid.addWidget(value, row, 2, Qt.AlignmentFlag.AlignRight)
             self._shortcut_labels[attribute] = value
+            self._shortcut_keys[attribute] = key
         return card
 
     def _build_actions(self) -> QHBoxLayout:
@@ -295,6 +299,11 @@ class ControlPanel(QMainWindow):
 
         for attribute, label in self._shortcut_labels.items():
             label.setText(hotkey_name(getattr(settings, attribute), i18n.language()))
+        alternate = settings.primary_completion_behavior.opposite
+        self._shortcut_keys["enter_hotkey"].setText(i18n.tr(
+            "panel_hotkey_enter" if alternate.presses_enter else "panel_hotkey_insert"))
+        if not settings.alternate_completion_enabled:
+            self._shortcut_labels["enter_hotkey"].setText("-")
 
         self._model_label.setText(i18n.tr(
             "settings_model_gigaam_v3"

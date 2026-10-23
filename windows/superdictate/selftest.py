@@ -92,6 +92,67 @@ def test_toggle_does_not_flip_when_busy() -> None:
     _check("toggle: next press still starts", ready.actions, [Action.PRESS])
 
 
+def _feed_enter(machine, vk, down, modifiers, *, mode=TriggerMode.TOGGLE, recording=False,
+                enter=None):
+    from .hotkeys import DEFAULT_ENTER_HOTKEY
+
+    return machine.transition(
+        _Event(vk=vk, is_down=down, modifiers=modifiers, is_repeat=False),
+        hotkey=HOTKEY, history_hotkey=HISTORY_HOTKEY, edit_hotkey=None,
+        enter_hotkey=enter or DEFAULT_ENTER_HOTKEY,
+        trigger_mode=mode, is_recording=recording)
+
+
+def test_alternate_finish_hotkey() -> None:
+    """The second shortcut (macOS enterHotkey): ends a recording the other way."""
+    from .settings import CompletionBehavior
+
+    VK_LMENU_ = VK_LMENU
+    # Toggle: start with Right Ctrl, finish with Alt held + Right Ctrl.
+    machine = _machine()
+    _check("alternate: the plain press still starts",
+           _feed_enter(machine, VK_RCONTROL, True, MOD_CTRL).actions, [Action.PRESS])
+    _feed_enter(machine, VK_RCONTROL, False, 0, recording=True)
+    _feed_enter(machine, VK_LMENU_, True, MOD_ALT, recording=True)
+    chord = _feed_enter(machine, VK_RCONTROL, True, MOD_ALT | MOD_CTRL, recording=True)
+    _check("alternate: Alt + Right Ctrl mid-recording finishes the other way",
+           chord.actions, [Action.RELEASE_ALTERNATE])
+    _check("alternate: its Right Ctrl is swallowed", chord.suppress, True)
+    up = _feed_enter(machine, VK_RCONTROL, False, MOD_ALT, recording=False)
+    _check("alternate: the chord's release does nothing more", up.actions, [])
+    _feed_enter(machine, VK_LMENU_, False, 0)
+    again = _feed_enter(machine, VK_RCONTROL, True, MOD_CTRL)
+    _check("alternate: the toggle is reset, the next press starts again",
+           again.actions, [Action.PRESS])
+
+    # Not recording: the chord is the dictation key's business, never a finish.
+    idle = _machine()
+    _feed_enter(idle, VK_LMENU_, True, MOD_ALT)
+    _check("alternate: outside a recording it never fires",
+           Action.RELEASE_ALTERNATE in _feed_enter(idle, VK_RCONTROL, True, MOD_ALT | MOD_CTRL).actions,
+           False)
+
+    # Hold: Right Ctrl is held from the start, Alt pressed later completes it
+    # (the adopted primary key, macOS adoptPrimaryModifierDown).
+    hold = _machine()
+    _check("alternate hold: press starts",
+           _feed_enter(hold, VK_RCONTROL, True, MOD_CTRL, mode=TriggerMode.HOLD).actions,
+           [Action.PRESS])
+    late = _feed_enter(hold, VK_LMENU_, True, MOD_CTRL | MOD_ALT, mode=TriggerMode.HOLD,
+                       recording=True)
+    _check("alternate hold: Alt added to the held key finishes the other way",
+           late.actions, [Action.RELEASE_ALTERNATE])
+    release = _feed_enter(hold, VK_RCONTROL, False, MOD_ALT, mode=TriggerMode.HOLD,
+                          recording=False)
+    _check("alternate hold: letting go afterwards does not finish a second time",
+           Action.RELEASE in release.actions, False)
+
+    _check("alternate: insert becomes insert + Enter",
+           CompletionBehavior.INSERT.opposite, CompletionBehavior.INSERT_AND_ENTER)
+    _check("alternate: and the reverse",
+           CompletionBehavior.INSERT_AND_ENTER.opposite, CompletionBehavior.INSERT)
+
+
 def test_hold_press_and_release() -> None:
     machine = _machine()
     press = _feed(machine, VK_RCONTROL, True, MOD_CTRL, mode=TriggerMode.HOLD)
@@ -1951,6 +2012,7 @@ _TESTS = [
     test_npu_encoder_background_compile,
     test_edit_watch_learns_like_macos,
     test_hotkey_hook_refresh,
+    test_alternate_finish_hotkey,
     test_incremental_stable_windows,
     test_incremental_transcription_matches_batch,
     test_segment_limits_follow_the_model_window,
