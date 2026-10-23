@@ -20,6 +20,7 @@ Windows only, tag `win-v0.8.4`. Same version number as macOS 0.8.4, but a differ
 
 ### Validation
 - 63 self-tests pass. The new one covers the second shortcut in toggle and hold mode, its silence outside a recording, the toggle reset after it, and the opposite behaviour.
+- Built on the build PC and installed silently there over 0.8.3.1 (exit code 0). `SuperDictate-0.8.4-setup.exe` SHA-256: `1c169c8f9a0b16ae05d5571b330ffd7f8fd4a682436127297c84b4c691391c77`.
 
 ## Windows 0.8.3.1 — 2026-10-23
 
