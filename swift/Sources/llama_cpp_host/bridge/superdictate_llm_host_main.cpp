@@ -70,7 +70,7 @@ struct HostConfig {
     std::string host = "127.0.0.1";
     int         port = 0;
     int32_t     n_ctx = 4096;
-    int32_t     n_threads = 0; // 0 == auto (hardware_concurrency)
+    int32_t     n_threads = 0; // 0 == auto (physical cores)
     // 0 = CPU only, >0 = offload that many layers to the first non-CPU
     // ggml backend (Vulkan, when this build was compiled with
     // GGML_USE_VULKAN). Driven by the SAME Settings.useGPU toggle the
@@ -249,8 +249,13 @@ public:
             params.devices = { nullptr };
             params.no_op_offload = true;
         }
+        // Auto = physical cores (on Apple silicon: performance cores). A
+        // second hyperthread per core adds no matmul throughput and makes
+        // every thread barrier wait on the slowest sibling: on a 18-core /
+        // 36-thread Xeon the default of hardware_concurrency() kept the
+        // host spinning 36 threads for a 0.8B model.
         const int32_t resolved_threads =
-            cfg.n_threads > 0 ? cfg.n_threads : static_cast<int32_t>(std::thread::hardware_concurrency());
+            cfg.n_threads > 0 ? cfg.n_threads : std::max<int32_t>(1, common_cpu_get_num_physical_cores());
         params.cpuparams.n_threads = resolved_threads;
         // common_cpu_params::n_threads defaults to -1 (common.h) and this
         // struct is otherwise left untouched here (we don't vendor
