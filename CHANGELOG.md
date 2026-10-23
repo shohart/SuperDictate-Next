@@ -18,7 +18,7 @@ Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
 - **The background NPU compile no longer competes with the rest of the machine.** `SuperDictateOvHost` drops to below-normal priority for the duration of the compile and returns to normal afterwards.
 
 ### Changed
-- **Local correction reuses the shared prompt prefix, on the CPU and the GPU.** The correction prompt is ~295 tokens, ~276 of them the same in every request (system prompt and examples). The local host now keeps a snapshot of that prefix and decodes only the sentence. To do that, the build switches from `llama-server` to the host shared with macOS, with the snapshot added there (PR #3, built by `tools/build-engines.ps1 -ExperimentalLlmHost -Vulkan`). Measured on the Core Ultra 5 225H with the 65-sentence corpus, quality unchanged (63/65 outputs identical to `llama-server`):
+- **Local correction reuses the shared prompt prefix, on the CPU and the GPU.** The correction prompt is ~295 tokens, ~276 of them the same in every request (system prompt and examples). The local host now keeps a snapshot of that prefix and decodes only the sentence. To do that, the build switches from `llama-server` to the host shared with macOS, which carries the snapshot since macOS 0.8.4 (PR #3; its NaN-logit check comes along, built by `tools/build-engines.ps1 -ExperimentalLlmHost -Vulkan`). Measured on the Core Ultra 5 225H with the 65-sentence corpus, quality unchanged (63/65 outputs identical to `llama-server`):
   - CPU: p50 0.25 s, p90 0.34 s, against 0.32 / 0.43 s with `llama-server`.
   - GPU: p50 0.44 s, p90 0.52 s, against 0.50 / 0.58 s.
 - **The host gets an explicit thread count:** physical cores minus two, at most 8 (`SUPERDICTATE_LLM_THREADS` overrides). With all 14 cores of the 225H (4 P, 8 E, 2 low-power E), the host's own threadpool waits at every barrier for the slowest thread. As soon as other programs used the CPU, a 0.3 s correction became minutes.
@@ -28,6 +28,10 @@ Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
 ### Validation
 - 62 self-tests pass. New checks cover the hook re-installation, the host's thread count and its GPU environment.
 - A real `DictationController` in a scratch profile (shortcut on F24) switched from Parakeet to GigaAM on the NPU with an empty compile cache. It started recording on the shortcut while GigaAM ran on the CPU and the NPU compile was in progress.
+- Correction through the app's pipeline on this host after warm-up: 0.22-0.30 s per sentence on the CPU, 0.41-0.50 s on the GPU.
+- The packaged build was run on the 225H laptop. Its correction host took a 256 ms median on the CPU and 473 ms on the GPU (10 sentences).
+- On the build PC, the installer installed silently over 0.8.3 (exit code 0) and removed the old `engines\llama` folder. `SuperDictate-0.8.3.1-setup.exe` SHA-256: `PENDING`.
+
 ## 0.8.4 — 2026-10-23
 
 macOS only, tag `mac-v0.8.4`. The version number follows the Windows port (0.8.1–0.8.3 were Windows-only releases).
