@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -191,6 +192,12 @@ std::string strip_leading_think_block(const std::string & text) {
 
 struct GenerationResult {
     bool        ok = false;
+    // The compute backend produced NaN/Inf logits. A broken GPU path (seen
+    // with MoltenVK on a Radeon Instinct MI50) does this on every request;
+    // the app answers by moving the model to the CPU, so it is reported as
+    // its own status instead of a generic failure -- and instead of letting
+    // llama_sampler_dist_apply's assertion abort the whole process.
+    bool        numeric_failure = false;
     std::string error;
     std::string content;
     int32_t     prompt_tokens = 0;
@@ -408,6 +415,11 @@ public:
 
         std::string content;
         for (int32_t i = 0; i < max_new; ++i) {
+            if (!last_logits_finite()) {
+                out.numeric_failure = true;
+                out.error = "non-finite logits: the compute backend produced NaN/Inf";
+                return out;
+            }
             llama_token token = common_sampler_sample(sampler_, ctx_, -1);
             common_sampler_accept(sampler_, token, /*is_generated=*/true);
 
@@ -431,6 +443,20 @@ public:
     }
 
 private:
+    bool last_logits_finite() const {
+        const float * logits = llama_get_logits_ith(ctx_, -1);
+        if (logits == nullptr) {
+            return false;
+        }
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab_);
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (!std::isfinite(logits[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     common_init_result_ptr    result_;
     llama_model *              model_ = nullptr;
     llama_context *            ctx_ = nullptr;
@@ -589,7 +615,7 @@ int main(int argc, char ** argv) {
         std::vector<sdlh_json> messages(body["messages"].begin(), body["messages"].end());
         GenerationResult gen = host.generate(messages, enable_thinking, max_tokens);
         if (!gen.ok) {
-            res.status = 500;
+            res.status = gen.numeric_failure ? 503 : 500;
             res.set_content(make_error_json(gen.error).dump(), "application/json");
             return;
         }

@@ -3021,6 +3021,12 @@ enum ParakeySelfTest {
     /// cases live in fixtures/llm-correction-guardrail.json, shared with the
     /// Windows port's suite, so the two guardrails cannot drift apart.
     private static func testLLMCorrectionGuardrail() throws {
+        // GPU canary: a sane model starts its answer with «Привет».
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane("Привет, как дела?"), equals: true, "corrector echo")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane("Привет! Всё хорошо."), equals: true, "instruct greeting")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" «Привет»"), equals: true, "leading punctuation")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" обесп"), equals: false, "MI50 garbage")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(""), equals: false, "empty")
         // editDistance primitive.
         try expect(LLMCorrectionGuardrail.editDistance("гитхаб", "гитхуб"), equals: 1,
                    "single substitution should have distance 1")
@@ -3229,6 +3235,13 @@ enum ParakeySelfTest {
                    "an already-correct Debian must survive the LLM pass unchanged")
         try expect(result2.contains("дебиан"), equals: false,
                    "the model must never revert an already-Latin term back to Cyrillic")
+        // On a GPU whose Vulkan path computes NaN the host now answers 503
+        // instead of aborting, and the coordinator moves to the CPU; either
+        // way the host must still be up after the requests.
+        let faulted = try runParakeetEngineSynchronously { await coordinator.isGPUFaultedForTest }
+        let running = try runParakeetEngineSynchronously { await coordinator.isHostProcessRunningForTest() }
+        print("LLM GEC: GPU fault fallback=\(faulted), host running=\(running)")
+        try expect(running, equals: true, "the model host must stay loaded after a dictation")
 
         try runParakeetEngineSynchronously { await coordinator.stop() }
     }

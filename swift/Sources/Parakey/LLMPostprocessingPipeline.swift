@@ -55,6 +55,21 @@ actor LLMPostprocessingCoordinator {
     /// UI only.
     var onHostLoadStage: (@Sendable @MainActor (String) -> Void)?
     var onHostLoadFinished: (@Sendable @MainActor () -> Void)?
+    /// Told once when a GPU fault moves the bundled hosts to the CPU.
+    var onGPUFallback: (@Sendable @MainActor () -> Void)?
+
+    /// Set when a bundled host running on the GPU returned NaN logits (HTTP
+    /// 503 from the host) or died mid-request. A broken GPU path does that
+    /// on every request (MoltenVK on a Radeon Instinct MI50), and before
+    /// this the host crashed on each dictation and was reloaded on the
+    /// next one — which looked like the model being unloaded after every
+    /// dictation, with no correction ever applied. From then on every
+    /// bundled host runs on the CPU, and stays loaded there, until the GPU
+    /// toggle is flipped (`stop()`) or the agent restarts.
+    private var gpuFaulted = false
+    /// The failure of the last correction/rewrite request, if any, so the
+    /// bundled paths can tell a GPU fault from an ordinary failure.
+    private var lastRequestFailure: LLMPostprocessError?
 
     /// Host identity for the bundled correction model — the cache-key under
     /// which its LLMHostProcess lives. Models without a LoRA contribute an
@@ -137,9 +152,78 @@ actor LLMPostprocessingCoordinator {
     }
 
     func setHostLoadUI(stage: @escaping @Sendable @MainActor (String) -> Void,
-                       finished: @escaping @Sendable @MainActor () -> Void) {
+                       finished: @escaping @Sendable @MainActor () -> Void,
+                       gpuFallback: (@Sendable @MainActor () -> Void)? = nil) {
         onHostLoadStage = stage
         onHostLoadFinished = finished
+        onGPUFallback = gpuFallback
+    }
+
+    /// Whether bundled hosts should be started on the GPU right now.
+    private func useGPU(_ settings: Settings) -> Bool {
+        settings.llmUseGPU && !gpuFaulted
+    }
+
+    var isGPUFaultedForTest: Bool { gpuFaulted }
+
+    /// Whether `failure`, from a host that ran on the GPU, means the GPU
+    /// path itself is broken: the host reported NaN logits, or the request
+    /// died together with the host process.
+    private func isGPUFault(_ failure: LLMPostprocessError?, host: LLMHostProcess) async -> Bool {
+        guard let failure else { return false }
+        if failure == .httpStatus(503) { return true }
+        guard failure == .network else { return false }
+        // The connection drops a moment before the process is reaped.
+        for _ in 0..<10 {
+            if !(await host.isRunning) { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return false
+    }
+
+    /// One tiny request to a host freshly started on the GPU, which also
+    /// warms the GPU path up. Any sane chat model answers «Привет, как
+    /// дела?» starting with «Привет» (a corrector echoes it, an instruct
+    /// model greets back); a GPU that computes garbage does not — on the
+    /// MI50 it answered « обесп» or NaN. False means: do not trust this GPU.
+    private func gpuCanaryPasses(baseURL: URL, model: BundledLLMModel) async -> Bool {
+        let result = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
+                                                                 apiKey: nil,
+                                                                 model: "canary-\(model.rawValue)",
+                                                                 systemPrompt: "",
+                                                                 userText: "Привет, как дела?",
+                                                                 enableThinking: false,
+                                                                 temperature: 0,
+                                                                 maxTokens: 8)
+        switch result {
+        case .success(let answer):
+            let passes = Self.canaryAnswerLooksSane(answer)
+            if !passes {
+                log("LLM postprocessing: GPU canary for \(model.displayName) answered \"\(answer.prefix(40))\"")
+            }
+            return passes
+        case .failure(let error):
+            log("LLM postprocessing: GPU canary for \(model.displayName) failed (\(error))")
+            return false
+        }
+    }
+
+    static func canaryAnswerLooksSane(_ answer: String) -> Bool {
+        let firstWord = answer
+            .split(whereSeparator: { !$0.isLetter })
+            .first
+            .map { $0.lowercased() } ?? ""
+        return firstWord == "привет"
+    }
+
+    private func fallBackToCPU(after failure: LLMPostprocessError?) async {
+        gpuFaulted = true
+        log("LLM postprocessing: the GPU host failed (\(failure.map { "\($0)" } ?? "garbage output")); running the LLM on the CPU until the GPU setting changes")
+        for host in hostProcesses.values {
+            await host.stop()
+        }
+        hostProcesses.removeAll()
+        await onGPUFallback?()
     }
 
     /// Stops every bundled host subprocess immediately, if running. Call
@@ -150,6 +234,9 @@ actor LLMPostprocessingCoordinator {
             await host.stop()
         }
         hostProcesses.removeAll()
+        // The GPU toggle stops the hosts before restarting them: a fresh
+        // choice deserves a fresh try on the GPU.
+        gpuFaulted = false
     }
 
     /// Stops, right now, every host the current `settings` don't use: a
@@ -189,6 +276,7 @@ actor LLMPostprocessingCoordinator {
                 models.append((identity, model))
             }
         }
+        let usedGPU = useGPU(settings)
         for (identity, model) in models where bundledLLMModelExists(model) {
             let hostProcess = hostProcess(forIdentity: identity)
             guard !(await hostProcess.isRunning) else { continue }
@@ -197,18 +285,27 @@ actor LLMPostprocessingCoordinator {
                                                       loraPath: bundledLLMLoraPath(model),
                                                       loraScale: bundledLLMLoraScale(model),
                                                       ctxSize: model.hostContextSize,
-                                                      useGPU: settings.llmUseGPU,
+                                                      useGPU: usedGPU,
                                                       chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
             guard case .success = startResult, let baseURL = await hostProcess.baseURL else {
                 log("LLM postprocessing: pre-warm of \(model.displayName) failed (\(startResult)); will retry on first use")
                 continue
             }
-            _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
-                                                            apiKey: nil,
-                                                            model: "warmup-\(model.rawValue)",
-                                                            systemPrompt: "",
-                                                            userText: "Привет.",
-                                                            maxTokens: 4)
+            if usedGPU {
+                // The canary doubles as the GPU warm-up request.
+                guard await gpuCanaryPasses(baseURL: baseURL, model: model) else {
+                    await fallBackToCPU(after: nil)
+                    await prewarmNeededHosts(settings: settings)
+                    return
+                }
+            } else {
+                _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
+                                                                apiKey: nil,
+                                                                model: "warmup-\(model.rawValue)",
+                                                                systemPrompt: "",
+                                                                userText: "Привет.",
+                                                                maxTokens: 4)
+            }
             log("LLM postprocessing: pre-warmed \(model.displayName) in \(String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startedAt)) s")
         }
     }
@@ -249,6 +346,7 @@ actor LLMPostprocessingCoordinator {
         }
         let identity = Self.correctionHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
+        let usedGPU = useGPU(settings)
         let coldStart = !(await hostProcess.isRunning)
         if coldStart {
             await onHostLoadStage?("Загружается модель \(model.displayName)…")
@@ -257,7 +355,7 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.llmUseGPU,
+                                                  useGPU: usedGPU,
                                                   chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
@@ -273,12 +371,24 @@ actor LLMPostprocessingCoordinator {
             log("LLM postprocessing: bundled host has no reachable baseURL; passing text through unchanged")
             return text
         }
-        return await requestCorrection(baseURL: baseURL,
-                                       apiKey: nil,
-                                       model: "gec-\(model.rawValue)",
-                                       bundledModel: model,
-                                       text: text,
-                                       settings: settings)
+        if usedGPU, coldStart, !(await gpuCanaryPasses(baseURL: baseURL, model: model)) {
+            await fallBackToCPU(after: nil)
+            return await correctedViaBundledHost(text, settings: settings)
+        }
+        lastRequestFailure = nil
+        let corrected = await requestCorrection(baseURL: baseURL,
+                                                apiKey: nil,
+                                                model: "gec-\(model.rawValue)",
+                                                bundledModel: model,
+                                                text: text,
+                                                settings: settings)
+        if usedGPU, let failure = lastRequestFailure,
+           await isGPUFault(failure, host: hostProcess) {
+            await fallBackToCPU(after: failure)
+            // Once: gpuFaulted now keeps this call on the CPU.
+            return await correctedViaBundledHost(text, settings: settings)
+        }
+        return corrected
     }
 
     private func correctedViaCustomEndpoint(_ text: String, settings: Settings) async -> String {
@@ -354,6 +464,7 @@ actor LLMPostprocessingCoordinator {
             case .failure(let error):
                 // A failed request (host down, timeout) would fail the same
                 // way for every remaining chunk; don't wait it out N times.
+                lastRequestFailure = error
                 log("LLM postprocessing: correction request failed (\(error)); passing the remaining \(chunks.count - index) chunk(s) through unchanged")
                 keptOriginal += chunks.count - index
                 correctedChunks.append(contentsOf: chunks[index...])
@@ -392,6 +503,7 @@ actor LLMPostprocessingCoordinator {
         }
         let identity = Self.rewriteHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
+        let usedGPU = useGPU(settings)
         let coldStart = !(await hostProcess.isRunning)
         if coldStart {
             await onHostLoadStage?("Загружается модель \(model.displayName)…")
@@ -400,7 +512,7 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.llmUseGPU,
+                                                  useGPU: usedGPU,
                                                   chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
@@ -416,11 +528,22 @@ actor LLMPostprocessingCoordinator {
             log("LLM postprocessing: bundled rewrite host has no reachable baseURL; passing text through unchanged")
             return text
         }
-        return await requestRewrite(baseURL: baseURL,
-                                    apiKey: nil,
-                                    model: "rewrite-\(model.rawValue)",
-                                    text: text,
-                                    settings: settings)
+        if usedGPU, coldStart, !(await gpuCanaryPasses(baseURL: baseURL, model: model)) {
+            await fallBackToCPU(after: nil)
+            return await rewrittenViaBundledHost(text, settings: settings)
+        }
+        lastRequestFailure = nil
+        let rewritten = await requestRewrite(baseURL: baseURL,
+                                             apiKey: nil,
+                                             model: "rewrite-\(model.rawValue)",
+                                             text: text,
+                                             settings: settings)
+        if usedGPU, let failure = lastRequestFailure,
+           await isGPUFault(failure, host: hostProcess) {
+            await fallBackToCPU(after: failure)
+            return await rewrittenViaBundledHost(text, settings: settings)
+        }
+        return rewritten
     }
 
     private func rewrittenViaCustomEndpoint(_ text: String, settings: Settings) async -> String {
@@ -491,6 +614,7 @@ actor LLMPostprocessingCoordinator {
             log("LLM postprocessing: applied rewrite [\(selection.id)] (\(text.count) → \(trimmed.count) chars)")
             return trimmed
         case .failure(let error):
+            lastRequestFailure = error
             log("LLM postprocessing: rewrite request failed (\(error)); passing text through unchanged")
             return text
         }

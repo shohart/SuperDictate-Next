@@ -284,6 +284,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.stateToastController.showLoading(text: text)
             }, finished: { [weak self] in
                 self?.stateToastController.dismissLoading()
+            }, gpuFallback: { [weak self] in
+                self?.showStateToast(text: "GPU считает с ошибками · LLM на процессоре", tone: .off)
             })
         }
         hotkey.onRejectedBusyPress = { [weak self] in
