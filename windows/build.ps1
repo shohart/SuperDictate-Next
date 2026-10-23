@@ -50,13 +50,12 @@ Write-Host "Building the speech-recognition host..." -ForegroundColor Cyan
 if ($LASTEXITCODE) { throw "build-onnx-host failed." }
 
 if (-not $SkipEngines) {
-    Write-Host "Building Silero VAD..." -ForegroundColor Cyan
-    & .\tools\build-engines.ps1
+    # Silero VAD and the local LLM host shared with macOS (CPU + Vulkan): it
+    # reuses the shared prompt prefix, which llama-server cannot do on the
+    # GPU for this model (llm\host.py). Needs the Vulkan SDK at build time.
+    Write-Host "Building Silero VAD and the LLM host..." -ForegroundColor Cyan
+    & .\tools\build-engines.ps1 -ExperimentalLlmHost -Vulkan
     if ($LASTEXITCODE) { throw "build-engines failed." }
-    # After build-engines, which recreates engines\.
-    Write-Host "Staging the local LLM host (llama.cpp Vulkan)..." -ForegroundColor Cyan
-    & .\tools\fetch-llama.ps1
-    if ($LASTEXITCODE) { throw "fetch-llama failed." }
 }
 
 # comtypes writes its UI Automation wrappers into comtypes.gen the first

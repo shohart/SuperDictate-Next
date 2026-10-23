@@ -1130,9 +1130,20 @@ def test_llm_backend_without_bundled_host() -> None:
     argv, cwd, env = host_command(r"C:\x\engines\llama\llama-server.exe", cpu, 5000)
     _check("llama-server on the CPU: no GPU device at all",
            (argv[argv.index("--device") + 1], "--ctx-checkpoints" in argv, env), ("none", False, {}))
-    legacy, _, _ = host_command(r"C:\x\engines\superdictate-llm-host.exe", gpu, 5000)
-    _check("the macOS-style host keeps its own flags",
-           legacy[legacy.index("--lora-scale") + 1], "4.0")
+    from .llm.host import LLM_MAX_THREADS, llm_thread_count
+    own, own_cwd, own_env = host_command(r"C:\x\engines\superdictate-llm-host.exe", gpu, 5000)
+    _check("our host keeps the macOS flags",
+           own[own.index("--lora-scale") + 1], "4.0")
+    _check("our host gets an explicit thread count",
+           own[own.index("--threads") + 1], str(llm_thread_count()))
+    _check("our host on the GPU: no cooperative-matrix shaders either",
+           own_env.get("GGML_VK_DISABLE_COOPMAT"), "1")
+    _, _, own_cpu_env = host_command(r"C:\x\engines\superdictate-llm-host.exe", cpu, 5000)
+    _check("our host on the CPU: no Vulkan environment", own_cpu_env, {})
+    _check("threads: a 14-core hybrid laptop leaves cores free (8, not 14)",
+           llm_thread_count(14), LLM_MAX_THREADS)
+    _check("threads: a 4-core machine still gets two", llm_thread_count(4), 2)
+    _check("threads: a 6-core machine keeps two cores free", llm_thread_count(6), 4)
 
     endpoint = CustomEndpoint(base_url="http://127.0.0.1:1234")
     _check("an endpoint needs only its address", endpoint.is_configured, True)

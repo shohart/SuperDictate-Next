@@ -70,13 +70,45 @@ def llama_server_executable() -> "os.PathLike[str]":
     return paths.resource_path("engines", "llama", "llama-server.exe")
 
 
-def host_executable() -> "os.PathLike[str]":
-    """Where the bundled host binary lives: llama-server when staged, else
-    the hand-written host of experimental builds (tools/build-engines.ps1)."""
-    server = llama_server_executable()
-    if os.path.isfile(server):
-        return server
+def own_host_executable() -> "os.PathLike[str]":
+    """The hand-written host shared with macOS (tools/build-engines.ps1)."""
     return paths.resource_path("engines", "superdictate-llm-host.exe")
+
+
+def host_executable() -> "os.PathLike[str]":
+    """Where the bundled host binary lives.
+
+    Our own host first: it keeps a snapshot of the shared prompt prefix (the
+    correction system prompt and its examples, ~276 of ~295 tokens) and
+    decodes only the sentence, on the CPU and the GPU alike. llama-server
+    (tools/fetch-llama.ps1) is the fallback when a build carries only it.
+    """
+    own = own_host_executable()
+    if os.path.isfile(own):
+        return own
+    return llama_server_executable()
+
+
+#: Threads for the CPU path of our host. llama.cpp's own threadpool (this
+#: build has no OpenMP) waits at a barrier after every op for the slowest
+#: thread. On a Core Ultra 5 225H, all 14 cores (4 P, 8 E, 2 low-power E)
+#: turned a 0.3 s correction into minutes as soon as other programs used the
+#: CPU, while 8 and 12 threads took 0.22-0.29 s per sentence. Leaving cores
+#: free is what keeps the barrier from stalling: physical cores minus two,
+#: like the speech threads, and no more than 8 -- the model is 0.8B and
+#: memory-bound beyond that.
+LLM_MAX_THREADS = 8
+
+
+def llm_thread_count(physical_cores: Optional[int] = None) -> int:
+    override = os.environ.get("SUPERDICTATE_LLM_THREADS", "")
+    if override.isdigit() and 1 <= int(override) <= 64:
+        return int(override)
+    if physical_cores is None:
+        from ..onnx_host import physical_core_count
+
+        physical_cores = physical_core_count()
+    return max(2, min(LLM_MAX_THREADS, physical_cores - 2))
 
 
 def bundled_host_available() -> bool:
@@ -110,15 +142,20 @@ def host_command(executable: str, spec: "HostSpec", port: int) -> tuple[list[str
       as the dictation is sequential.
     """
     if os.path.basename(str(executable)).lower() != "llama-server.exe":
+        # Our own host: the macOS flags, plus an explicit thread count (see
+        # llm_thread_count) and, on the GPU, the same cooperative-matrix
+        # workaround as llama-server. Prompt-prefix reuse is built in.
         argv = [str(executable),
                 "--model", spec.model_path,
                 "--host", "127.0.0.1",
                 "--port", str(port),
                 "--ctx-size", str(spec.context_size),
-                "--gpu-layers", str(spec.gpu_layers)]
+                "--gpu-layers", str(spec.gpu_layers),
+                "--threads", str(llm_thread_count())]
         if spec.lora_path:
             argv += ["--lora", spec.lora_path, "--lora-scale", str(spec.lora_scale)]
-        return argv, None, {}
+        env = {"GGML_VK_DISABLE_COOPMAT": "1"} if spec.gpu_layers > 0 else {}
+        return argv, None, env
 
     argv = [str(executable),
             "--model", spec.model_path,

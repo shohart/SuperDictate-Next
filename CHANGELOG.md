@@ -16,11 +16,16 @@ Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
   - The hook is re-installed every 30 s. Windows silently removes a low-level hook whose callback misses `LowLevelHooksTimeout`, and that cannot be detected; the new hook goes in before the old one comes out, so no keystroke is lost.
 - **The background NPU compile no longer competes with the rest of the machine.** `SuperDictateOvHost` drops to below-normal priority for the duration of the compile and returns to normal afterwards.
 
-### Not changed
-- **Local correction still runs on `llama-server`.** On the CPU its prompt cache already reuses the shared prefix of the correction prompt (0.32 s per sentence). The macOS host's prefix snapshot (PR #3) was measured as an alternative: it helps on Vulkan (0.45–0.54 s against 0.50 s), but on this laptop's CPU it hung after the first restore. It is not part of this release.
+### Changed
+- **Local correction reuses the shared prompt prefix, on the CPU and the GPU.** The correction prompt is ~295 tokens, ~276 of them the same in every request (system prompt and examples). The local host now keeps a snapshot of that prefix and decodes only the sentence. To do that, the build switches from `llama-server` to the host shared with macOS, with the snapshot added there (PR #3, built by `tools/build-engines.ps1 -ExperimentalLlmHost -Vulkan`). Measured on the Core Ultra 5 225H with the 65-sentence corpus, quality unchanged (63/65 outputs identical to `llama-server`):
+  - CPU: p50 0.25 s, p90 0.34 s, against 0.32 / 0.43 s with `llama-server`.
+  - GPU: p50 0.44 s, p90 0.52 s, against 0.50 / 0.58 s.
+- **The host gets an explicit thread count:** physical cores minus two, at most 8 (`SUPERDICTATE_LLM_THREADS` overrides). With all 14 cores of the 225H (4 P, 8 E, 2 low-power E), the host's own threadpool waits at every barrier for the slowest thread. As soon as other programs used the CPU, a 0.3 s correction became minutes.
+- **The correction model loads in the background and primes its prompt cache** when the app becomes ready, when correction is turned on, and after settings change. The first dictation no longer pays ~3 s for the load plus ~1.2 s for the snapshot.
+- `--gpu-layers 0` now keeps the host off the GPU completely, with no device and no op offload.
 
 ### Validation
-- 62 self-tests pass; the new one covers the hook re-installation.
+- 62 self-tests pass. New checks cover the hook re-installation, the host's thread count and its GPU environment.
 - A real `DictationController` in a scratch profile (shortcut on F24) switched from Parakeet to GigaAM on the NPU with an empty compile cache. It started recording on the shortcut while GigaAM ran on the CPU and the NPU compile was in progress.
 ## 0.8.4 — 2026-10-23
 

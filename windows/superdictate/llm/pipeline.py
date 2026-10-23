@@ -198,7 +198,35 @@ class LLMPostprocessor:
 
     # -- stages ------------------------------------------------------
 
-    def _corrected(self, text: str, config: CorrectionConfig) -> str:
+    def warm_up(self, config: CorrectionConfig) -> None:
+        """Load the local correction host and prime its prompt cache, off the
+        dictation path. Blocking; call from a background thread.
+
+        The host keeps a snapshot of the prompt prefix every correction
+        request shares (system prompt and example turns, ~276 of ~295
+        tokens), learned from two consecutive requests. Without this the
+        first dictation after a start pays the model load and the full
+        prompt (~3 s) and the second the snapshot (~1.2 s); with it, both
+        take the usual 0.2-0.4 s. Nothing happens unless the bundled model
+        is the correction backend and its weights are on disk.
+        """
+        if not config.enabled or config.backend is not LLMBackend.BUNDLED_LOCAL:
+            return
+        if not is_present(profile(config.model).pin):
+            return
+        system, examples = self._correction_prompt(config)
+        try:
+            # Two different one-letter sentences: what they share is exactly
+            # the prefix every real request shares.
+            for text in ("а", "б"):
+                self._bundled_completion(
+                    config.model, [Message(Role.SYSTEM, system), *examples, Message(Role.USER, text)],
+                    max_tokens=8)
+            log.info("Local correction host warmed up")
+        except Exception as exc:
+            log.info("Local correction warm-up failed (the first dictation will load it): %s", exc)
+
+    def _correction_prompt(self, config: CorrectionConfig) -> tuple[str, list[Message]]:
         # A custom endpoint serves whichever model the user named there, so
         # it gets the zero-shot instruct prompt, as on macOS: the few-shot
         # turns were tuned against the bundled adapter only.
@@ -206,7 +234,10 @@ class LLMPostprocessor:
                     and profile(config.model).uses_few_shot_correction)
         system = (config.system_prompt_override.strip()
                   or prompts.correction_system_prompt(few_shot=few_shot))
-        examples = list(prompts.correction_example_turns(few_shot=few_shot))
+        return system, list(prompts.correction_example_turns(few_shot=few_shot))
+
+    def _corrected(self, text: str, config: CorrectionConfig) -> str:
+        system, examples = self._correction_prompt(config)
 
         # One request per sentence-bounded chunk, as on macOS: a long
         # dictation in one request is where the model loses or replaces

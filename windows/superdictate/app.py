@@ -309,6 +309,7 @@ class DictationController(QObject):
         if model.prepare(on_progress):
             self._set_state(AppState.READY)
             self._recover_pending_dictation()
+            self._warm_up_correction()
         else:
             self.last_error = model.error or "unknown error"
             self._set_state(AppState.FAILED)
@@ -353,6 +354,9 @@ class DictationController(QObject):
                      self.settings.llm_compute_backend)
             self.postprocessor.gpu_layers = wanted_layers
             self.postprocessor.shutdown()
+        # A changed correction model, device or prompt means a new host
+        # (or none): load it now rather than on the next dictation.
+        self._warm_up_correction()
         self.settings_applied.emit()
 
     def _apply_hotkey_settings(self) -> None:
@@ -456,9 +460,19 @@ class DictationController(QObject):
                     style=i18n.tr(f"rewrite_style_{following.value}")),
             following.value)
 
+    def _warm_up_correction(self) -> None:
+        """Load the local correction model and prime its prompt cache in the
+        background, so the next dictation does not pay for either."""
+        if self._terminating:
+            return
+        config = self.settings.correction_config()
+        threading.Thread(target=self.postprocessor.warm_up, args=(config,),
+                         name="llm-warm-up", daemon=True).start()
+
     def _after_postprocessing_toggle(self, enabled: bool) -> None:
         if enabled:
             self.postprocessor.cancel_scheduled_unload()
+            self._warm_up_correction()
         elif not (self.settings.correction_enabled or self.settings.rewrite_enabled):
             self.postprocessor.schedule_unload()
         if self.settings.play_feedback_sounds:
