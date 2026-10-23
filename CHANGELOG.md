@@ -6,6 +6,22 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Windows 0.8.3.1 — 2026-10-23
+
+Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
+
+### Fixed
+- **The dictation shortcut could stop responding** while GigaAM ran on the CPU and its NPU compile went on in the background. Two changes cover a silently removed hook, whatever removed it:
+  - The keyboard-hook thread runs at high priority.
+  - The hook is re-installed every 30 s. Windows silently removes a low-level hook whose callback misses `LowLevelHooksTimeout`, and that cannot be detected; the new hook goes in before the old one comes out, so no keystroke is lost.
+- **The background NPU compile no longer competes with the rest of the machine.** `SuperDictateOvHost` drops to below-normal priority for the duration of the compile and returns to normal afterwards.
+
+### Not changed
+- **Local correction still runs on `llama-server`.** On the CPU its prompt cache already reuses the shared prefix of the correction prompt (0.32 s per sentence). The macOS host's prefix snapshot (PR #3) was measured as an alternative: it helps on Vulkan (0.45–0.54 s against 0.50 s), but on this laptop's CPU it hung after the first restore. It is not part of this release.
+
+### Validation
+- 62 self-tests pass; the new one covers the hook re-installation.
+- A real `DictationController` in a scratch profile (shortcut on F24) switched from Parakeet to GigaAM on the NPU with an empty compile cache. It started recording on the shortcut while GigaAM ran on the CPU and the NPU compile was in progress.
 ## 0.8.4 — 2026-10-23
 
 macOS only, tag `mac-v0.8.4`. The version number follows the Windows port (0.8.1–0.8.3 were Windows-only releases).

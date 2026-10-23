@@ -411,6 +411,36 @@ NPU_QUICK_WAIT_SECONDS = 15.0
 on_event: Optional[Callable[[str], None]] = None
 
 
+class _below_normal_priority:
+    """This process at BELOW_NORMAL_PRIORITY_CLASS for the duration (Windows)."""
+
+    _BELOW_NORMAL = 0x4000
+    _NORMAL = 0x20
+
+    def __enter__(self):
+        self._set(self._BELOW_NORMAL)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._set(self._NORMAL)
+
+    @staticmethod
+    def _set(priority_class: int) -> None:
+        import sys
+
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32")
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), priority_class)
+        except Exception:
+            pass  # a priority is an optimisation, never a reason to fail
+
+
 def _emit(message: str) -> None:
     if on_event is not None:
         try:
@@ -455,7 +485,12 @@ class EncoderSlot:
             try:
                 core = _core(cache_directory)
                 _configure_npu(core)
-                compiled = _compile(core, path, "NPU")
+                # Minutes of compiler threads on every core: below normal,
+                # so the rest of the machine (the app's keyboard hook first
+                # of all) keeps the CPU it needs. Dictation on the CPU in
+                # this process meanwhile is only a few hundred ms a request.
+                with _below_normal_priority():
+                    compiled = _compile(core, path, "NPU")
                 with self._lock:
                     self._pending = compiled
                 _emit(f"{path.name}: NPU ready after {time.monotonic() - started:.0f}s")

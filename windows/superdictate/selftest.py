@@ -1593,6 +1593,35 @@ def test_npu_encoder_background_compile() -> None:
         openvino_asr._compile, openvino_asr._core, openvino_asr._configure_npu = saved
 
 
+def test_hotkey_hook_refresh() -> None:
+    """The keyboard hook is re-installed new-before-old, and kept on failure.
+
+    Windows evicts a low-level hook silently when its callback misses
+    LowLevelHooksTimeout (seen while a background NPU compile kept every
+    core busy), so the listener re-installs it periodically.
+    """
+    from unittest import mock
+
+    from . import hotkeys
+
+    listener = hotkeys.HotkeyListener(lambda actions: None)
+    calls = []
+    fake = mock.MagicMock()
+    fake.SetWindowsHookExW.side_effect = lambda *a: calls.append("set") or 222
+    fake.UnhookWindowsHookEx.side_effect = lambda h: calls.append(("unhook", h))
+    listener._hook = 111
+    with mock.patch.object(hotkeys, "user32", fake):
+        listener._refresh_hook()
+        _check("hook refresh: the new hook goes in before the old comes out",
+               calls, ["set", ("unhook", 111)])
+        _check("hook refresh: the new handle is kept", listener._hook, 222)
+        fake.SetWindowsHookExW.side_effect = lambda *a: 0
+        listener._refresh_hook()
+        _check("hook refresh: a failed install keeps the working hook", listener._hook, 222)
+    _check("hook refresh: often enough to bound a dead shortcut",
+           hotkeys.HOOK_REFRESH_SECONDS <= 30, True)
+
+
 def _run_edit_watch(states, inserted, *, pid=42):
     """Drive edit_watch.EditWatcher through ``states``: ``[(at_seconds, text, element)]``,
     each field state holding from its time until the next one. Returns the
@@ -1909,6 +1938,7 @@ _TESTS = [
     test_openvino_host_ipc,
     test_npu_encoder_background_compile,
     test_edit_watch_learns_like_macos,
+    test_hotkey_hook_refresh,
     test_incremental_stable_windows,
     test_incremental_transcription_matches_batch,
     test_segment_limits_follow_the_model_window,

@@ -489,6 +489,16 @@ user32.CallNextHookEx.argtypes = [
     ctypes.POINTER(KBDLLHOOKSTRUCT),
 ]
 user32.UnhookWindowsHookEx.argtypes = [wt.HHOOK]
+user32.SetTimer.restype = ctypes.c_size_t
+user32.SetTimer.argtypes = [wt.HWND, ctypes.c_size_t, wt.UINT, ctypes.c_void_p]
+user32.KillTimer.argtypes = [wt.HWND, ctypes.c_size_t]
+kernel32.GetCurrentThread.restype = wt.HANDLE
+kernel32.SetThreadPriority.argtypes = [wt.HANDLE, ctypes.c_int]
+
+WM_TIMER = 0x0113
+THREAD_PRIORITY_HIGHEST = 2
+#: How often the keyboard hook is re-installed; see HotkeyListener._run.
+HOOK_REFRESH_SECONDS = 30.0
 # Undeclared, ctypes would return a c_int and the 0x8000 "held" bit of the
 # c_short result could not be tested reliably.
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -569,16 +579,40 @@ class HotkeyListener:
 
     def _run(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
+        # The callback has to answer within LowLevelHooksTimeout or Windows
+        # removes the hook, silently and for good. When every core is busy
+        # (a background NPU compile in SuperDictateOvHost takes minutes) a
+        # normal-priority thread can miss that deadline, after which the
+        # shortcut is dead until the app restarts. So the hook thread runs
+        # at high priority -- it only ever wakes for a keystroke -- and...
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
         self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, None, 0)
         if not self._hook:
             return
+        # ...the hook is re-installed every HOOK_REFRESH_SECONDS, because an
+        # eviction cannot be detected: the new hook goes in first, then the
+        # old one comes out, so no keystroke falls between the two.
+        timer = user32.SetTimer(None, 0, int(HOOK_REFRESH_SECONDS * 1000), None)
         msg = wt.MSG()
         while self._running and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_TIMER and not msg.hWnd:
+                self._refresh_hook()
+                continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        if timer:
+            user32.KillTimer(None, timer)
         if self._hook:
             user32.UnhookWindowsHookEx(self._hook)
             self._hook = None
+
+    def _refresh_hook(self) -> None:
+        fresh = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, None, 0)
+        if not fresh:
+            return  # keep the one we have; try again next time
+        stale, self._hook = self._hook, fresh
+        if stale:
+            user32.UnhookWindowsHookEx(stale)
 
     def _modifier_mask(self, event_vk: int, event_is_down: bool) -> int:
         """What is held right now, asked of Windows rather than remembered.
