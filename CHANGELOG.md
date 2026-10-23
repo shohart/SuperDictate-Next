@@ -30,7 +30,7 @@ Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
 - A real `DictationController` in a scratch profile (shortcut on F24) switched from Parakeet to GigaAM on the NPU with an empty compile cache. It started recording on the shortcut while GigaAM ran on the CPU and the NPU compile was in progress.
 - Correction through the app's pipeline on this host after warm-up: 0.22-0.30 s per sentence on the CPU, 0.41-0.50 s on the GPU.
 - The packaged build was run on the 225H laptop. Its correction host took a 256 ms median on the CPU and 473 ms on the GPU (10 sentences).
-- On the build PC, the installer installed silently over 0.8.3 (exit code 0) and removed the old `engines\llama` folder. `SuperDictate-0.8.3.1-setup.exe` SHA-256: `PENDING`.
+- On the build PC, the installer installed silently over 0.8.3 (exit code 0) and removed the old `engines\llama` folder. `SuperDictate-0.8.3.1-setup.exe` SHA-256: `e583e0da69f3dedca34f5b530b52e92c7f30e8b601fb433e427bce90ac92443c`.
 
 ## 0.8.4 — 2026-10-23
 
