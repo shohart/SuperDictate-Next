@@ -208,6 +208,15 @@ actor LLMPostprocessingCoordinator {
         }
     }
 
+    /// A host started on the GPU that dies of a crash signal before it is
+    /// up: the GPU path cannot even start (mac-v0.8.4 shipped without the
+    /// Vulkan shaders and crashed in pipeline creation on every start), so
+    /// it is a GPU fault like NaN logits, not a reason to skip correction.
+    static func isCrashDuringStartup(_ error: LLMHostProcessError) -> Bool {
+        guard case .processExitedDuringStartup(let status) = error else { return false }
+        return [SIGILL, SIGABRT, SIGBUS, SIGSEGV].contains(status)
+    }
+
     static func canaryAnswerLooksSane(_ answer: String) -> Bool {
         let firstWord = answer
             .split(whereSeparator: { !$0.isLetter })
@@ -217,8 +226,12 @@ actor LLMPostprocessingCoordinator {
     }
 
     private func fallBackToCPU(after failure: LLMPostprocessError?) async {
+        await fallBackToCPU(reason: failure.map { "\($0)" } ?? "garbage output")
+    }
+
+    private func fallBackToCPU(reason: String) async {
         gpuFaulted = true
-        log("LLM postprocessing: the GPU host failed (\(failure.map { "\($0)" } ?? "garbage output")); running the LLM on the CPU until the GPU setting changes")
+        log("LLM postprocessing: the GPU host failed (\(reason)); running the LLM on the CPU until the GPU setting changes")
         for host in hostProcesses.values {
             await host.stop()
         }
@@ -287,6 +300,11 @@ actor LLMPostprocessingCoordinator {
                                                       ctxSize: model.hostContextSize,
                                                       useGPU: usedGPU,
                                                       chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
+            if usedGPU, case .failure(let error) = startResult, Self.isCrashDuringStartup(error) {
+                await fallBackToCPU(reason: "\(error)")
+                await prewarmNeededHosts(settings: settings)
+                return
+            }
             guard case .success = startResult, let baseURL = await hostProcess.baseURL else {
                 log("LLM postprocessing: pre-warm of \(model.displayName) failed (\(startResult)); will retry on first use")
                 continue
@@ -411,6 +429,10 @@ actor LLMPostprocessingCoordinator {
         }
         switch startResult {
         case .failure(let error):
+            if usedGPU, Self.isCrashDuringStartup(error) {
+                await fallBackToCPU(reason: "\(error)")
+                return await correctedViaBundledHost(text, settings: settings)
+            }
             log("LLM postprocessing: bundled host failed to start (\(error)); passing text through unchanged")
             return text
         case .success:
@@ -591,6 +613,10 @@ actor LLMPostprocessingCoordinator {
         }
         switch startResult {
         case .failure(let error):
+            if usedGPU, Self.isCrashDuringStartup(error) {
+                await fallBackToCPU(reason: "\(error)")
+                return await rewrittenViaBundledHost(text, settings: settings)
+            }
             log("LLM postprocessing: bundled rewrite host failed to start (\(error)); passing text through unchanged")
             return text
         case .success:

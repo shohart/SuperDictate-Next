@@ -18,11 +18,38 @@ the tag prefix, never by which release GitHub calls "latest".
 
 ## macOS
 
-1. Build and sign, as before (`scripts/build-app.sh`, identity "PolterType Dev").
-2. Put the version, `RELEASE_TAG="mac-vX.Y.Z"` and the zip's sha256 into
+1. Bump `swift/Info.plist`. Build and sign in the main checkout, not in a
+   temporary worktree or clone:
+   `SIGN_IDENTITY=C78D9D87EB6EC8BF75D2DF035A59D6FB300C9ED9 scripts/build-app.sh`
+   (the "PolterType Dev" certificate, by hash: its name is ambiguous in
+   the keychain). Then zip it:
+   `ditto -c -k --sequesterRsrc --keepParent dist/SuperDictate.app dist/SuperDictate.zip`.
+2. **Self-tests from the build tree, with the real models** (`swift build -c debug`
+   first). These must pass: `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`,
+   `llm-prefix-primer`, `full-pipeline`; the environment variables they need are
+   printed in each suite's SKIP line. `all` and `update` can boot the
+   production agent out: afterwards check
+   `launchctl list | grep superdictate` and restore it if it is gone.
+3. **`scripts/verify-release.sh dist/SuperDictate.zip` must pass. This step is
+   mandatory.** It unpacks the zip into a fresh directory and checks that
+   exact artifact through its own binaries. It checks the signature and
+   designated requirement, the helpers, and the LLM Vulkan shaders in the
+   bundle. It starts the GPU host from the bundle. It runs correction on the
+   GPU and the CPU and rewrite on the GPU through the real coordinator
+   (`--diagnose-llm`). It also runs Parakeet and GigaAM on a `say` recording.
+   Self-tests alone are not enough. mac-v0.8.4 passed all of them and still
+   crashed on every GPU start: its shaders were missing from the bundle and
+   were found only in the build tree, a worktree that was deleted after the
+   build.
+4. Put the version, `RELEASE_TAG="mac-vX.Y.Z"` and the zip's sha256 into
    `install.sh`, and the version and sha256 into `update.json`;
-   `scripts/check.sh` checks that they agree. Add a CHANGELOG entry, commit.
-3. `gh release create mac-vX.Y.Z SuperDictate.zip --target <full sha> --latest`
+   `scripts/check.sh` checks that they agree. Add a CHANGELOG entry and
+   commit (S). In a second commit, set `SOURCE_COMMIT=S` in `install.sh`.
+5. `gh release create mac-vX.Y.Z dist/SuperDictate.zip --target <full sha of the second commit> --latest`,
+   then `gh workflow run "release smoke"` (Actions do not trigger on their
+   own in this repo) and wait for it to pass.
+6. Pushes from this Mac go over HTTPS (the SSH key is a read-only deploy key):
+   `git -c credential.helper='!gh auth git-credential' push https://github.com/shohart/SuperDictate-Next.git main`.
 
 **One-time bridge.** macOS 0.7.0 and earlier read `releases/latest` and only
 understand a `vX.Y.Z` tag, downloading from `releases/download/vX.Y.Z/`. So

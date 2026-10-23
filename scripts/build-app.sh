@@ -66,6 +66,14 @@ else
     echo "build-app.sh: WARNING: $LLM_HOST_BIN not found -- shipping without the local correction-model helper (text-correction mode will be unavailable in this build)" >&2
 fi
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
+# The LLM host's Vulkan backend loads loose SPIR-V files at runtime
+# (ggml-vulkan-shaders-runtime.cpp); the host looks for them in
+# Contents/Resources/llama-vulkan-shaders. Without them a GPU start falls
+# back to the build tree's copy -- present on the build machine only -- and
+# crashes everywhere else (mac-v0.8.4). A missing corpus fails the build.
+LLM_SHADER_SRC="$ROOT_DIR/swift/Sources/llama_cpp_host/upstream/ggml-vulkan/vulkan-shaders"
+[[ -f "$LLM_SHADER_SRC/matmul_f32_f32.spv" ]] || fail "No LLM Vulkan shader corpus in $LLM_SHADER_SRC"
+cp -R "$LLM_SHADER_SRC" "$STAGE_APP/Contents/Resources/llama-vulkan-shaders"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"

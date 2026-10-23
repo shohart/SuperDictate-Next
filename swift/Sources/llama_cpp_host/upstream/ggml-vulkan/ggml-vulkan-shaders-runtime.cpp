@@ -166,6 +166,11 @@ void ggml_vk_shaders_set_directory(const char * dir) {
     g_dir_resolved = false;
 }
 
+const char * ggml_vk_shaders_directory(void) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return resolve_dir_locked().c_str();
+}
+
 namespace ggml_vk_shaders_detail {
 
 const void * get_data(const char * name) {

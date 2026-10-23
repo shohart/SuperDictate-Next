@@ -48,6 +48,8 @@ if let benchmarkResult = runASRBenchmarkDiagnostic(arguments: launchArguments) {
     exit(benchmarkResult)
 } else if let streamingResult = runStreamingASRBenchmarkDiagnostic(arguments: launchArguments) {
     exit(streamingResult)
+} else if let llmResult = runLLMDiagnostic(arguments: launchArguments) {
+    exit(llmResult)
 } else if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {

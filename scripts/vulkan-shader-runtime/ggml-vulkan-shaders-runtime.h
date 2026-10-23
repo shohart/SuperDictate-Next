@@ -71,6 +71,14 @@ extern "C" {
 // environment-variable/source-relative fallbacks.
 void ggml_vk_shaders_set_directory(const char * dir);
 
+// The directory shaders are (or will be) loaded from, after the same
+// env-var > configured > source-relative resolution the loader uses. Lets
+// a host check, before any Vulkan pipeline exists, that the corpus is
+// really there -- a missing one does not fail cleanly, it crashes inside
+// pipeline creation. The pointer stays valid until the next
+// ggml_vk_shaders_set_directory() call.
+const char * ggml_vk_shaders_directory(void);
+
 #ifdef __cplusplus
 } // extern "C"
 

@@ -34,6 +34,7 @@
 #include "sampling.h"
 #include "llama.h"
 
+#include "ggml-vulkan-shaders-runtime.h"
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
@@ -56,6 +57,11 @@
 #include <tlhelp32.h>
 #else
 #include <unistd.h>
+#include <climits>
+#include <sys/stat.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 // Not "json" -- common/chat.h already defines that alias (to
@@ -511,7 +517,40 @@ static int list_gpu_devices() {
     return 0;
 }
 
+// The Vulkan backend loads its SPIR-V shaders from loose .spv files, which
+// ship in Contents/Resources/llama-vulkan-shaders (scripts/build-app.sh).
+// Without this the loader falls back to the shader directory of the source
+// tree the binary was compiled in: that works on the build machine only,
+// and only while that tree exists -- mac-v0.8.4 was built in a temporary
+// worktree, which was then deleted, and every GPU start crashed.
+static void configure_vulkan_shader_dir() {
+#if defined(__APPLE__)
+    char exe[PATH_MAX];
+    uint32_t size = sizeof(exe);
+    char resolved[PATH_MAX];
+    if (_NSGetExecutablePath(exe, &size) != 0 || realpath(exe, resolved) == nullptr) {
+        return;
+    }
+    std::string dir(resolved);
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../Resources/llama-vulkan-shaders";
+    char shaders[PATH_MAX];
+    struct stat st;
+    if (realpath(dir.c_str(), shaders) != nullptr && stat(shaders, &st) == 0 && S_ISDIR(st.st_mode)) {
+        ggml_vk_shaders_set_directory(shaders);
+    }
+#endif
+}
+
+// A missing shader does not fail cleanly: pipeline creation reads a null
+// buffer and the process dies with SIGSEGV. So check before any pipeline
+// exists, and run on the CPU instead.
+static bool vulkan_shaders_present() {
+    std::ifstream probe(std::string(ggml_vk_shaders_directory()) + "/matmul_f32_f32.spv");
+    return probe.good();
+}
+
 int main(int argc, char ** argv) {
+    configure_vulkan_shader_dir();
     if (argc == 2 && std::string(argv[1]) == "--list-devices") {
         return list_gpu_devices();
     }
@@ -524,6 +563,16 @@ int main(int argc, char ** argv) {
                              "[--lora <path.gguf>] [--lora-scale N]\n"
                              "       superdictate-llm-host --list-devices\n");
         return 1;
+    }
+
+    if (cfg.n_gpu_layers != 0) {
+        if (vulkan_shaders_present()) {
+            std::fprintf(stderr, "superdictate-llm-host: vulkan shaders: %s\n", ggml_vk_shaders_directory());
+        } else {
+            std::fprintf(stderr, "superdictate-llm-host: vulkan shaders not found in %s; running on the CPU\n",
+                         ggml_vk_shaders_directory());
+            cfg.n_gpu_layers = 0;
+        }
     }
 
     LlmHost host;

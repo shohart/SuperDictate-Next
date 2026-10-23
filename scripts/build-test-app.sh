@@ -73,6 +73,10 @@ cp "$BIN" "$STAGE_APP/Contents/MacOS/${APP_NAME}"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
+# Same LLM Vulkan shader corpus as build-app.sh (see there).
+LLM_SHADER_SRC="$ROOT_DIR/swift/Sources/llama_cpp_host/upstream/ggml-vulkan/vulkan-shaders"
+[[ -f "$LLM_SHADER_SRC/matmul_f32_f32.spv" ]] || fail "No LLM Vulkan shader corpus in $LLM_SHADER_SRC"
+cp -R "$LLM_SHADER_SRC" "$STAGE_APP/Contents/Resources/llama-vulkan-shaders"
 # The bundled LLM host helper (Ветка 1), if built -- same relative layout
 # build-app.sh will eventually use for the real app.
 LLM_HOST_BIN="$BIN_DIR/SuperDictateLLMHost"

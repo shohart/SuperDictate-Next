@@ -417,3 +417,74 @@ func benchmarkReadMonoPCM(fileURL: URL) throws -> [Float] {
     return Array(UnsafeBufferPointer(start: channelData[0], count: Int(outBuffer.frameLength)))
 }
 
+
+/// Production-shipped check of the local LLM stages, used by
+/// scripts/verify-release.sh before every release: the REAL
+/// LLMPostprocessingCoordinator, with SuperDictateLLMHost resolved from this
+/// bundle's Contents/Helpers and the models from the app cache, exactly as
+/// a dictation uses them. mac-v0.8.4 passed every self-test (run from the
+/// build tree) and still shipped a host that crashed on every GPU start;
+/// this runs the shipped bundle instead.
+///
+/// usage: SuperDictate --diagnose-llm correction|rewrite gpu|cpu <text>
+///
+/// Prints one `LLM_DIAG` line. Fails when the host is not running after
+/// the requests, when a GPU run fell back to the CPU, when the output is
+/// empty or unchanged, or (correction) when the second request did not
+/// reuse the shared prompt prefix.
+func runLLMDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--diagnose-llm" else { return nil }
+    guard arguments.count == 4,
+          ["correction", "rewrite"].contains(arguments[1]),
+          ["gpu", "cpu"].contains(arguments[2]) else {
+        fputs("usage: SuperDictate --diagnose-llm correction|rewrite gpu|cpu <text>\n", stderr)
+        return EXIT_FAILURE
+    }
+    let rewrite = arguments[1] == "rewrite"
+    let gpu = arguments[2] == "gpu"
+    let text = arguments[3]
+
+    let suite = "com.local.superdictate.diagnose-llm"
+    UserDefaults().removePersistentDomain(forName: suite)
+    let settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: .inMemoryFallback())
+    settings.textPostprocessingMode = rewrite ? .off : .correction
+    settings.llmEngineBackend = .bundledLocal
+    settings.rewriteEnabled = rewrite
+    settings.rewriteEngineBackend = .bundledLocal
+    settings.llmUseGPU = gpu
+    let model = rewrite ? settings.rewriteBundledModel : settings.correctionBundledModel
+    guard bundledLLMModelExists(model) else {
+        fputs("LLM_DIAG_FAILED: \(model.displayName) is not downloaded\n", stderr)
+        return EXIT_FAILURE
+    }
+
+    let semaphore = DispatchSemaphore(value: 0)
+    let exitCode = DiagnosticExitCode()
+    Task.detached {
+        defer { semaphore.signal() }
+        let coordinator = LLMPostprocessingCoordinator()
+        let started = ProcessInfo.processInfo.systemUptime
+        await coordinator.prewarmNeededHosts(settings: settings)
+        let warmed = ProcessInfo.processInfo.systemUptime
+        let output = await coordinator.finalizedText(text, settings: settings)
+        let done = ProcessInfo.processInfo.systemUptime
+        let cached = rewrite ? nil : await coordinator.correctionCachedTokensForTest(text, settings: settings)
+        let running = await coordinator.isHostProcessRunningForTest()
+        let faulted = await coordinator.isGPUFaultedForTest
+        await coordinator.stop()
+        print(String(format: "LLM_DIAG stage=%@ device=%@ model=\"%@\" load=%.1fs request=%.2fs host_running=%@ gpu_fallback=%@ cached_tokens=%@ output=\"%@\"",
+                     arguments[1], arguments[2], model.displayName, warmed - started, done - warmed,
+                     "\(running)", "\(faulted)", cached.map(String.init) ?? "-", output))
+        var problems: [String] = []
+        if !running { problems.append("the model host is not running") }
+        if gpu && faulted { problems.append("the GPU host failed and the coordinator fell back to the CPU") }
+        if output.isEmpty || output == text { problems.append("the text came back empty or unchanged") }
+        if !rewrite && (cached ?? 0) < 200 { problems.append("the shared prompt prefix was not reused") }
+        for problem in problems { fputs("LLM_DIAG_FAILED: \(problem)\n", stderr) }
+        exitCode.set(problems.isEmpty ? EXIT_SUCCESS : EXIT_FAILURE)
+    }
+    while semaphore.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    return exitCode.value
+}

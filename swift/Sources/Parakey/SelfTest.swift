@@ -3029,6 +3029,11 @@ enum ParakeySelfTest {
         try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" «Привет»"), equals: true, "leading punctuation")
         try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" обесп"), equals: false, "MI50 garbage")
         try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(""), equals: false, "empty")
+        // A GPU host that crashes while starting is a GPU fault; a plain
+        // failed start (bad model file, exit 1) or the app's own SIGTERM is not.
+        try expect(LLMPostprocessingCoordinator.isCrashDuringStartup(.processExitedDuringStartup(SIGSEGV)), equals: true, "SIGSEGV at start")
+        try expect(LLMPostprocessingCoordinator.isCrashDuringStartup(.processExitedDuringStartup(1)), equals: false, "exit 1 at start")
+        try expect(LLMPostprocessingCoordinator.isCrashDuringStartup(.processExitedDuringStartup(SIGTERM)), equals: false, "SIGTERM at start")
         // editDistance primitive.
         try expect(LLMCorrectionGuardrail.editDistance("гитхаб", "гитхуб"), equals: 1,
                    "single substitution should have distance 1")

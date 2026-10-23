@@ -131,7 +131,8 @@ let package = Package(
             // by explicit file path (ggml-vulkan-shaders-runtime.cpp), not
             // compiled in -- and never through SwiftPM `resources:`.
             // scripts/build-test-app.sh / build-app.sh copy this directory
-            // into the shipped bundle directly.
+            // into the bundle as Contents/Resources/llama-vulkan-shaders,
+            // where the host looks for it (superdictate_llm_host_main.cpp).
             exclude: [
                 "upstream/ggml-vulkan/vulkan-shaders",
             ],
