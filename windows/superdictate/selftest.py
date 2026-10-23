@@ -1589,8 +1589,9 @@ def test_npu_encoder_background_compile() -> None:
         deadline = time.monotonic() + 5
         while slot.compiling and time.monotonic() < deadline:
             time.sleep(0.01)
-        _check("npu slow: moves to the NPU once compiled",
-               (slot.swap(), slot.device, slot.request), (True, "NPU", "request-NPU"))
+        _check("npu slow: moves to the NPU by itself once compiled, without a request",
+               (slot.device, slot.request), ("NPU", "request-NPU"))
+        _check("npu slow: nothing left to swap afterwards", slot.swap(), False)
 
         behaviour["npu"] = "fast"
         _check("npu cached: starts on the NPU",

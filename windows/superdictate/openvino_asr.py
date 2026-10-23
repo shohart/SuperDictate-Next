@@ -470,6 +470,9 @@ class EncoderSlot:
         self.npu_error = ""
         self._pending = None
         self._lock = threading.Lock()
+        #: Held while a request runs on the encoder; the swap to the NPU
+        #: waits for it, so a request never sees the encoder change under it.
+        self.in_use = threading.Lock()
         self._compiling = threading.Event()
         if not path.is_file():
             raise InvalidModel(f"missing model file {path.name}")
@@ -493,6 +496,11 @@ class EncoderSlot:
                     compiled = _compile(core, path, "NPU")
                 with self._lock:
                     self._pending = compiled
+                # Move over now, between requests, not on the next request:
+                # an idle app would otherwise keep reporting the CPU (and
+                # "compiling") until somebody dictates.
+                with self.in_use:
+                    self.swap()
                 _emit(f"{path.name}: NPU ready after {time.monotonic() - started:.0f}s")
             except Exception as exc:
                 lines = str(exc).strip().splitlines() or [type(exc).__name__]
@@ -511,7 +519,10 @@ class EncoderSlot:
                       f"running on the CPU meanwhile")
             # No CACHE_DIR: the CPU copy is a stopgap, and its blob would be
             # another gigabyte on disk for Parakeet.
-            self._use(_compile(_core(None), path, "CPU"), "CPU")
+            cpu = _compile(_core(None), path, "CPU")
+            with self.in_use:
+                if self.device != "NPU":  # the compile may have won the race
+                    self._use(cpu, "CPU")
 
     @property
     def compiling(self) -> bool:
@@ -565,7 +576,11 @@ class OvFamily:
         return ""
 
     def transcribe(self, samples: np.ndarray, cancelled: CancelCheck = lambda: False) -> Transcript:
-        self.encoder.swap()
+        with self.encoder.in_use:
+            self.encoder.swap()
+            return self._transcribe(samples, cancelled)
+
+    def _transcribe(self, samples: np.ndarray, cancelled: CancelCheck) -> Transcript:
         samples = np.ascontiguousarray(samples, dtype=np.float32)
         spans = plan_windows(samples.size, self.window_samples, self.overlap_samples)
         if len(spans) == 1:

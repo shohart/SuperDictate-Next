@@ -232,6 +232,25 @@ class SpeechModel:
         return host.window_seconds if host is not None else 0.0
 
     @property
+    def npu_compiling(self) -> bool:
+        """The NPU was asked for and is still being compiled in the host."""
+        return self.backend == BACKEND_NPU and "compiling" in self.fallback_reason
+
+    def refresh_device(self) -> bool:
+        """Re-read the host's device. Skipped (False) while a request runs,
+        so it never delays a dictation. True when it was read."""
+        if self._host is None or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._host.refresh_status()
+            return True
+        except Exception as exc:
+            log.debug("Status poll failed: %s", exc)
+            return False
+        finally:
+            self._lock.release()
+
+    @property
     def fallback_reason(self) -> str:
         """Why the requested device is not the one running, or ``""``."""
         host = self._host

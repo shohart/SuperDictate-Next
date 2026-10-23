@@ -194,6 +194,15 @@ class OnnxHost:
         except (TypeError, ValueError):
             self.window_seconds = 0.0
 
+    def refresh_status(self, timeout: float = 5.0) -> None:
+        """Ask the host where it runs now (SuperDictateOvHost moves a model
+        from the CPU to the NPU when its background compile finishes)."""
+        status, _ = self._round_trip(TYPE_STATUS, {}, b"", timeout=timeout)
+        provider = status.get("provider_actual")
+        if isinstance(provider, str) and provider:
+            self.provider_actual = provider
+            self.provider_fallback_reason = str(status.get("provider_fallback_reason", "") or "")
+
     def shutdown(self) -> None:
         if not self.is_alive:
             self._close()

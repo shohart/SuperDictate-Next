@@ -153,6 +153,7 @@ class ControlPanel(QMainWindow):
         controller.state_changed.connect(lambda _: self.refresh())
         controller.progress_changed.connect(self._on_progress)
         controller.settings_applied.connect(self.refresh)
+        controller.device_changed.connect(self.refresh)
         controller.transcript_ready.connect(lambda _: self._stats.refresh())
 
         self._usage_timer = QTimer(self)

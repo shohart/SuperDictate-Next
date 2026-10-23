@@ -42,6 +42,9 @@ from .settings import CompletionBehavior, Settings
 
 log = get_logger("app")
 
+#: How often an idle app asks the speech host whether its NPU compile is done.
+NPU_POLL_SECONDS = 10.0
+
 # Live preview. The model is not a streaming one: each pass re-reads the
 # audio from the start, so the cost grows with the length of the dictation
 # and the interval has to grow with it. PREVIEW_DUTY is the share of one
@@ -108,6 +111,9 @@ class DictationController(QObject):
     # shortcut. Carries them newest first.
     history_bubbles_requested = Signal(list)
     settings_applied = Signal()
+    # The speech model moved to another device (the NPU, once its background
+    # compile finished); the panel shows the device.
+    device_changed = Signal()
     # Rules just learned, as (source, replacement) pairs. The UI
     # offers an undo for them; see ui.learn_toast.
     vocabulary_learned = Signal(list)
@@ -310,6 +316,9 @@ class DictationController(QObject):
             self._set_state(AppState.READY)
             self._recover_pending_dictation()
             self._warm_up_correction()
+            if model.npu_compiling:
+                threading.Thread(target=self._watch_npu_compile, args=(model,),
+                                 name="npu-compile-watch", daemon=True).start()
         else:
             self.last_error = model.error or "unknown error"
             self._set_state(AppState.FAILED)
@@ -459,6 +468,17 @@ class DictationController(QObject):
             i18n.tr("toast_rewrite_style",
                     style=i18n.tr(f"rewrite_style_{following.value}")),
             following.value)
+
+    def _watch_npu_compile(self, model) -> None:
+        """Until the background NPU compile ends, ask the host every
+        NPU_POLL_SECONDS where the model runs, so the panel switches from
+        "CPU, compiling" to the NPU without waiting for a dictation."""
+        while not self._terminating and model is self._model and model.npu_compiling:
+            time.sleep(NPU_POLL_SECONDS)
+            if model.refresh_device() and not model.npu_compiling:
+                log.info("Speech model moved to %s after its background compile",
+                         ", ".join(model.active_providers).upper())
+                self.device_changed.emit()
 
     def _warm_up_correction(self) -> None:
         """Load the local correction model and prime its prompt cache in the

@@ -14,6 +14,7 @@ Windows only, tag `win-v0.8.3.1`. macOS stays on 0.8.0.
 - **The dictation shortcut could stop responding** while GigaAM ran on the CPU and its NPU compile went on in the background. Two changes cover a silently removed hook, whatever removed it:
   - The keyboard-hook thread runs at high priority.
   - The hook is re-installed every 30 s. Windows silently removes a low-level hook whose callback misses `LowLevelHooksTimeout`, and that cannot be detected; the new hook goes in before the old one comes out, so no keystroke is lost.
+- **The app showed "CPU, compiling" long after the NPU compile was done.** The finished NPU encoder was picked up only by the next dictation, and only that dictation told the app. GigaAM's compile actually ends after 4–7 minutes. Now the host moves to the NPU the moment the compile finishes, between requests. While a compile runs, the app asks the host every 10 s and updates the control panel.
 - **The background NPU compile no longer competes with the rest of the machine.** `SuperDictateOvHost` drops to below-normal priority for the duration of the compile and returns to normal afterwards.
 
 ### Changed
