@@ -86,6 +86,9 @@ Source: "..\dist\SuperDictate\*"; DestDir: "{app}"; \
 Type: files; Name: "{app}\D1CT.exe"
 Type: files; Name: "{group}\D1CT.lnk"
 Type: files; Name: "{autodesktop}\D1CT.lnk"
+; 0.8.3 shipped llama.cpp's llama-server here; from 0.8.3.1 the local LLM
+; host is engines\superdictate-llm-host.exe, so the old 83 MB goes.
+Type: filesandordirs; Name: "{app}\_internal\engines\llama"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
