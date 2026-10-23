@@ -192,6 +192,8 @@ enum ParakeySelfTest {
             return runSuite("llm-gec", testLLMGECIntegration)
         case "llm-rewrite":
             return runSuite("llm-rewrite", testLLMRewriteIntegration)
+        case "llm-prefix-primer":
+            return runSuite("llm-prefix-primer", testLLMPrefixPrimer)
         case "full-pipeline":
             return runSuite("full-pipeline", testFullDictationPipelineWithLLMCorrection)
         case "silero-vad-download":
@@ -3021,6 +3023,12 @@ enum ParakeySelfTest {
     /// cases live in fixtures/llm-correction-guardrail.json, shared with the
     /// Windows port's suite, so the two guardrails cannot drift apart.
     private static func testLLMCorrectionGuardrail() throws {
+        // GPU canary: a sane model starts its answer with «Привет».
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane("Привет, как дела?"), equals: true, "corrector echo")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane("Привет! Всё хорошо."), equals: true, "instruct greeting")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" «Привет»"), equals: true, "leading punctuation")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(" обесп"), equals: false, "MI50 garbage")
+        try expect(LLMPostprocessingCoordinator.canaryAnswerLooksSane(""), equals: false, "empty")
         // editDistance primitive.
         try expect(LLMCorrectionGuardrail.editDistance("гитхаб", "гитхуб"), equals: 1,
                    "single substitution should have distance 1")
@@ -3140,6 +3148,31 @@ enum ParakeySelfTest {
     /// tried and rejected. This test only asserts what the model layer
     /// itself demonstrably does reliably: term/casing correction, and not
     /// corrupting an already-correct term it's handed.
+    /// The pre-warm primes the bundled host's prompt-prefix snapshot, so
+    /// the very first dictation after it reuses the shared system prompt and
+    /// few-shot turns instead of decoding them. Real model, so not in `all`.
+    private static func testLLMPrefixPrimer() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP llm-prefix-primer: SUPERDICTATE_GEC_MODEL not set to an existing file")
+            return
+        }
+        let coordinator = LLMPostprocessingCoordinator()
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-prefix-primer")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.textPostprocessingMode = .correction
+        settings.llmEngineBackend = .bundledLocal
+        settings.llmUseGPU = ProcessInfo.processInfo.environment["SUPERDICTATE_PRIMER_CPU"] == nil
+        try runParakeetEngineSynchronously { await coordinator.prewarmNeededHosts(settings: settings) }
+        let cached = try runParakeetEngineSynchronously {
+            await coordinator.correctionCachedTokensForTest("я развернул дебиан сервер", settings: settings)
+        }
+        print("LLM prefix primer: first request after pre-warm reused \(cached.map(String.init) ?? "nil") prompt tokens")
+        try runParakeetEngineSynchronously { await coordinator.stop() }
+        try expect((cached ?? 0) >= 200, equals: true,
+                   "the first correction after pre-warm must reuse the system prompt and few-shot turns")
+    }
+
     private static func testLLMGECIntegration() throws {
         guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_GEC_MODEL"],
               FileManager.default.fileExists(atPath: modelPath) else {
@@ -3229,6 +3262,13 @@ enum ParakeySelfTest {
                    "an already-correct Debian must survive the LLM pass unchanged")
         try expect(result2.contains("дебиан"), equals: false,
                    "the model must never revert an already-Latin term back to Cyrillic")
+        // On a GPU whose Vulkan path computes NaN the host now answers 503
+        // instead of aborting, and the coordinator moves to the CPU; either
+        // way the host must still be up after the requests.
+        let faulted = try runParakeetEngineSynchronously { await coordinator.isGPUFaultedForTest }
+        let running = try runParakeetEngineSynchronously { await coordinator.isHostProcessRunningForTest() }
+        print("LLM GEC: GPU fault fallback=\(faulted), host running=\(running)")
+        try expect(running, equals: true, "the model host must stay loaded after a dictation")
 
         try runParakeetEngineSynchronously { await coordinator.stop() }
     }
