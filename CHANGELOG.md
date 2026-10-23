@@ -6,6 +6,33 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.5 — 2026-10-23
+
+macOS only, tag `mac-v0.8.5`. Fixes 0.8.4, which broke local correction and rewrite on the GPU.
+
+### Fixed
+- **Local correction and rewrite work on the GPU again.** In 0.8.4 the LLM host crashed on every GPU start, so no correction or rewrite was applied. The host's Vulkan backend loads its shaders from files at runtime, and the app bundle never contained them. The host found them in the source tree it was built from, which exists only on the build machine. That is why every earlier release worked on that machine and only there. 0.8.4 was built in a temporary directory that was deleted afterwards. The shaders now ship in the bundle (`Contents/Resources/llama-vulkan-shaders`), and the host loads them from there. This also fixes "LLM on GPU" on every Mac other than the build machine, in every release since it was added.
+- **A GPU that cannot start no longer means no correction.** If the shaders are missing, the host runs on the CPU and says so in the log. If a GPU host crashes while starting, the app moves the local models to the CPU, as it already did for NaN output.
+
+### Added
+- `SuperDictate --diagnose-llm correction|rewrite gpu|cpu <text>`: runs the local correction or rewrite exactly as a dictation does, with the bundle's own model host.
+- `scripts/verify-release.sh <zip>`, now a mandatory release step (`docs/RELEASING.md`). It checks the release zip itself, not the build tree:
+  - the signature and designated requirement, the helpers, and the shaders;
+  - that the GPU host loads its shaders from the bundle;
+  - correction on the GPU and the CPU, and rewrite on the GPU;
+  - speech recognition with Parakeet and GigaAM.
+  On the 0.8.4 zip it reports 5 failures.
+
+### Validation
+- `scripts/verify-release.sh` passes on this zip:
+  - correction on the GPU (MI50): 0.34 s, 276 prompt tokens reused;
+  - correction on the CPU: 0.54 s;
+  - rewrite (YandexGPT-5-Lite 8B) on the GPU: 0.87 s;
+  - Parakeet and GigaAM both pass.
+- Self-tests pass: `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline`.
+- With the shaders made unreachable, the host logs it and serves from the CPU instead of crashing.
+- macOS 0.8.5 (build 62), bundle id `com.local.superdictate`, macOS 14.0+, x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `d00666cc6270e99c447c557147182d20ea00c78db08278de5bf29d1bd18c2a3a`.
+
 ## Windows 0.8.4 — 2026-10-23
 
 Windows only, tag `win-v0.8.4`. Same version number as macOS 0.8.4, but a different release.
