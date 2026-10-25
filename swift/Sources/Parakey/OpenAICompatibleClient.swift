@@ -2,6 +2,7 @@
 // during the refactor/split-main refactor.
 //
 
+import Darwin
 import Foundation
 
 // MARK: - OpenAI-compatible chat completions client
@@ -34,11 +35,55 @@ enum LLMPostprocessError: Error, Equatable, Sendable {
     case invalidBaseURL
 }
 
-/// True for 127.0.0.1/::1/localhost — see the `connectionProxyDictionary`
-/// override at the call site for why this matters.
-func isLoopbackHost(_ host: String?) -> Bool {
-    guard let host else { return false }
-    return host == "127.0.0.1" || host == "::1" || host == "localhost"
+/// Whether `host` lives on this machine or its own LAN: loopback, the IPv4
+/// private ranges (10/8, 172.16/12, 192.168/16), link-local and CGNAT
+/// addresses, IPv6 loopback/ULA/link-local, and mDNS `.local` names.
+/// Public names are deliberately not resolved: DNS may itself be reachable
+/// only through the proxy, and a lookup per request would slow the
+/// dictation path. A local LLM server is configured with a literal LAN
+/// address or a `.local` name in practice.
+///
+/// Used by the `connectionProxyDictionary` override at the call site:
+/// loopback and LAN endpoints must never go through the system proxy.
+func isLocalNetworkHost(_ host: String?) -> Bool {
+    guard let rawHost = host else { return false }
+    var host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !host.isEmpty else { return false }
+    if host.hasPrefix("[") && host.hasSuffix("]") {
+        host = String(host.dropFirst().dropLast())
+    }
+    host = host.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    if host == "localhost" || host == "0.0.0.0"
+        || host == "::1" || host == "::" { return true }
+    if host.hasSuffix(".local") || host.hasSuffix(".localhost") { return true }
+
+    if host.contains(":") {
+        // An IPv4-mapped literal (::ffff:192.168.1.5) is a LAN endpoint.
+        if host.hasPrefix("::ffff:") {
+            return isLocalNetworkHost(String(host.dropFirst(7)))
+        }
+        // IPv6: unique-local fc00::/7 and link-local fe80::/10.
+        return host.hasPrefix("fc") || host.hasPrefix("fd")
+            || host.hasPrefix("fe80:")
+    }
+
+    var address = in_addr()
+    guard inet_pton(AF_INET, host, &address) == 1 else { return false }
+    let bytes = withUnsafeBytes(of: &address) { Array($0) }
+    switch bytes[0] {
+    case 10, 127:
+        return true
+    case 169:
+        return bytes[1] == 254
+    case 172:
+        return (16...31).contains(Int(bytes[1]))
+    case 192:
+        return bytes[1] == 168
+    case 100:
+        return (64...127).contains(Int(bytes[1]))
+    default:
+        return false
+    }
 }
 
 enum OpenAICompatibleRole: String, Codable, Sendable {
@@ -109,6 +154,7 @@ enum OpenAICompatibleClient {
                                 enableThinking: Bool = false,
                                 temperature: Double = 0,
                                 maxTokens: Int = 512,
+                                useSystemProxy: Bool = true,
                                 // 60s comfortably covers a release-build
                                 // correction request (measured ~30 tok/s on
                                 // the pinned model) even for a long
@@ -158,12 +204,12 @@ enum OpenAICompatibleClient {
         config.urlCache = nil
         config.timeoutIntervalForRequest = timeoutInterval
         config.timeoutIntervalForResource = timeoutInterval
-        if isLoopbackHost(url.host) {
+        if !useSystemProxy || isLocalNetworkHost(url.host) {
             // A system-wide HTTP/HTTPS/SOCKS proxy (common on managed
             // Macs, VPN clients, and -- verified empirically during
             // development -- this project's own dev machine) has no route
-            // back into this same machine's loopback interface. Without
-            // this override, URLSession still honors that proxy for a
+            // back to loopback or the user's own LAN. Without this
+            // override, URLSession still honors that proxy for a
             // 127.0.0.1 target (macOS's proxy exceptions list defaults to
             // *.local/link-local/specific LAN hosts, never loopback), so
             // every request to the bundled SuperDictateLLMHost silently
@@ -172,9 +218,13 @@ enum OpenAICompatibleClient {
             // taking exactly ~30s (the default timeout) before failing.
             // An empty dictionary (not nil) is CFNetwork's documented way
             // to say "no proxy," overriding the system configuration for
-            // this session only. Applies equally to a user-supplied custom
-            // baseURL that happens to also be loopback (e.g. their own
-            // local llama-server) -- same reasoning, same fix.
+            // this session only.
+            //
+            // The same override covers a user's own llama-server on the
+            // LAN, and the Settings checkbox that turns the system proxy
+            // off for internet endpoints (a provider behind a local XRay
+            // client needs the proxy; a machine behind a broken proxy
+            // needs to bypass it).
             config.connectionProxyDictionary = [:]
         }
         let session = URLSession(configuration: config)

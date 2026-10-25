@@ -1212,6 +1212,46 @@ def test_llm_backend_without_bundled_host() -> None:
            endpoint.effective_model_name, "gpt-4o-mini")
 
 
+def test_llm_proxy_policy() -> None:
+    """Local LLM endpoints stay direct; internet ones honour the proxy."""
+    from .llm.host import (
+        _OPENER,
+        _REMOTE_OPENER,
+        _is_local_network_host,
+        _opener_for,
+    )
+    from .settings import Settings
+
+    for host in ("127.0.0.1", "127.10.0.2", "192.168.1.10", "10.0.0.5",
+                 "172.16.0.1", "172.31.255.255", "169.254.1.1",
+                 "100.64.0.1", "::1", "fe80::1", "fd00::1", "0.0.0.0",
+                 "localhost", "printer.local"):
+        _check(f"local network: {host}", _is_local_network_host(host), True)
+    for host in ("8.8.8.8", "172.32.0.1", "203.0.113.10", "openrouter.ai"):
+        _check(f"internet: {host}", _is_local_network_host(host), False)
+
+    _check("a LAN endpoint bypasses even an enabled proxy",
+           _opener_for("http://192.168.1.5:1234/v1/chat/completions", True),
+           _OPENER)
+    _check("an internet endpoint uses the system proxy by default",
+           _opener_for("https://openrouter.ai/api/v1/chat/completions", True),
+           _REMOTE_OPENER)
+    _check("the toggle forces an internet endpoint direct",
+           _opener_for("https://openrouter.ai/api/v1/chat/completions", False),
+           _OPENER)
+
+    settings = Settings(path=tempfile.mktemp(suffix=".json"))
+    _check("proxy on by default", settings.llm_use_system_proxy, True)
+    _check("the correction endpoint follows the setting",
+           settings.correction_config().endpoint.use_system_proxy, True)
+    _check("the rewrite endpoint follows the setting",
+           settings.rewrite_config().endpoint.use_system_proxy, True)
+    settings._set("llm_use_system_proxy_v1", False)
+    _check("turning it off reaches both endpoints",
+           (settings.correction_config().endpoint.use_system_proxy,
+            settings.rewrite_config().endpoint.use_system_proxy), (False, False))
+
+
 def test_update_channel_is_windows_only() -> None:
     # Both platforms publish to one repository; a macOS release (mac-v0.9.0,
     # legacy v0.8.0, a .zip of the .app) must never read as a Windows update.
@@ -1998,6 +2038,7 @@ _TESTS = [
     test_overlap_assembly,
     test_compute_backends_are_independent,
     test_llm_backend_without_bundled_host,
+    test_llm_proxy_policy,
     test_update_channel_is_windows_only,
     test_retired_asr_settings_are_dropped,
     test_asr_thread_policy,

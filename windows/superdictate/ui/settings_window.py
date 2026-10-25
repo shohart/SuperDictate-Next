@@ -705,8 +705,14 @@ class SettingsWindow(QDialog):
                 rewrite, f"rewrite_style_{style.value}",
                 f"rewrite_system_prompt_{style.value}_v1")
 
+        network = Section(i18n.tr("settings_llm_network"),
+                          i18n.tr("settings_llm_network_hint"))
+        self._llm_proxy = self._checkbox(
+            network, "settings_llm_use_system_proxy", "llm_use_system_proxy_v1",
+            hint=i18n.tr("settings_llm_use_system_proxy_hint"))
+
         if not bundled:
-            return _page(correction, rewrite)
+            return _page(correction, rewrite, network)
 
         device = Section(i18n.tr("settings_llm_device"),
                          i18n.tr("settings_llm_device_hint"))
@@ -723,7 +729,7 @@ class SettingsWindow(QDialog):
         for model in offered:
             self._model_rows[model] = self._model_row(models, model, PROFILES[model])
 
-        return _page(correction, rewrite, device, models)
+        return _page(correction, rewrite, network, device, models)
 
     def _endpoint_fields(self, section: "Section", prefix: str) -> None:
         """Base URL, API key and model name of one stage's endpoint."""

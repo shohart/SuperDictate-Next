@@ -548,7 +548,8 @@ actor LLMPostprocessingCoordinator {
                 userText: chunk,
                 enableThinking: false,
                 temperature: 0,
-                maxTokens: maxTokens
+                maxTokens: maxTokens,
+                useSystemProxy: settings.llmUseSystemProxy
             )
             switch result {
             case .success(let corrected):
@@ -681,6 +682,7 @@ actor LLMPostprocessingCoordinator {
             // same 3072 ceiling the 8192-token host context fits next to a
             // long prompt.
             maxTokens: min(3072, max(256, text.utf8.count * 3)),
+            useSystemProxy: settings.llmUseSystemProxy,
             // Long structured rewrites on the 8B model (~35 tok/s on this
             // hardware) can outlast the correction-tuned 60 s default.
             timeoutInterval: 90

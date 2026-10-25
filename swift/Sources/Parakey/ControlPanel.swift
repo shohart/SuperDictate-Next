@@ -86,6 +86,9 @@ struct ControlPanelSettingsDraft: Equatable {
     var llmCustomBaseURL: String
     var llmCustomAPIKey: String
     var llmCustomModelName: String
+    /// Shared by both custom endpoints: internet addresses go through the
+    /// system proxy, LAN addresses always connect directly.
+    var llmUseSystemProxy: Bool
     var correctionModel: BundledLLMModel
     /// The correction system prompt AS SHOWN IN THE EDITOR: either the
     /// stored override or (when none) the selected model's built-in
@@ -140,6 +143,7 @@ struct ControlPanelSettingsDraft: Equatable {
         llmCustomBaseURL = settings.llmCustomBaseURL
         llmCustomAPIKey = settings.llmCustomAPIKey
         llmCustomModelName = settings.llmCustomModelName
+        llmUseSystemProxy = settings.llmUseSystemProxy
         correctionModel = settings.correctionBundledModel
         correctionSystemPrompt = {
             let override = settings.correctionSystemPromptOverride
@@ -798,6 +802,12 @@ case .text:
                     content.addArrangedSubview(rewriteCustomEndpointRows(draft))
                 }
                 content.addArrangedSubview(rewritePromptRow(draft))
+            }
+            let usesCustomEndpoint =
+                (draft.textPostprocessingMode == .correction && draft.llmEngineBackend == .customEndpoint)
+                || (draft.rewriteEnabled && draft.rewriteEngineBackend == .customEndpoint)
+            if usesCustomEndpoint {
+                content.addArrangedSubview(llmProxyRow(draft))
             }
 
         case .audio:
@@ -2320,6 +2330,48 @@ header.addArrangedSubview(panelLabel(
         return container
     }
 
+    /// One switch for both custom endpoints: whether internet addresses go
+    /// through the system proxy. LAN addresses (loopback, 10/8, 172.16/12,
+    /// 192.168/16, *.local) always bypass it — a proxy has no route into
+    /// the user's own machine or LAN.
+    private func llmProxyRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Использовать системный прокси", "Use the system proxy"),
+            size: 13,
+            weight: .semibold
+        ))
+        let detail = panelLabel(
+            t("Для интернет-адресов моделей коррекции и рерайта. Локальные адреса (127.0.0.1, 192.168.x.x, 10.x.x.x, *.local) всегда открываются напрямую, без прокси.",
+              "For internet addresses of the correction and rewrite models. Local addresses (127.0.0.1, 192.168.x.x, 10.x.x.x, *.local) always connect directly, without the proxy."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleLLMUseSystemProxy(_:))
+        toggle.state = draft.llmUseSystemProxy ? .on : .off
+        toggle.toolTip = t("Использовать системный прокси для интернет-адресов моделей коррекции и рерайта.",
+                           "Use the system proxy for internet addresses of the correction and rewrite models.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     /// Bundled correction model picker — the benchmark's small-model class
     /// (benchmark/REPORT.md correction table). Numbers in the detail line
     /// come from the same report; the "?" button opens the benchmark
@@ -3048,6 +3100,13 @@ header.addArrangedSubview(panelLabel(
     @objc private func toggleLLMCorrectionMode(_ sender: NSSwitch) {
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.textPostprocessingMode = sender.state == .on ? .correction : .off
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleLLMUseSystemProxy(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.llmUseSystemProxy = sender.state == .on
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -4300,6 +4359,7 @@ header.addArrangedSubview(panelLabel(
         settings.llmCustomBaseURL = draft.llmCustomBaseURL
         settings.llmCustomAPIKey = draft.llmCustomAPIKey
         settings.llmCustomModelName = draft.llmCustomModelName
+        settings.llmUseSystemProxy = draft.llmUseSystemProxy
         settings.correctionBundledModel = draft.correctionModel
         // Prompt editors: text identical to the built-in default is stored
         // as EMPTY (no override), so "reset to default" and "typed the

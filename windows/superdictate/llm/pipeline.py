@@ -67,6 +67,10 @@ class CustomEndpoint:
     base_url: str = ""
     api_key: str = ""
     model_name: str = ""
+    #: Internet endpoints honour the system proxy unless this is off.
+    #: Local-network endpoints (loopback, private LAN addresses) always go
+    #: direct, whatever this says.
+    use_system_proxy: bool = True
 
     #: What the request names when the user left the model empty — the
     #: macOS default, which most OpenAI-compatible local servers ignore.
@@ -310,6 +314,7 @@ class LLMPostprocessor:
                     max_tokens=max_tokens,
                     api_key=endpoint.api_key,
                     model=endpoint.effective_model_name,
+                    use_system_proxy=endpoint.use_system_proxy,
                 )
             else:
                 content = self._bundled_completion(model, messages, max_tokens)

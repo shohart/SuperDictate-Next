@@ -326,6 +326,9 @@ _DEFAULTS: dict[str, Any] = {
     "llm_custom_base_url_v1": "",
     "llm_custom_api_key_v1": "",
     "llm_custom_model_name_v1": "",
+    # Internet endpoints go through the system proxy when this is on; LAN
+    # addresses (127.0.0.1, 192.168.x.x, 10.x.x.x, *.local) never do.
+    "llm_use_system_proxy_v1": True,
 
     "rewrite_enabled_v1": False,
     "rewrite_engine_backend_v1": "bundledLocal",
@@ -615,6 +618,17 @@ class Settings:
         return 99 if self.llm_compute_backend == "gpu" else 0
 
     @property
+    def llm_use_system_proxy(self) -> bool:
+        """Whether internet endpoints use the system proxy.
+
+        Local-network endpoints bypass it unconditionally; see
+        :mod:`superdictate.llm.host`. Defaults to on, matching the macOS
+        build, because a remote provider is commonly only reachable
+        through the proxy.
+        """
+        return bool(self._get("llm_use_system_proxy_v1"))
+
+    @property
     def correction_enabled(self) -> bool:
         return str(self._get("text_postprocessing_mode_v1")) == "correction"
 
@@ -651,6 +665,7 @@ class Settings:
                 base_url=str(self._get("llm_custom_base_url_v1") or ""),
                 api_key=str(self._get("llm_custom_api_key_v1") or ""),
                 model_name=str(self._get("llm_custom_model_name_v1") or ""),
+                use_system_proxy=self.llm_use_system_proxy,
             ),
             system_prompt_override=str(self._get("correction_system_prompt_v1") or ""),
         )
@@ -709,6 +724,7 @@ class Settings:
                 base_url=str(self._get("rewrite_custom_base_url_v1") or ""),
                 api_key=str(self._get("rewrite_custom_api_key_v1") or ""),
                 model_name=str(self._get("rewrite_custom_model_name_v1") or ""),
+                use_system_proxy=self.llm_use_system_proxy,
             ),
             system_prompt_overrides={
                 style: str(self._get(f"rewrite_system_prompt_{style}_v1") or "")

@@ -102,6 +102,10 @@ final class Settings: @unchecked Sendable {
     private static let keyLLMCustomBaseURL = "llm_custom_base_url_v1"
     private static let keyLLMCustomAPIKey = "llm_custom_api_key_v1"
     private static let keyLLMCustomModelName = "llm_custom_model_name_v1"
+    /// Shared by the correction and rewrite endpoints. On by default:
+    /// remote providers are commonly reachable only through the proxy.
+    /// Local-network addresses bypass it unconditionally.
+    private static let keyLLMUseSystemProxy = "llm_use_system_proxy_v1"
     // Tiered correction + rewrite (docs/specs/rewrite-tiered-correction-
     // spec.md §4). Rewrite keys are fully independent from the
     // llm_* correction keys above on purpose: correction and rewrite are
@@ -1048,6 +1052,19 @@ final class Settings: @unchecked Sendable {
     var llmCustomModelName: String {
         get { defaults.string(forKey: Self.keyLLMCustomModelName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
         set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyLLMCustomModelName) }
+    }
+
+    /// Whether internet endpoints use the system proxy (macOS network
+    /// settings, including PAC and exceptions). LAN endpoints -- loopback,
+    /// private ranges, `.local` names -- always connect directly. Defaults
+    /// to `true`, so an existing install with a proxy keeps working; an
+    /// explicit `false` turns the proxy off for custom endpoints only.
+    var llmUseSystemProxy: Bool {
+        get {
+            guard defaults.object(forKey: Self.keyLLMUseSystemProxy) != nil else { return true }
+            return defaults.bool(forKey: Self.keyLLMUseSystemProxy)
+        }
+        set { defaults.set(newValue, forKey: Self.keyLLMUseSystemProxy) }
     }
 
     /// Which bundled model the correction pass loads when its backend is

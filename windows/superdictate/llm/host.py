@@ -15,7 +15,14 @@ hard way:
 
 * **Proxies.** ``urllib`` picks up the system WinINET proxy and will route
   even ``127.0.0.1`` through it, which answers 503 for a loopback host it
-  cannot reach. Every request here goes through a no-proxy opener.
+  cannot reach. So local endpoints -- loopback, the private LAN ranges
+  people actually run LM Studio and Ollama on, and mDNS ``.local`` names --
+  never use a proxy. Remote internet endpoints do use the system one unless
+  the user clears "Use the system proxy" in Settings
+  (``llm_use_system_proxy_v1``). Sending remote endpoints direct was a bug:
+  where the provider is only reachable through the proxy (OpenRouter behind
+  a local XRay client here), every rewrite failed with the network's own
+  HTTP 403.
 * **Orphans.** The host holds gigabytes of model memory, so it must not
   outlive the app. It watches its parent itself, but that is best-effort;
   this module also assigns it to a job object that kills it when the app's
@@ -24,6 +31,7 @@ hard way:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -32,6 +40,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -47,6 +56,65 @@ REQUEST_TIMEOUT_SECONDS = 180.0
 # One opener for the whole module: build_opener with an empty ProxyHandler
 # disables proxy lookup entirely. See this module's docstring.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#: For remote endpoints: urllib's default handlers, i.e. the system proxy
+#: (WinINET settings on Windows, *_PROXY variables elsewhere) and its bypass
+#: list.
+_REMOTE_OPENER = urllib.request.build_opener()
+
+_LOCAL_HOST_NAMES = {"localhost", "::1", "0.0.0.0"}
+# Explicit LAN ranges rather than ``ipaddress.is_private``: the latter also
+# calls documentation and benchmark ranges private, and those are not
+# reachable on the user's own network. CGNAT (100.64/10) is included
+# because some ISPs and Tailscale-style overlays hand it out.
+_LOCAL_NETWORKS_V4 = tuple(ipaddress.ip_network(net) for net in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/32",
+))
+_LOCAL_NETWORKS_V6 = tuple(ipaddress.ip_network(net) for net in (
+    "::1/128", "fc00::/7", "fe80::/10", "::/128",
+))
+
+
+def _is_local_network_host(host: str) -> bool:
+    """Whether ``host`` is reachable on this machine or its own LAN.
+
+    Covers loopback, the IPv4 private ranges (10/8, 172.16/12,
+    192.168/16), link-local and CGNAT addresses, IPv6 loopback/ULA/
+    link-local, and mDNS ``.local`` names. A public name is deliberately
+    not resolved here: DNS may itself only be reachable through the proxy,
+    and resolving on every request would add a lookup to the dictation
+    path. Literal LAN addresses and ``.local`` names are what local LLM
+    servers are configured with.
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if not host:
+        return False
+    if host in _LOCAL_HOST_NAMES or host.endswith(".local") \
+            or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv4Address):
+        return any(address in network for network in _LOCAL_NETWORKS_V4)
+    return any(address in network for network in _LOCAL_NETWORKS_V6)
+
+
+def _opener_for(url: str, use_system_proxy: bool = True):
+    """Pick the opener for one request.
+
+    Local-network endpoints always go direct. Internet endpoints use the
+    system proxy when the user allows it, and go direct otherwise.
+    """
+    host = urlsplit(url).hostname or ""
+    if not use_system_proxy or _is_local_network_host(host):
+        return _OPENER
+    return _REMOTE_OPENER
 
 
 class LLMHostError(Exception):
@@ -315,16 +383,34 @@ class LLMHostProcess:
                                max_tokens=max_tokens, temperature=temperature)
 
 
+def chat_completions_url(base_url: str) -> str:
+    """The request URL for an endpoint address as people write it.
+
+    Provider docs give the base with its version ("https://openrouter.ai/api/v1",
+    OpenAI SDK style); local servers are usually given bare
+    ("http://127.0.0.1:1234"). Both work, and so does the full URL.
+    """
+    url = base_url.strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    if url.endswith("/v1"):
+        return url + "/chat/completions"
+    return url + "/v1/chat/completions"
+
+
 def chat_completion(base_url: str, messages: Sequence[Message], *,
                     max_tokens: int = 512,
                     temperature: Optional[float] = None,
                     api_key: str = "",
                     model: str = "superdictate-llm-host",
+                    use_system_proxy: bool = True,
                     timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
     """POST ``/v1/chat/completions`` and return the assistant's content.
 
     Shared by the bundled host and a user-supplied OpenAI-compatible
     endpoint — the whole reason the host speaks this protocol at all.
+    ``use_system_proxy`` only affects internet endpoints; LAN ones always
+    go direct.
     """
     payload: dict[str, object] = {
         "model": model,
@@ -339,7 +425,7 @@ def chat_completion(base_url: str, messages: Sequence[Message], *,
         payload["temperature"] = temperature
 
     request = urllib.request.Request(
-        base_url.rstrip("/") + "/v1/chat/completions",
+        chat_completions_url(base_url),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
@@ -347,7 +433,8 @@ def chat_completion(base_url: str, messages: Sequence[Message], *,
         request.add_header("Authorization", f"Bearer {api_key}")
 
     try:
-        with _OPENER.open(request, timeout=timeout) as response:
+        with _opener_for(request.full_url, use_system_proxy).open(
+                request, timeout=timeout) as response:
             body = json.load(response)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:400]
@@ -358,7 +445,10 @@ def chat_completion(base_url: str, messages: Sequence[Message], *,
     choices = body.get("choices") or []
     if not choices:
         raise LLMHostError(f"no choices in response: {str(body)[:200]}")
-    return str(choices[0].get("message", {}).get("content", ""))
+    # A reasoning model that ran out of tokens answers "content": null;
+    # str() of that would hand the pipeline the word "None" as the text.
+    content = (choices[0].get("message") or {}).get("content")
+    return content if isinstance(content, str) else ""
 
 
 class LLMHostPool:

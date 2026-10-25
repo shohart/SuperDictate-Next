@@ -71,6 +71,17 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_endpoint_key_placeholder": ("Не нужен для локального сервера",
                                           "Not needed for a local server"),
     "settings_endpoint_model": ("Модель", "Model"),
+    "settings_llm_network": ("Сеть", "Network"),
+    "settings_llm_network_hint": (
+        "Как приложение подключается к моделям коррекции и переписывания.",
+        "How the app reaches the correction and rewrite models."),
+    "settings_llm_use_system_proxy": ("Использовать системный прокси",
+                                      "Use the system proxy"),
+    "settings_llm_use_system_proxy_hint": (
+        "Для интернет-адресов. Локальные адреса (127.0.0.1, 192.168.x.x, "
+        "10.x.x.x, *.local) всегда открываются напрямую, без прокси.",
+        "For internet addresses. Local addresses (127.0.0.1, 192.168.x.x, "
+        "10.x.x.x, *.local) always connect directly, without the proxy."),
     "settings_correction_mode": ("Коррекция текста", "Text correction"),
     "settings_correction_off": ("Выключена", "Off"),
     "settings_correction_on": ("Включена", "On"),
