@@ -6,6 +6,27 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.0 — 2026-10-27
+
+macOS (`mac-v0.9.0`) and Windows (`win-v0.9.0`).
+
+### Added
+- **Punctuation restoration**, a new last stage after correction and rewrite. A separate local model places commas, periods, question marks, colons and dashes. It runs on the CPU, with no GPU and no internet. It does not remove periods, "!" or "?" that are already there. It adds a capital letter only after a new sentence end, or after an existing one the model agrees with, so abbreviations like «т.е.» stay as they are. It never lowercases anything.
+  - Turn it on in Settings → Correction (macOS) or on the LLM page (Windows). Choose Base (307M, more accurate, about 60 ms a sentence, 1.5 GB of RAM) or Small (140M, about 25 ms, 0.7 GB). Then download the model with the button next to it: 675 MB or 303 MB.
+  - Model: [Horizon-Labs/punctuation-restoration](https://huggingface.co/Horizon-Labs/punctuation-restoration-base), Apache-2.0, built on mmBERT. It covers 88 languages; its punctuation F1 for Russian is 0.95.
+  - The stage never loses text. If the model is missing or a request fails, the text is inserted as it was.
+- **Each text stage has its own animation in the capsule.** Correction keeps its bars. Rewrite shows letters and symbols, and punctuation restoration shows punctuation marks. They move the same way as the correction bars. Each glyph fades in from nothing, breathes, and fades out again, and a glyph changes only while it is invisible.
+
+### Under the hood
+- `SuperDictateOnnxHost` runs the punctuation model through a native port of the Hugging Face BPE tokenizer: `modernbert_punct` family, `sd_asr_punctuate_utf8`, IPC `PUNCTUATE`. Token ids and output match the Python reference (`tokenizers` + ONNX Runtime) exactly, for both models, on macOS and Windows.
+- Spec: `docs/specs/punctuation-restoration-spec.md`.
+
+### Validation
+- macOS: these self-tests pass: `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline` and `punctuation-real`. `scripts/verify-release.sh` passes on this zip, including its new step 5. Punctuation through the shipped bundle took 36 ms with Base and 20 ms with Small.
+- Native: the `contract`, `ipc` and `punct` tests pass on macOS and Windows; `punct` matches the reference exactly for both models.
+- macOS 0.9.0 (build 64), x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `07f4330884927a4032c4eda390f93b5acd83bc7246a1cc6485ab95dd61fd8405`.
+- Windows: 66 self-tests pass, including `test_punctuation_real`. `SuperDictate-0.9.0-setup.exe` SHA-256: `14121ece819677cbcf11bba435f588e8faf16294c6a4a0bff5404e4585821c99`.
+
 ## 0.8.6 — 2026-10-27
 
 macOS (`mac-v0.8.6`) and Windows (`win-v0.8.6`).
