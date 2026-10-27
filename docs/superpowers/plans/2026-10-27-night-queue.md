@@ -61,3 +61,51 @@ for a 70-word and a 400-word dictation.
   fixed set, speed, VRAM. Then decide with the user whether it goes into
   the release (Windows LLM is API-only by the 2026-10-21 decision) and how
   to test on the Intel laptop GPU.
+
+## Stage 3 results (2026-10-27, GAMING-PC1, RTX 4070, driver 617.14)
+
+The host is built with `build-engines.ps1 -ExperimentalLlmHost -Vulkan`. Each probe sends one
+chat request, or the app's own rewrite prompts (`rwbench.py`), and compares
+GPU (`--gpu-layers 99`) with CPU (`--gpu-layers 0`).
+
+| Model | GPU (Vulkan) | GPU time | CPU time |
+|---|---|---|---|
+| Qwen3.5-0.8B Q6_K (correction) | correct, same text as CPU | 0.15 s | 0.8 s |
+| Qwen3.5-4B Q6_K | correct, same text as CPU | 0.27 s | 3.0 s |
+| QVikhr-3-4B Q6_K (Qwen3) | sane; 2 of 8 rewrites identical to CPU | p50 1.1 s | p50 17 s |
+| **YandexGPT-5-Lite-8B Q4_K_M** | **NaN logits (HTTP 503)** | — | p50 ~12 s |
+| YandexGPT-5-Lite-8B Q6_K | garbage tokens | — | 2.0 s (short answer) |
+
+The VRAM-mode fix worked: the small and 4B models that used to give garbage
+are now correct. YandexGPT still fails on this card, in every one of these
+setups:
+- with any `GGML_VK_*` precision, async or allocation flag, or all of the
+  precision flags at once;
+- in upstream llama.cpp b11927 on Vulkan, with flash attention on, off or
+  auto;
+- in upstream llama.cpp b11927 on CUDA 13.4;
+- with the graphics clock locked to 2000 MHz or the memory clock lowered (both
+  reset afterwards).
+
+Offloading the last 7 layers is fine; offloading the last 8 breaks, and so
+does keeping layers 20–31 on the CPU with the rest on the GPU. The error
+accumulates across layers. The only GPU setup that gives correct output is
+`GGML_VK_PREFER_HOST_MEMORY=1`, which in effect computes on the CPU (5.7 s).
+
+Qwen3-8B Q4_K_M also gives NaN logits on the GPU (0 of 8 rewrites; the CPU
+answers all 8). Every 8B model breaks and every model of 4B or smaller works.
+
+**Root cause: faulty VRAM.** `memtest_vulkan` v0.5.0 finds errors in its
+first pass: 0x80 errors out of 0x38000000 words, always in the same address
+range (0x4CAA1510..0x4CAEEFF3 of its test buffer). The errors are
+reproducible, they sit in one place, and they are not bit-flip noise. Models
+whose weights or KV cache land on those cells compute garbage on CUDA and on
+Vulkan alike. Small models fit below the bad range. MSI Afterburner runs on
+this PC, so a memory overclock is the first suspect. Next steps: reset
+Afterburner to stock and rerun memtest_vulkan. If the errors stay at the same
+addresses, the card is defective.
+
+The local rewrite on the GPU itself works where the VRAM is good: QVikhr-3-4B
+takes 0.5–2 s per rewrite on the RTX 4070, against 10–22 s on the CPU. The
+8B rewrite models have to be checked again on a healthy GPU, such as the
+Intel Arc laptop or this card once the errors are fixed.
