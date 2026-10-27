@@ -109,3 +109,27 @@ The local rewrite on the GPU itself works where the VRAM is good: QVikhr-3-4B
 takes 0.5–2 s per rewrite on the RTX 4070, against 10–22 s on the CPU. The
 8B rewrite models have to be checked again on a healthy GPU, such as the
 Intel Arc laptop or this card once the errors are fixed.
+
+## Follow-up (2026-10-27, day): Windows local LLM → win-v0.9.1
+
+The user reversed the API-only decision: local correction and rewrite on the
+Windows GPU, tested on the Intel Arc laptop and the RTX 4070 PC. The user
+considers the 4070 healthy and will check it; the cause of the failures below
+is theirs to settle.
+
+- The Windows model table is now the macOS one (9 correction, 7 rewrite
+  models, same pins). Local rewrite is enabled.
+- GPU safeguards, from what the 4070 did today (driver 617.14, Afterburner
+  running, memory clock at the stock 10501 MHz). In the app's own pipeline,
+  every model from 3B up failed on Vulkan, as NaN logits (Qwen3.5-4B,
+  Phi-4-mini, YandexGPT, LFM2.5) or as fluent garbage (RuAdapt-4B, QVikhr-4B,
+  Ministral-3B). The 0.8B models were correct, and fast: VoiceScribe
+  0.1–0.45 s on the GPU against 0.7–2 s on the CPU. Qwen3.5-4B, correct on
+  the same card the night before, gave NaN today. All nine models pass the
+  canary on the CPU. So:
+  - a cold GPU host must repeat «Мама мыла раму.» word for word;
+  - NaN from any request, or a failed canary, moves that model to the CPU
+    for the session, repeats the request, and shows a toast.
+- Rewrite output drops a leading `<think>` block: LFM2.5 still reasons
+  sometimes, even with its template fixed and `enable_thinking: false`.
+- The Windows learn pill was ported from macOS (VocabularyLearnedToast).

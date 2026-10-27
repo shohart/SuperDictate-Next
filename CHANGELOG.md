@@ -6,6 +6,27 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.1 — 2026-10-27
+
+Windows only (`win-v0.9.1`).
+
+### Added
+- **Local correction and rewrite on the GPU.** Both stages can now run on this computer, on the CPU or the graphics card (Vulkan: NVIDIA, AMD, Intel Arc), as well as through an OpenAI-compatible API. You choose the device in Settings → LLM → "Where it runs".
+  - The models are the macOS ones, with the same pinned files and checksums. Correction: VoiceScribe 0.8B (default), Qwen3.5-4B, RuAdapt Qwen3-4B, QVikhr-3-4B, Ministral-3-3B, Phi-4-mini, Loqira, plain Qwen3.5-0.8B and YandexGPT 5 Lite 8B. Rewrite: YandexGPT 8B, Qwen3.5-9B, Gemma 4 E4B, Phi-4-mini, Ministral-3-3B, RuAdapt-4B and LFM2.5-2.6B (experimental). Download them in the same settings page.
+  - If you already sent the rewrite to an API endpoint, that setting stays as it was.
+- **The GPU is checked, not trusted.** The first time a model starts on the GPU, it must repeat a short sentence word for word. If the answer is garbage, or the card computes NaN at any point, that model runs on the CPU for the rest of the session. The request is repeated there, so the text is still processed, only slower, and the capsule tells you. Saving the settings gives the GPU another chance.
+
+### Changed
+- **The learn pill now looks and works like the macOS one.** When you fix a dictated word in place («инглиш» → «English»), a rounded capsule with "old → new" appears above the field, with the arrow in the recording colour. Enter saves the rule at once, and the pill flashes and shrinks away. Escape, or a click on the pill, strikes the pair through and drops it. Otherwise the rule is saved after 4 seconds. Before, the rule was saved first and a large card at the bottom of the screen offered an undo.
+
+### Fixed
+- **Rewrite output never includes a model's reasoning.** A leading `<think>…</think>` block is dropped. If the model ran out of tokens while still reasoning, the dictated text is inserted as it was.
+
+### Validation
+- 68 Windows self-tests pass. New and extended ones cover the learn pill (keys, the watcher's pending flow, drawing), the model table, the settings migration, the GPU fallback and canary, and reasoning stripping.
+- End to end through the app's own pipeline on GAMING-PC1 (RTX 4070, Vulkan): VoiceScribe corrects on the GPU in 0.1–0.45 s with the same text as on the CPU. On this card every model from 3B up returned NaN or garbage on the GPU. Each one fell back to the CPU and gave a correct rewrite, so no garbage reached the text. All nine downloaded models pass the canary on the CPU.
+- `SuperDictate-0.9.1-setup.exe` SHA-256: `1b42d2acd6b916018cf91be701c5a7c31cc9d969f775a7afb4c78cdbfb1b9d2b`.
+
 ## 0.9.0 — 2026-10-27
 
 macOS (`mac-v0.9.0`) and Windows (`win-v0.9.0`).
