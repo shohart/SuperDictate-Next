@@ -100,6 +100,10 @@ RECORDING_LEVEL_PHASE_SPEED = 10.08
 TRANSCRIBING_PHASE_SPEED = 10.2
 CORRECTING_PHASE_SPEED = 6.4
 CORRECTING_SWEEP_RADIANS = 20.48
+#: The text stages; each has its own animation with the same motion.
+PROCESSING_MODES = ("correcting", "rewriting", "punctuating")
+REWRITE_GLYPHS = ("А", "б", "Ж", "к", "Я", "ю", "Ф", "A", "g", "R", "e", "W", "&", "§", "¶", "@", "ß", "Ω")
+PUNCTUATION_GLYPHS = (".", ",", "?", "!", ":", ";", "–", "…", "«", "»", "(", ")")
 ERROR_FLASH_MS = 1500
 FRAME_INTERVAL_MS = 8  # paced by dt, so this is only the ceiling (~120 fps)
 BOTTOM_MARGIN = 24
@@ -140,7 +144,7 @@ def phase_speed(mode: str, level: float) -> float:
         return RECORDING_BASE_PHASE_SPEED + max(0.0, min(1.0, level)) * RECORDING_LEVEL_PHASE_SPEED
     if mode == "transcribing":
         return TRANSCRIBING_PHASE_SPEED
-    if mode == "correcting":
+    if mode in PROCESSING_MODES:
         return CORRECTING_PHASE_SPEED
     return 0.0
 
@@ -550,9 +554,16 @@ class RecordingHUD(QWidget):
 
     def show_correcting(self) -> None:
         """showCorrectingHUD: only over a capsule that is already up."""
-        if self._mode not in ("recording", "transcribing", "correcting"):
+        self.show_processing("correcting")
+
+    def show_processing(self, mode: str) -> None:
+        """The animation of the text stage that just started; only over a
+        capsule that is already up."""
+        if mode not in PROCESSING_MODES or self._mode not in ("recording", "transcribing") + PROCESSING_MODES:
             return
-        self._set_mode("correcting")
+        if self._mode == mode:
+            return
+        self._set_mode(mode)
         self._recording_started_at = None
         self._stop_tracking()
         self._ensure_running()
@@ -627,7 +638,7 @@ class RecordingHUD(QWidget):
         """finishBusyHUD: a transcription never flashes by unseen."""
         if self._mode in ("hidden", "hiding"):
             return
-        if self._transcribing_since is not None and self._mode in ("transcribing", "correcting"):
+        if self._transcribing_since is not None and self._mode in ("transcribing",) + PROCESSING_MODES:
             remaining = TRANSCRIBING_MIN_VISIBLE_SECONDS - (time.monotonic() - self._transcribing_since)
             if remaining > 0:
                 self._deferred_hide.start(int(remaining * 1000))
@@ -956,6 +967,11 @@ class RecordingHUD(QWidget):
             self._paint_transcribing(painter, capsule, now)
         elif mode == "correcting":
             self._paint_correcting(painter, capsule)
+        elif mode == "rewriting":
+            self._paint_glyphs(painter, capsule, REWRITE_GLYPHS, 1.0)
+        elif mode == "punctuating":
+            # Marks are thin and small; a larger font gives them the same ink.
+            self._paint_glyphs(painter, capsule, PUNCTUATION_GLYPHS, 1.3)
         elif mode == "error":
             self._paint_error(painter, capsule)
         elif mode == "result":
@@ -1118,6 +1134,68 @@ class RecordingHUD(QWidget):
                      _alpha(color, min(1.0, 0.05 + 0.16 * band + 0.30 * flash)))
             _rounded(painter, rect, _alpha(color, min(1.0, 0.60 + 0.34 * band + 0.40 * flash)))
 
+    def _paint_glyphs(self, painter: QPainter, capsule: QRectF,
+                      glyphs: tuple, size_factor: float) -> None:
+        """drawGlyphWave: the correcting motion carried by glyphs.
+
+        Each slot fades a glyph in from nothing and out to nothing on its
+        own slow cycle; the next glyph is picked only while the slot is
+        invisible, so nothing flickers. Slots stay clear of the rounded ends.
+        """
+        scale = self.size_preset.scale
+        slots = 5
+        inset = capsule.height() * 0.5
+        total = min(capsule.width() - 2 * inset, 42 * scale)
+        if total <= 0:
+            return
+        slot_width = total / slots
+        start_x = capsule.center().x() - total / 2
+        max_font = min(capsule.height() * 0.42, 10.5 * scale) * size_factor
+        min_font = max_font * 0.45
+        sweep = math.fmod(self._phase / CORRECTING_SWEEP_RADIANS, 1.0)
+        seconds = self._phase / CORRECTING_PHASE_SPEED
+        transcribing = self._colors(self.transcribing_color)
+        correcting = self._colors(self.correcting_color)
+        black, white = QColor(0, 0, 0), QColor(255, 255, 255)
+        font = QFont(painter.font())
+        font.setWeight(QFont.Weight.DemiBold)
+        for index in range(slots):
+            i = float(index)
+            x_norm = i / (slots - 1)
+            behind = sweep - x_norm
+            if behind < 0:
+                behind += 1
+            band = smoothstep(0.03, 0.20, behind) * (1 - smoothstep(0.52, 0.92, behind))
+            dist = min(abs(sweep - x_norm), 1 - abs(sweep - x_norm))
+            flash = math.exp(-((dist * dist) / (2 * 0.05 * 0.05)))
+            raw = 0.30 + 0.10 * math.sin(2 * math.pi * 4 * sweep + i * 0.85)
+            refined = 0.66 + 0.12 * math.sin(2 * math.pi * 2 * sweep - i * 0.32)
+            activity = min(1.0, raw + (refined - raw) * band + 0.25 * flash)
+
+            period = 2.2 + 0.27 * ((index * 5) % slots)
+            cycle = seconds / period + index * 0.37
+            cycle_index = math.floor(cycle)
+            visibility = math.sin(math.pi * (cycle - cycle_index)) ** 2
+            if visibility <= 0.01:
+                continue
+            glyph = glyphs[abs(index * 7919 + cycle_index * 104729) % len(glyphs)]
+
+            size = (min_font + (max_font - min_font) * activity) * (0.72 + 0.28 * visibility)
+            color = _mix(_color_at(transcribing, x_norm), _color_at(correcting, x_norm), x_norm)
+            color = _mix(color, black, 0.30 * (1 - band))
+            color = _mix(color, white, flash * 0.75)
+            font.setPixelSize(max(1, int(round(size * 1.33))))
+            painter.setFont(font)
+            cell = QRectF(start_x + i * slot_width - slot_width, capsule.top(),
+                          slot_width * 3, capsule.height())
+            # A soft halo first, then the glyph: the bars' glow, in type.
+            painter.setPen(_alpha(color, min(1.0, 0.18 + 0.30 * flash) * visibility))
+            for dx, dy in ((-0.6, 0), (0.6, 0), (0, -0.6), (0, 0.6)):
+                painter.drawText(cell.translated(dx * scale, dy * scale), Qt.AlignmentFlag.AlignCenter, glyph)
+            painter.setPen(_alpha(color, min(1.0, 0.62 + 0.34 * band + 0.40 * flash) * visibility))
+            painter.drawText(cell, Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.setPen(Qt.PenStyle.NoPen)
+
     def _paint_error(self, painter: QPainter, capsule: QRectF) -> None:
         """drawErrorIndicator: a static yellow exclamation mark."""
         scale = self.size_preset.scale
@@ -1160,8 +1238,10 @@ def export_animation_frames(directory: str, *, size: HUDSize = HUDSize.STANDARD,
                   display_mode=HUDDisplayMode.TIMER_OUTLINE if timer else HUDDisplayMode.LEVEL_BARS)
     pixel = 4
     width, height = hud.width(), hud.height()
+    # The text stages (correcting, rewriting, punctuating) share one
+    # 12-second span, 4 s each.
     lead, recording_for, transcribing_for, correcting_for, tail = (
-        0.35, 11.5 if timer else 6.2, 2.4, 4.0, 0.5)
+        0.35, 11.5 if timer else 6.2, 2.4, 12.0, 0.5)
     stages = [lead, ANIMATE_IN_SECONDS, recording_for, transcribing_for,
               correcting_for, ANIMATE_OUT_SECONDS, tail]
     marks = [sum(stages[:i + 1]) for i in range(len(stages))]
@@ -1187,11 +1267,11 @@ def export_animation_frames(directory: str, *, size: HUDSize = HUDSize.STANDARD,
             reveal, mode = 1.0, "transcribing"
             hud._transcribing_age_override = t - marks[2]
         elif t < marks[4]:
-            reveal, mode = 1.0, "correcting"
+            reveal, mode = 1.0, PROCESSING_MODES[min(2, int((t - marks[3]) / 4.0))]
         elif t < marks[5]:
-            reveal, mode = 1.0 - (t - marks[4]) / ANIMATE_OUT_SECONDS, "correcting"
+            reveal, mode = 1.0 - (t - marks[4]) / ANIMATE_OUT_SECONDS, "punctuating"
         else:
-            reveal, mode = 0.0, "correcting"
+            reveal, mode = 0.0, "punctuating"
         hud._mode = mode
         hud._reveal = max(0.0, min(1.0, reveal))
         hud._smoothed_level = level

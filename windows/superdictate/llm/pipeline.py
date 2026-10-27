@@ -159,14 +159,23 @@ class LLMPostprocessor:
 
     def finalize(self, text: str, *,
                  correction: CorrectionConfig,
-                 rewrite: RewriteConfig) -> str:
-        """Apply the enabled stages. Returns ``text`` unchanged if none are."""
+                 rewrite: RewriteConfig,
+                 on_stage: Optional[Callable[[str], None]] = None) -> str:
+        """Apply the enabled stages. Returns ``text`` unchanged if none are.
+
+        ``on_stage`` hears "correcting" / "rewriting" as each one starts, so
+        the capsule can show that stage's animation.
+        """
         if not text.strip():
             return text
         result = text
         if correction.enabled:
+            if on_stage is not None:
+                on_stage("correcting")
             result = self._corrected(result, correction)
         if rewrite.enabled:
+            if on_stage is not None:
+                on_stage("rewriting")
             result = self._rewritten(result, rewrite)
         return result
 

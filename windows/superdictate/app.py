@@ -94,6 +94,8 @@ class DictationController(QObject):
     """Owns the dictation lifecycle and emits UI-facing signals."""
 
     state_changed = Signal(str)            # AppState value
+    #: "correcting" / "rewriting" / "punctuating" as each text stage starts.
+    processing_stage = Signal(str)
     progress_changed = Signal(object)      # asr.Progress
     level_changed = Signal(float)
     preview_changed = Signal(str)         # partial text while recording
@@ -888,9 +890,11 @@ class DictationController(QObject):
         try:
             if correction.enabled or rewrite.enabled:
                 text = self.postprocessor.finalize(
-                    text, correction=correction, rewrite=rewrite)
+                    text, correction=correction, rewrite=rewrite,
+                    on_stage=self.processing_stage.emit)
             # The last stage, after correction and rewrite.
             if punctuation:
+                self.processing_stage.emit("punctuating")
                 text = self.punctuation.restore(text, self.settings.punctuation_model)
             return text
         finally:

@@ -119,6 +119,7 @@ def main(argv: list[str]) -> int:
     controller.state_toast_requested.connect(windows.show_state_toast)
     controller.loading_toast_requested.connect(windows.show_loading_toast)
     controller.state_changed.connect(windows.on_state_changed)
+    controller.processing_stage.connect(windows.on_processing_stage)
     controller.level_changed.connect(windows.on_level)
     controller.preview_changed.connect(windows.on_preview)
 
@@ -387,6 +388,12 @@ class _Windows:
                 background=settings.hud_background_style,
                 display_mode=settings.hud_display_mode,
             )
+
+    def on_processing_stage(self, mode: str) -> None:
+        """Each text stage gets its own animation: correcting bars, rewrite
+        letters, punctuation marks."""
+        if self._controller.settings.show_recording_waveform and self._hud is not None:
+            self._hud.show_processing(mode)
 
     def on_state_changed(self, value: str) -> None:
         if not self._controller.settings.show_recording_waveform:
