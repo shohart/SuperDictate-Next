@@ -71,6 +71,25 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_endpoint_key_placeholder": ("Не нужен для локального сервера",
                                           "Not needed for a local server"),
     "settings_endpoint_model": ("Модель", "Model"),
+    "settings_punctuation": ("Восстановление пунктуации", "Punctuation restoration"),
+    "settings_punctuation_hint": (
+        "Последний этап, после коррекции и переписывания: отдельная модель "
+        "расставляет запятые, точки, вопросительные знаки, двоеточия и тире. "
+        "Уже стоящие точки, «!» и «?» не убирает. Работает локально на процессоре.",
+        "The last stage, after correction and rewrite: a separate model places "
+        "commas, periods, question marks, colons and dashes. It never removes "
+        "periods, \"!\" or \"?\" that are already there. Runs locally on the CPU."),
+    "settings_punctuation_enabled": ("Восстанавливать пунктуацию моделью",
+                                     "Restore punctuation with a model"),
+    "settings_punctuation_model": ("Модель", "Model"),
+    "settings_punctuation_base": ("Base (307M) — рекомендуется", "Base (307M) — recommended"),
+    "settings_punctuation_small": ("Small (140M)", "Small (140M)"),
+    "settings_punctuation_model_hint": (
+        "Base точнее, Small быстрее и легче: около 60 и 25 мс на фразу, "
+        "1,5 и 0,7 ГБ памяти.",
+        "Base is more accurate, Small is faster and lighter: about 60 and 25 ms "
+        "per sentence, 1.5 and 0.7 GB of memory."),
+    "settings_punctuation_files": ("Файлы модели", "Model files"),
     "settings_llm_network": ("Сеть", "Network"),
     "settings_llm_network_hint": (
         "Как приложение подключается к моделям коррекции и переписывания.",

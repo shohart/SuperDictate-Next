@@ -331,6 +331,9 @@ _DEFAULTS: dict[str, Any] = {
     "llm_use_system_proxy_v1": True,
 
     "rewrite_enabled_v1": False,
+    # Punctuation restoration, the last text stage (punctuation.py).
+    "punctuation_restoration_enabled_v1": False,
+    "punctuation_model_v1": "base",
     "rewrite_engine_backend_v1": "bundledLocal",
     "rewrite_bundled_model_v2": "yandexgpt",
     "rewrite_style_v1": "official",             # polish | structured_task | official
@@ -692,6 +695,16 @@ class Settings:
     @property
     def rewrite_enabled(self) -> bool:
         return bool(self._get("rewrite_enabled_v1"))
+
+    @property
+    def punctuation_enabled(self) -> bool:
+        return bool(self._get("punctuation_restoration_enabled_v1"))
+
+    @property
+    def punctuation_model(self) -> str:
+        """``"small"`` or ``"base"`` (the default)."""
+        value = str(self._get("punctuation_model_v1"))
+        return value if value in ("small", "base") else "base"
 
     def rewrite_config(self):
         """Build the rewrite stage's config from stored settings."""

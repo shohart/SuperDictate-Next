@@ -47,6 +47,7 @@ TYPE_TRANSCRIBE = 2
 TYPE_STATUS = 3
 TYPE_CANCEL = 4
 TYPE_SHUTDOWN = 5
+TYPE_PUNCTUATE = 6
 
 STATUS_OK = 0
 STATUS_CANCELLED = 8
@@ -83,6 +84,12 @@ class HostWord:
     text: str
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class HostPunctuation:
+    text: str
+    processing_seconds: float
 
 
 @dataclass(frozen=True)
@@ -264,6 +271,17 @@ class OnnxHost:
         return HostTranscription(text=text,
                                  processing_seconds=float(result.get("processing_seconds", 0.0)),
                                  words=words)
+
+    def punctuate(self, text: str) -> HostPunctuation:
+        """Punctuation restoration with a text model (family modernbert_punct)."""
+        # ~60 ms a sentence; the bound is for a stuck host.
+        result, _ = self._round_trip(TYPE_PUNCTUATE, {"text": text}, b"",
+                                     timeout=20.0 + len(text.encode("utf-8")) / 500.0)
+        punctuated = result.get("text")
+        if not isinstance(punctuated, str):
+            raise InvalidResponse("missing text")
+        return HostPunctuation(text=punctuated,
+                               processing_seconds=float(result.get("processing_seconds", 0.0)))
 
     def _take_id(self) -> int:
         request_id = self._next_id

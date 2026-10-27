@@ -705,6 +705,8 @@ class SettingsWindow(QDialog):
                 rewrite, f"rewrite_style_{style.value}",
                 f"rewrite_system_prompt_{style.value}_v1")
 
+        punctuation = self._punctuation_section()
+
         network = Section(i18n.tr("settings_llm_network"),
                           i18n.tr("settings_llm_network_hint"))
         self._llm_proxy = self._checkbox(
@@ -712,7 +714,7 @@ class SettingsWindow(QDialog):
             hint=i18n.tr("settings_llm_use_system_proxy_hint"))
 
         if not bundled:
-            return _page(correction, rewrite, network)
+            return _page(correction, rewrite, punctuation, network)
 
         device = Section(i18n.tr("settings_llm_device"),
                          i18n.tr("settings_llm_device_hint"))
@@ -729,7 +731,7 @@ class SettingsWindow(QDialog):
         for model in offered:
             self._model_rows[model] = self._model_row(models, model, PROFILES[model])
 
-        return _page(correction, rewrite, network, device, models)
+        return _page(correction, rewrite, punctuation, network, device, models)
 
     def _endpoint_fields(self, section: "Section", prefix: str) -> None:
         """Base URL, API key and model name of one stage's endpoint."""
@@ -801,6 +803,92 @@ class SettingsWindow(QDialog):
         layout.addWidget(button)
         section.add_row(i18n.tr(f"llm_model_{model.value}"), row)
         return row
+
+    def _punctuation_section(self) -> "Section":
+        """The last text stage: on/off, Small or Base, and its download."""
+        from PySide6.QtWidgets import QProgressBar
+
+        from .. import punctuation
+
+        section = Section(i18n.tr("settings_punctuation"),
+                          i18n.tr("settings_punctuation_hint"))
+        self._punctuation_enabled = self._checkbox(
+            section, "settings_punctuation_enabled", "punctuation_restoration_enabled_v1")
+        self._punctuation_model = self._combo(
+            section, "settings_punctuation_model", "punctuation_model_v1",
+            [("base", i18n.tr("settings_punctuation_base")),
+             ("small", i18n.tr("settings_punctuation_small"))],
+            hint=i18n.tr("settings_punctuation_model_hint"))
+
+        row = QWidget()
+        row.setObjectName("Plain")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        status = QLabel()
+        status.setWordWrap(True)
+        progress = QProgressBar()
+        progress.setRange(0, 100)
+        progress.setVisible(False)
+        progress.setMaximumWidth(160)
+        button = QPushButton(i18n.tr("settings_model_download"))
+        layout.addWidget(status, 1)
+        layout.addWidget(progress)
+        layout.addWidget(button)
+        section.add_row(i18n.tr("settings_punctuation_files"), row)
+
+        def refresh(*_args) -> None:
+            model = str(self._punctuation_model.currentData() or "base")
+            size_mb = punctuation.download_bytes(model) // (1 << 20)
+            present = punctuation.is_installed(model)
+            status.setText(i18n.tr("settings_model_present" if present
+                                   else "settings_model_absent", size=size_mb))
+            button.setEnabled(not present and not progress.isVisible())
+
+        self._punctuation_model.currentIndexChanged.connect(refresh)
+        button.clicked.connect(lambda _=False: self._start_punctuation_download(
+            str(self._punctuation_model.currentData() or "base"), status, progress, button, refresh))
+        refresh()
+        return section
+
+    def _start_punctuation_download(self, model: str, status, progress, button, refresh) -> None:
+        import threading
+
+        from PySide6.QtCore import QTimer
+
+        from .. import onnx_models, punctuation
+
+        button.setEnabled(False)
+        progress.setVisible(True)
+        state = {"fraction": 0.0, "error": ""}
+
+        def on_progress(done: int, total: int) -> None:
+            state["fraction"] = done / total if total else 0.0
+
+        def run() -> None:
+            try:
+                onnx_models.install(punctuation.model_id(model), on_progress)
+            except Exception as exc:  # shown in the row
+                state["error"] = str(exc)
+
+        thread = threading.Thread(target=run, name=f"download-punct-{model}", daemon=True)
+        thread.start()
+        timer = QTimer(self)
+        timer.setInterval(200)
+
+        def tick() -> None:
+            progress.setValue(int(state["fraction"] * 100))
+            if thread.is_alive():
+                return
+            timer.stop()
+            progress.setVisible(False)
+            refresh()
+            if state["error"]:
+                button.setEnabled(True)
+                status.setText(i18n.tr("settings_model_failed", error=state["error"]))
+
+        timer.timeout.connect(tick)
+        timer.start()
 
     def _start_download(self, model, pin, status, progress, button) -> None:
         """Fetch one model on a worker thread, reporting into this row."""

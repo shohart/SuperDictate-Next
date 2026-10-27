@@ -36,6 +36,7 @@ from . import (asr, audio, edit_watch, focus_target, i18n, incremental, inject, 
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
+from .punctuation import PunctuationRestorer
 from .vocabulary import VocabularyStore, migrate_json_if_needed
 from .logging_setup import get as get_logger
 from .settings import CompletionBehavior, Settings
@@ -143,6 +144,7 @@ class DictationController(QObject):
         # that actually needs one — a multi-GB model must not be loaded at
         # launch for a feature the user may never turn on.
         self.postprocessor = LLMPostprocessor()
+        self.punctuation = PunctuationRestorer()
         self.postprocessor.gpu_layers = settings.llm_gpu_layers
         # Cold-start feedback. The callbacks fire on the transcription
         # worker thread; the signals are queued, so the widgets are still
@@ -295,6 +297,7 @@ class DictationController(QObject):
         # After the worker has joined: a host torn down mid-request would
         # turn a finished dictation into a lost one.
         self.postprocessor.shutdown()
+        self.punctuation.shutdown()
         self.focus.close()
 
     def _prepare_model(self) -> None:
@@ -316,6 +319,7 @@ class DictationController(QObject):
             self._set_state(AppState.READY)
             self._recover_pending_dictation()
             self._warm_up_correction()
+            self._warm_up_punctuation()
             if model.npu_compiling:
                 threading.Thread(target=self._watch_npu_compile, args=(model,),
                                  name="npu-compile-watch", daemon=True).start()
@@ -366,6 +370,7 @@ class DictationController(QObject):
         # A changed correction model, device or prompt means a new host
         # (or none): load it now rather than on the next dictation.
         self._warm_up_correction()
+        self._warm_up_punctuation()
         self.settings_applied.emit()
 
     def _apply_hotkey_settings(self) -> None:
@@ -494,6 +499,17 @@ class DictationController(QObject):
         config = self.settings.correction_config()
         threading.Thread(target=self.postprocessor.warm_up, args=(config,),
                          name="llm-warm-up", daemon=True).start()
+
+    def _warm_up_punctuation(self) -> None:
+        """Load the selected punctuation model in the background while the
+        stage is on; free it as soon as the stage is off."""
+        if self._terminating:
+            return
+        if not self.settings.punctuation_enabled:
+            self.punctuation.shutdown()
+            return
+        threading.Thread(target=self.punctuation.warm_up, args=(self.settings.punctuation_model,),
+                         name="punctuation-warm-up", daemon=True).start()
 
     def _after_postprocessing_toggle(self, enabled: bool) -> None:
         if enabled:
@@ -863,14 +879,20 @@ class DictationController(QObject):
         """
         correction = self.settings.correction_config()
         rewrite = self.settings.rewrite_config()
-        if not correction.enabled and not rewrite.enabled:
+        punctuation = self.settings.punctuation_enabled
+        if not correction.enabled and not rewrite.enabled and not punctuation:
             return text
 
         self._set_state(AppState.CORRECTING)
         started = time.monotonic()
         try:
-            return self.postprocessor.finalize(
-                text, correction=correction, rewrite=rewrite)
+            if correction.enabled or rewrite.enabled:
+                text = self.postprocessor.finalize(
+                    text, correction=correction, rewrite=rewrite)
+            # The last stage, after correction and rewrite.
+            if punctuation:
+                text = self.punctuation.restore(text, self.settings.punctuation_model)
+            return text
         finally:
             log.info("Post-processing took %.2fs", time.monotonic() - started)
 

@@ -1212,6 +1212,44 @@ def test_llm_backend_without_bundled_host() -> None:
            endpoint.effective_model_name, "gpt-4o-mini")
 
 
+def test_punctuation_settings() -> None:
+    """Punctuation restoration: settings, catalog ids, and pass-through."""
+    from . import onnx_models, punctuation
+    from .settings import Settings
+
+    settings = Settings(path=tempfile.mktemp(suffix=".json"))
+    _check("punctuation off by default", settings.punctuation_enabled, False)
+    _check("Base by default", settings.punctuation_model, "base")
+    settings._set("punctuation_model_v1", "bogus")
+    _check("an unknown model reads as Base", settings.punctuation_model, "base")
+    for model in punctuation.MODELS:
+        entry = onnx_models.model(punctuation.model_id(model))
+        _check(f"{model}: catalog entry", entry.entry["family"], "modernbert_punct")
+    restorer = punctuation.PunctuationRestorer()
+    _check("blank text passes through", restorer.restore("  ", "base"), "  ")
+
+
+def test_punctuation_real() -> None:
+    """The real model through SuperDictateOnnxHost, when one is installed."""
+    from . import onnx_models, punctuation
+
+    model = next((m for m in ("base", "small") if punctuation.is_installed(m)), None)
+    if model is None or onnx_models.host_executable() is None:
+        print("  skip: no punctuation model or host installed")
+        return
+    restorer = punctuation.PunctuationRestorer()
+    try:
+        _check(f"{model}: commas and the final period",
+               restorer.restore("Когда ты придёшь домой позвони мне пожалуйста", model),
+               "Когда ты придёшь домой, позвони мне, пожалуйста.")
+        _check(f"{model}: an existing ! is kept",
+               restorer.restore("Ура! пошли гулять", model).startswith("Ура!"), True)
+        _check("the model stays loaded", restorer.loaded_model, model)
+    finally:
+        restorer.shutdown()
+    _check("shutdown frees it", restorer.loaded_model, None)
+
+
 def test_llm_proxy_policy() -> None:
     """Local LLM endpoints stay direct; internet ones honour the proxy."""
     from .llm.host import (
@@ -2039,6 +2077,8 @@ _TESTS = [
     test_compute_backends_are_independent,
     test_llm_backend_without_bundled_host,
     test_llm_proxy_policy,
+    test_punctuation_settings,
+    test_punctuation_real,
     test_update_channel_is_windows_only,
     test_retired_asr_settings_are_dropped,
     test_asr_thread_policy,
