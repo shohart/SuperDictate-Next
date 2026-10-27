@@ -6,6 +6,31 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.2 — 2026-10-27
+
+macOS (`mac-v0.9.2`); Windows (`win-v0.9.2`) follows with the same change.
+
+### Changed
+- **Local rewrite answers sooner: its prompt is cached like the correction prompt.** A rewrite style's instructions are about 240 of a request's ~275 prompt tokens, the same in every request. The local model now keeps them prepared and reads only your dictation, from the first dictation after the app starts. With YandexGPT doing both correction and rewrite, the prompt work per dictation is:
+
+  | Machine | before | now |
+  |---|---|---|
+  | macOS, AMD GPU (Vulkan) | 15.2 s | 1.1 s |
+  | macOS, Xeon CPU | 18.8 s | 2.3 s |
+  | Windows CPU, whole dictation | 26–27 s | 8–11 s |
+
+  - The same model can now serve both stages without losing the cache. Before, one model doing correction and rewrite never reused either prompt.
+  - Up to six prepared prompts are kept: correction, the rewrite styles and a custom style. The least recently used one goes first.
+
+### Under the hood
+- `SuperDictateLLMHost` keeps up to six prompt-prefix snapshots instead of one, learned from the last six prompts, and restores the longest one a request starts with.
+- Both ports prime every stage a host serves with two requests shaped like real ones.
+- The cached and uncached runs gave word-for-word the same text for 2 of 3 rewrites. The third used equivalent wording: the prefix is computed in its own batch, so the floats round differently. The single-snapshot cache before this release behaved the same way.
+
+### Validation
+- macOS: the self-tests `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline` and `punctuation-real` pass. `llm-prefix-primer` now also checks a host shared by both stages: 159 correction tokens and 240 rewrite tokens are reused on every alternating request. `scripts/verify-release.sh` passes on this zip.
+- macOS 0.9.2 (build 65), x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `6458433c7dfdbd72c74da167f9f3bba591a49da77dd9dd1897c0b78f8240eb08`.
+
 ## 0.9.1 — 2026-10-27
 
 Windows only (`win-v0.9.1`).

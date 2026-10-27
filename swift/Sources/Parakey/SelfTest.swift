@@ -3175,6 +3175,10 @@ enum ParakeySelfTest {
                                 vocabularyStore: .inMemoryFallback())
         settings.textPostprocessingMode = .correction
         settings.llmEngineBackend = .bundledLocal
+        // The suite persists between runs, and the shared-host part below
+        // changes these: set every one the first part depends on.
+        settings.correctionBundledModel = .voiceScribe
+        settings.rewriteEnabled = false
         settings.llmUseGPU = ProcessInfo.processInfo.environment["SUPERDICTATE_PRIMER_CPU"] == nil
         try runParakeetEngineSynchronously { await coordinator.prewarmNeededHosts(settings: settings) }
         let cached = try runParakeetEngineSynchronously {
@@ -3209,6 +3213,8 @@ enum ParakeySelfTest {
         }
         print("LLM prefix primer (shared host): correction/rewrite alternating reused \(counts.map { $0.map(String.init) ?? "nil" })")
         try runParakeetEngineSynchronously { await shared.stop() }
+        settings.correctionBundledModel = .voiceScribe
+        settings.rewriteEnabled = false
         try expect(counts.allSatisfy { ($0 ?? 0) >= 100 }, equals: true,
                    "a host serving both stages must reuse each stage's system prompt on every request")
     }
