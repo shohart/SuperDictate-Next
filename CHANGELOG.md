@@ -6,6 +6,23 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.6 — 2026-10-27
+
+macOS (`mac-v0.8.6`) and Windows (`win-v0.8.6`).
+
+### Fixed
+- **Correction and rewrite through an internet provider work behind a proxy.** Remote endpoints used to connect directly, bypassing the system proxy. Where the provider is reachable only through the proxy (for example OpenRouter behind a local XRay client), every request failed. Internet endpoints now follow the system proxy (macOS network settings, including PAC and exceptions; WinINET on Windows). Local addresses — loopback, 10/8, 172.16/12, 192.168/16, link-local, CGNAT, IPv6 ULA/link-local and `*.local` — always connect directly, because a proxy has no route into your own machine or LAN.
+- **macOS: an endpoint address that already ends in `/v1` works.** `https://openrouter.ai/api/v1` used to become `…/v1/v1/chat/completions`. The bare base, the `/v1` base and the full `/chat/completions` URL all work now, as they already did on Windows.
+- **Windows: a reasoning model that runs out of tokens no longer inserts the word "None".**
+
+### Added
+- **"Use the system proxy" toggle** in Settings (on by default), shared by the correction and rewrite endpoints. Turn it off when the system proxy itself is broken for the provider. It never affects local addresses.
+
+### Validation
+- macOS: self-tests `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline` and the new `llm-proxy-policy` pass; `scripts/verify-release.sh` passes on this zip (correction GPU 0.30 s / CPU 0.52 s, rewrite GPU 0.88 s, Parakeet and GigaAM).
+- macOS 0.8.6 (build 63), x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `d1508b38920ef2a7b42ad3c4e9de49543705caae5f437c07b9148615f7db6d99`.
+- Windows: 64 self-tests pass, including `test_llm_proxy_policy`. `SuperDictate-0.8.6-setup.exe` SHA-256: `7e363a558efedb6bf2efd2c799a130b1db775f923379c6e06f5bee4ffed7b3f7`.
+
 ## 0.8.5 — 2026-10-23
 
 macOS only, tag `mac-v0.8.5`. Fixes 0.8.4, which broke local correction and rewrite on the GPU.
