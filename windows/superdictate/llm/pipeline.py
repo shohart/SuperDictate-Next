@@ -123,6 +123,15 @@ class RewriteConfig:
             self.custom_styles = {}
 
 
+#: The GPU canary (LLMPostprocessor._gpu_answers_sanely).
+CANARY_SYSTEM = "Повтори текст пользователя дословно, без комментариев."
+CANARY_TEXT = "Мама мыла раму."
+
+
+def _letters(text: str) -> str:
+    return "".join(ch for ch in text.lower().replace("ё", "е") if ch.isalpha())
+
+
 class LLMPostprocessor:
     """Owns the host pool and applies the enabled stages to one transcript.
 
@@ -148,6 +157,10 @@ class LLMPostprocessor:
         #: it on every dictation would be nagging, not helping.
         self.on_model_missing: Optional[Callable[[BundledLLMModel], None]] = None
         self._reported_missing: set = set()
+        #: Called with a model the GPU computed NaN for, once: from then on
+        #: that model runs on the CPU for the rest of the session.
+        self.on_gpu_fallback: Optional[Callable[[BundledLLMModel], None]] = None
+        self._cpu_only: set = set()
         #: How many layers the host offloads. Set from settings, and kept
         #: separate from the ASR engine's device: the two are independent
         #: choices, and on real hardware the right answer differs — Parakeet
@@ -239,6 +252,22 @@ class LLMPostprocessor:
         except Exception as exc:
             log.info("Local correction warm-up failed (the first dictation will load it): %s", exc)
 
+    def warm_up_rewrite(self, config: RewriteConfig) -> None:
+        """Load the local rewrite model ahead of the first rewrite. Blocking;
+        call from a background thread. A rewrite model is gigabytes, and
+        loading it on the dictation path is a several-second wait."""
+        if not config.enabled or config.backend is not LLMBackend.BUNDLED_LOCAL:
+            return
+        if not is_present(profile(config.model).pin):
+            return
+        try:
+            self._bundled_completion(
+                config.model, [Message(Role.SYSTEM, "Ответь одним словом."),
+                               Message(Role.USER, "да")], max_tokens=1)
+            log.info("Local rewrite host warmed up (%s)", config.model.value)
+        except Exception as exc:
+            log.info("Local rewrite warm-up failed (the first rewrite will load it): %s", exc)
+
     def _correction_prompt(self, config: CorrectionConfig) -> tuple[str, list[Message]]:
         # A custom endpoint serves whichever model the user named there, so
         # it gets the zero-shot instruct prompt, as on macOS: the few-shot
@@ -293,14 +322,17 @@ class LLMPostprocessor:
         ]
         raw = self._complete(messages, backend=config.backend,
                              model=config.model, endpoint=config.endpoint,
-                             stage="rewrite", max_tokens=2048)
+                             stage="rewrite",
+                             # As on macOS: room for a structured rewrite of
+                             # a long dictation, inside the 8192 window.
+                             max_tokens=min(3072, max(256, len(text.encode("utf-8")) * 3)))
         if raw is None:
             return text
         # No leading-word guardrail here: rewrite IS allowed to restructure,
         # so that check would reject its whole purpose. The prompt's own
         # fact-preservation constraints are the safety mechanism, plus this
         # empty-output fallback.
-        trimmed = raw.strip()
+        trimmed = guardrail.strip_reasoning(raw)
         return trimmed or text
 
     # -- transport ---------------------------------------------------
@@ -349,12 +381,14 @@ class LLMPostprocessor:
             self._report_missing(model)
             raise LLMHostError(
                 f"model not downloaded: {model_profile.pin.filename}")
+        on_gpu = self.gpu_layers > 0 and model not in self._cpu_only
         spec = HostSpec(
             model_path=model_profile.model_path,
             lora_path=model_profile.lora_path,
             lora_scale=model_profile.lora_scale,
             context_size=model_profile.context_size,
-            gpu_layers=self.gpu_layers,
+            gpu_layers=self.gpu_layers if on_gpu else 0,
+            chat_template_path=model_profile.chat_template_path,
         )
         cold = not self._pool_has(spec)
         if cold and self.on_load_stage is not None:
@@ -364,7 +398,51 @@ class LLMPostprocessor:
         finally:
             if cold and self.on_load_finished is not None:
                 self._notify(self.on_load_finished)
-        return host.complete(messages, max_tokens=max_tokens)
+        if cold and on_gpu and not self._gpu_answers_sanely(host):
+            return self._fall_back_to_cpu(model, spec, messages, max_tokens,
+                                          "failed the canary")
+        try:
+            return host.complete(messages, max_tokens=max_tokens)
+        except LLMHostError as exc:
+            if not on_gpu or "non-finite" not in str(exc):
+                raise
+        return self._fall_back_to_cpu(model, spec, messages, max_tokens,
+                                      "produced NaN logits")
+
+    def _gpu_answers_sanely(self, host) -> bool:
+        """The canary, once per cold GPU host: repeat a short sentence.
+
+        A GPU can compute wrong without failing: NaN is caught by the host,
+        but a model whose weights sit on bad memory or meet a driver bug
+        writes fluent-looking garbage ("завершитьчатчатчат…" from a 4B on
+        one RTX 4070), and a rewrite would insert it. Every bundled model,
+        the correction LoRA included, repeats this sentence on the CPU.
+        """
+        try:
+            answer = host.complete([Message(Role.SYSTEM, CANARY_SYSTEM),
+                                    Message(Role.USER, CANARY_TEXT)], max_tokens=16)
+        except LLMHostError as exc:
+            # Only NaN says anything about the GPU; anything else is for the
+            # real request to run into and report.
+            return "non-finite" not in str(exc)
+        return _letters(CANARY_TEXT) in _letters(answer)
+
+    def _fall_back_to_cpu(self, model: BundledLLMModel, spec: HostSpec,
+                          messages: list[Message], max_tokens: int, why: str) -> str:
+        # A fault no prompt can avoid, and it repeats: this model moves to
+        # the CPU for the rest of the session and the request is asked again
+        # there, so the text is still processed, only slower.
+        log.warning("%s: the GPU %s; running it on the CPU for the rest of the session",
+                    model.value, why)
+        self._cpu_only.add(model)
+        self._pool.discard(spec)
+        if self.on_gpu_fallback is not None:
+            self._notify(self.on_gpu_fallback, model)
+        return self._bundled_completion(model, messages, max_tokens)
+
+    def reset_gpu_fallbacks(self) -> None:
+        """Give the GPU another chance (the device setting was saved)."""
+        self._cpu_only.clear()
 
     def _pool_has(self, spec: HostSpec) -> bool:
         existing = self._pool._hosts.get(spec.identity)  # noqa: SLF001

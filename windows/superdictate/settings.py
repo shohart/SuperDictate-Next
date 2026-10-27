@@ -335,6 +335,7 @@ _DEFAULTS: dict[str, Any] = {
     "punctuation_restoration_enabled_v1": False,
     "punctuation_model_v1": "base",
     "rewrite_engine_backend_v1": "bundledLocal",
+    "local_rewrite_v1": False,                  # migration marker, see load()
     "rewrite_bundled_model_v2": "yandexgpt",
     "rewrite_style_v1": "official",             # polish | structured_task | official
     "rewrite_custom_styles_v1": [],
@@ -379,6 +380,14 @@ class Settings:
             if "hud_timer_default_v1" not in stored:
                 self._data["hud_display_mode"] = HUDDisplayMode.TIMER_OUTLINE.value
                 self._data["hud_timer_default_v1"] = True
+            # Until 0.9.1 the rewrite always went to the endpoint, so the
+            # stored "bundledLocal" was never anyone's choice. Someone who
+            # set an endpoint up keeps it rather than being moved to a local
+            # model they have not downloaded.
+            if "local_rewrite_v1" not in stored:
+                if str(self._data.get("rewrite_custom_base_url_v1") or "").strip():
+                    self._data["rewrite_engine_backend_v1"] = "customEndpoint"
+                self._data["local_rewrite_v1"] = True
 
     def save(self) -> None:
         paths.ensure_directories()
@@ -638,9 +647,9 @@ class Settings:
     def _llm_backend(self, key: str):
         """The stored stage backend, or the endpoint when no host ships.
 
-        Release builds carry no local LLM host, so a stored ``bundledLocal``
-        (the macOS default, kept for key compatibility) would silently do
-        nothing; it reads as the custom endpoint instead.
+        A build without the local LLM host (``build.ps1 -SkipEngines``)
+        cannot run ``bundledLocal`` (the macOS default, kept for key
+        compatibility), so there it reads as the custom endpoint.
         """
         from .llm import LLMBackend
         from .llm.host import bundled_host_available
@@ -653,12 +662,11 @@ class Settings:
     def correction_config(self):
         """Build the correction stage's config from stored settings."""
         from .llm import BundledLLMModel, CorrectionConfig, CustomEndpoint, LLMBackend
-        from .llm.models import LOCAL_CORRECTION_MODELS
+        from .llm.models import CORRECTION_MODELS
 
         model = _enum_or(BundledLLMModel, self._get("correction_bundled_model_v2"),
                          BundledLLMModel.VOICESCRIBE)
-        if model not in LOCAL_CORRECTION_MODELS:
-            # Carried over from macOS, where the 8B quality tier exists.
+        if model not in CORRECTION_MODELS:
             model = BundledLLMModel.VOICESCRIBE
         return CorrectionConfig(
             enabled=self.correction_enabled,
@@ -720,17 +728,16 @@ class Settings:
                         "name": str(entry.get("name", "")),
                         "instruction": str(entry.get("instruction", "")),
                     }
-        from .llm.models import LOCAL_REWRITE_ENABLED
+        from .llm.models import REWRITE_MODELS
 
-        backend = self._llm_backend("rewrite_engine_backend_v1")
-        if not LOCAL_REWRITE_ENABLED:
-            # The local host does correction only, for now.
-            backend = LLMBackend.CUSTOM_ENDPOINT
+        model = _enum_or(BundledLLMModel, self._get("rewrite_bundled_model_v2"),
+                         BundledLLMModel.YANDEXGPT)
+        if model not in REWRITE_MODELS:
+            model = BundledLLMModel.YANDEXGPT
         return RewriteConfig(
             enabled=self.rewrite_enabled,
-            backend=backend,
-            model=_enum_or(BundledLLMModel, self._get("rewrite_bundled_model_v2"),
-                           BundledLLMModel.YANDEXGPT),
+            backend=self._llm_backend("rewrite_engine_backend_v1"),
+            model=model,
             style=_enum_or(RewriteStyle, self._get("rewrite_style_v1"),
                            RewriteStyle.OFFICIAL),
             endpoint=CustomEndpoint(

@@ -164,6 +164,9 @@ class DictationController(QObject):
                 i18n.tr("toast_loading_model")))
         self.postprocessor.on_load_finished = (
             lambda: self.loading_toast_requested.emit(""))
+        self.postprocessor.on_gpu_fallback = (
+            lambda model: self.state_toast_requested.emit(
+                i18n.tr("toast_gpu_fallback"), "off"))
         self.sounds = system.Sounds(settings.play_feedback_sounds)
         self.output_mute = system.OutputMute()
         self.media_pause = system.MediaPause()
@@ -383,6 +386,7 @@ class DictationController(QObject):
                      self.settings.llm_compute_backend)
             self.postprocessor.gpu_layers = wanted_layers
             self.postprocessor.shutdown()
+        self.postprocessor.reset_gpu_fallbacks()
         # A changed correction model, device or prompt means a new host
         # (or none): load it now rather than on the next dictation.
         self._warm_up_correction()
@@ -512,13 +516,19 @@ class DictationController(QObject):
                 self.device_changed.emit()
 
     def _warm_up_correction(self) -> None:
-        """Load the local correction model and prime its prompt cache in the
-        background, so the next dictation does not pay for either."""
+        """Load the local correction model and prime its prompt cache, then
+        the local rewrite model, in the background, so the next dictation
+        does not pay for either."""
         if self._terminating:
             return
-        config = self.settings.correction_config()
-        threading.Thread(target=self.postprocessor.warm_up, args=(config,),
-                         name="llm-warm-up", daemon=True).start()
+        correction = self.settings.correction_config()
+        rewrite = self.settings.rewrite_config()
+
+        def warm() -> None:
+            self.postprocessor.warm_up(correction)
+            self.postprocessor.warm_up_rewrite(rewrite)
+
+        threading.Thread(target=warm, name="llm-warm-up", daemon=True).start()
 
     def _warm_up_punctuation(self) -> None:
         """Load the selected punctuation model in the background while the

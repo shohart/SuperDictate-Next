@@ -1,10 +1,10 @@
 """The local LLM host process, and the OpenAI-compatible client for it.
 
-Release builds ship llama.cpp's own ``llama-server`` (Vulkan build, staged by
-``tools/fetch-llama.ps1`` into ``engines\\llama``). Experimental builds may
-instead carry ``superdictate-llm-host.exe``, the hand-written C++ host the
-macOS build spawns (``swift/Sources/llama_cpp_host/bridge/``, built by
-``tools/build-engines.ps1``). Either one loads one GGUF model
+Builds ship ``superdictate-llm-host.exe``, the hand-written C++ host the
+macOS build spawns (``swift/Sources/llama_cpp_host/bridge/``, built with
+CPU and Vulkan backends by ``tools/build-engines.ps1``); llama.cpp's own
+``llama-server`` (``tools/fetch-llama.ps1``, ``engines\\llama``) is the
+fallback when a build carries only that. Either one loads one GGUF model
 (optionally with a LoRA adapter) and serves ``/health`` plus
 ``/v1/chat/completions`` over loopback HTTP — deliberately indistinguishable
 from a real OpenAI-compatible server, so the same client code below serves
@@ -222,6 +222,8 @@ def host_command(executable: str, spec: "HostSpec", port: int) -> tuple[list[str
                 "--threads", str(llm_thread_count())]
         if spec.lora_path:
             argv += ["--lora", spec.lora_path, "--lora-scale", str(spec.lora_scale)]
+        if spec.chat_template_path:
+            argv += ["--chat-template-file", spec.chat_template_path]
         env = {"GGML_VK_DISABLE_COOPMAT": "1"} if spec.gpu_layers > 0 else {}
         return argv, None, env
 
@@ -242,6 +244,8 @@ def host_command(executable: str, spec: "HostSpec", port: int) -> tuple[list[str
     if spec.lora_path:
         cwd = os.path.dirname(spec.lora_path)
         argv += ["--lora-scaled", f"{os.path.basename(spec.lora_path)}:{spec.lora_scale:g}"]
+    if spec.chat_template_path:
+        argv += ["--chat-template-file", spec.chat_template_path]
     return argv, cwd, env
 
 
@@ -275,10 +279,12 @@ class HostSpec:
     lora_scale: float = 1.0
     context_size: int = 4096
     gpu_layers: int = 99
+    #: A chat-template override (LFM2.5), or "".
+    chat_template_path: str = ""
 
     @property
     def identity(self) -> str:
-        return f"{self.model_path}|{self.lora_path}"
+        return f"{self.model_path}|{self.lora_path}|{'gpu' if self.gpu_layers else 'cpu'}"
 
 
 class LLMHostProcess:
@@ -476,6 +482,13 @@ class LLMHostPool:
             host.start()
             self._hosts[spec.identity] = host
             return host
+
+    def discard(self, spec: HostSpec) -> None:
+        """Stop the host for ``spec``, if there is one."""
+        with self._lock:
+            host = self._hosts.pop(spec.identity, None)
+        if host is not None:
+            host.stop()
 
     def shutdown(self) -> None:
         with self._lock:

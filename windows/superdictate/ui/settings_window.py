@@ -650,16 +650,16 @@ class SettingsWindow(QDialog):
     def _build_postprocessing_tab(self) -> QWidget:
         """Correction and rewrite: what runs, where, with which prompt.
 
-        Release builds have no local LLM host, so both stages talk to an
-        OpenAI-compatible endpoint the user names here. A build with the
-        experimental host (tools/build-engines.ps1 -ExperimentalLlmHost)
-        also offers the bundled models, their downloads and the CPU/GPU
-        choice. The weights are gigabytes, so the download is offered here
-        rather than happening on the first dictation that wants them.
+        Each stage runs a bundled model in the local host (CPU or GPU) or
+        talks to an OpenAI-compatible endpoint the user names here. The
+        model lists are the macOS pickers'. The weights are gigabytes, so
+        the download is offered here rather than happening on the first
+        dictation that wants them. A build without the host
+        (``build.ps1 -SkipEngines``) shows the endpoint fields only.
         """
         from ..llm import RewriteStyle
         from ..llm.host import bundled_host_available
-        from ..llm.models import LOCAL_CORRECTION_MODELS, LOCAL_REWRITE_ENABLED, PROFILES
+        from ..llm.models import CORRECTION_MODELS, PROFILES, REWRITE_MODELS
 
         bundled = bundled_host_available()
         engines = [("bundledLocal", i18n.tr("settings_llm_engine_bundled")),
@@ -677,7 +677,7 @@ class SettingsWindow(QDialog):
             self._correction_model = self._combo(
                 correction, "settings_correction_model", "correction_bundled_model_v2",
                 [(model.value, i18n.tr(f"llm_model_{model.value}"))
-                 for model in LOCAL_CORRECTION_MODELS],
+                 for model in CORRECTION_MODELS],
             )
         self._endpoint_fields(correction, "llm_custom")
         self._correction_prompt = self._prompt_editor(
@@ -692,12 +692,12 @@ class SettingsWindow(QDialog):
             [(style.value, i18n.tr(f"rewrite_style_{style.value}"))
              for style in RewriteStyle],
         )
-        if bundled and LOCAL_REWRITE_ENABLED:
+        if bundled:
             self._combo(rewrite, "settings_llm_engine", "rewrite_engine_backend_v1", engines)
             self._rewrite_model = self._combo(
                 rewrite, "settings_rewrite_model", "rewrite_bundled_model_v2",
                 [(model.value, i18n.tr(f"llm_model_{model.value}"))
-                 for model in PROFILES],
+                 for model in REWRITE_MODELS],
             )
         self._endpoint_fields(rewrite, "rewrite_custom")
         for style in RewriteStyle:
@@ -727,8 +727,13 @@ class SettingsWindow(QDialog):
         models = Section(i18n.tr("settings_llm_models"),
                          i18n.tr("settings_llm_models_hint"))
         self._model_rows = {}
-        offered = LOCAL_CORRECTION_MODELS if not LOCAL_REWRITE_ENABLED else tuple(PROFILES)
-        for model in offered:
+        # One row per file: the vanilla 0.8B is the VoiceScribe base.
+        files = set()
+        for model in dict.fromkeys(CORRECTION_MODELS + REWRITE_MODELS):
+            pin = PROFILES[model].pin
+            if pin.local_path in files:
+                continue
+            files.add(pin.local_path)
             self._model_rows[model] = self._model_row(models, model, PROFILES[model])
 
         return _page(correction, rewrite, punctuation, network, device, models)

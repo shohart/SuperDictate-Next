@@ -42,17 +42,18 @@ datas += [("assets/record-start.wav", "assets"),
 datas += [("onnx-asr", "onnx-asr")]
 # The pinned catalog of the NPU models (onnx_models.openvino_catalog_path).
 datas += [("assets/openvino-models.json", "assets")]
-# silero-vad.dll, and in experimental builds superdictate-llm-host.exe,
-# built by tools/build-engines.ps1 from the vendored macOS sources.
-# Optional: without the VAD, seams fall back to mel energy. Release builds
-# have no LLM host: post-processing goes through an OpenAI-compatible API.
+# silero-vad.dll and superdictate-llm-host.exe (CPU + Vulkan), built by
+# tools/build-engines.ps1 from the vendored macOS sources. Optional: without
+# the VAD, seams fall back to mel energy; without the host, post-processing
+# goes through an OpenAI-compatible API only.
 if os.path.isdir("engines"):
     datas += [("engines", "engines")]
 else:
     print("WARNING: engines\\ is missing; the build has no Silero VAD")
 if os.path.isfile(os.path.join("engines", "superdictate-llm-host.exe")):
     # The correction LoRA belongs to the bundled host (llm/models.py).
-    datas += [("assets/models/gec-lora-adapter.gguf", "assets/models")]
+    datas += [("assets/models/gec-lora-adapter.gguf", "assets/models"),
+              ("assets/models/chat-template-lfm25.jinja", "assets/models")]
 binaries = []
 
 hiddenimports = [

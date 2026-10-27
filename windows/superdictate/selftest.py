@@ -1144,9 +1144,10 @@ def test_compute_backends_are_independent() -> None:
 
 
 def test_llm_backend_without_bundled_host() -> None:
-    # Release builds ship no LLM host: a stored "bundledLocal" (the macOS
-    # default) must read as the endpoint, and the endpoint must get the
-    # zero-shot prompt and the macOS default model name.
+    # A build without the LLM host (-SkipEngines): a stored "bundledLocal"
+    # (the macOS default) must read as the endpoint, and the endpoint must
+    # get the zero-shot prompt and the macOS default model name. With the
+    # host, both stages run the macOS model table locally.
     import os
     import tempfile
     from unittest import mock
@@ -1169,13 +1170,116 @@ def test_llm_backend_without_bundled_host() -> None:
            profile(BundledLLMModel.VOICESCRIBE).lora_scale, 4.0)
     with mock.patch("superdictate.llm.host.bundled_host_available", return_value=True):
         settings._set("rewrite_engine_backend_v1", "bundledLocal")
-        _check("local host: rewrite still goes to the endpoint (correction only)",
-               settings.rewrite_config().backend, LLMBackend.CUSTOM_ENDPOINT)
+        _check("local host: the rewrite runs locally too",
+               settings.rewrite_config().backend, LLMBackend.BUNDLED_LOCAL)
         settings._set("correction_bundled_model_v2", "yandexgpt")
-        _check("local host: an 8B correction model from macOS reads as VoiceScribe",
+        _check("local host: YandexGPT corrects, as on macOS",
+               settings.correction_config().model, BundledLLMModel.YANDEXGPT)
+        settings._set("correction_bundled_model_v2", "lfm25")
+        _check("local host: LFM2.5 is not a correction model",
                settings.correction_config().model, BundledLLMModel.VOICESCRIBE)
+        settings._set("rewrite_bundled_model_v2", "voicescribe")
+        _check("local host: the 0.8B is not a rewrite model",
+               settings.rewrite_config().model, BundledLLMModel.YANDEXGPT)
+
+    # The macOS model table, pin for pin.
+    from .llm.models import CORRECTION_MODELS, PROFILES, REWRITE_MODELS
+    _check("models: the macOS correction picker",
+           [m.value for m in CORRECTION_MODELS],
+           ["voicescribe", "qwen35_4b", "ruadapt4b", "qvikhr4b", "ministral3b",
+            "phi4mini", "loqira", "vanilla08b", "yandexgpt"])
+    _check("models: the macOS rewrite picker",
+           [m.value for m in REWRITE_MODELS],
+           ["yandexgpt", "qwen35_9b", "gemma4e4b", "phi4mini", "ministral3b",
+            "ruadapt4b", "lfm25"])
+    _check("models: every pin is a 64-hex digest and a size",
+           all(len(PROFILES[m].pin.sha256) == 64 and PROFILES[m].pin.size_bytes > 10**8
+               for m in PROFILES), True)
+    _check("models: rewrite models get the 8192 window",
+           (PROFILES[BundledLLMModel.YANDEXGPT].context_size,
+            PROFILES[BundledLLMModel.QVIKHR_4B].context_size), (8192, 4096))
+    _check("models: RuAdapt's bare remote name is stored under the model's",
+           os.path.basename(PROFILES[BundledLLMModel.RUADAPT_4B].pin.local_path),
+           "RuadaptQwen3-4B-Instruct-Q6_K.gguf")
+    _check("models: the vanilla 0.8B is the VoiceScribe base without the LoRA",
+           (PROFILES[BundledLLMModel.VANILLA_08B].pin, PROFILES[BundledLLMModel.VANILLA_08B].uses_lora),
+           (PROFILES[BundledLLMModel.VOICESCRIBE].pin, False))
+    template = PROFILES[BundledLLMModel.LFM25].chat_template_path
+    _check("models: the LFM2.5 template ships and does not force <think>",
+           os.path.isfile(template) and "<think>" not in
+           open(template, encoding="utf-8").read().split("add_generation_prompt")[-1], True)
+
+    # A GPU that computes NaN costs speed, not the correction: the model
+    # moves to the CPU for the session and the request is asked again.
+    from .llm.host import LLMHostError
+    from .llm.pipeline import LLMPostprocessor
+    from .llm.prompts import Message, Role
+
+    class FakeHost:
+        garbage = False
+
+        def __init__(self, spec):
+            self.spec = spec
+
+        def complete(self, messages, max_tokens=0):
+            canary = messages[-1].content == "Мама мыла раму."
+            if self.spec.gpu_layers and FakeHost.garbage:
+                return "Мамачатчат мылачат" if canary else "чатчатчат"
+            if self.spec.gpu_layers and not canary:
+                raise LLMHostError('HTTP 503: {"error":{"message":"non-finite logits"}}')
+            return "Мама мыла раму." if canary else "ok"
+
+    started, fallbacks = [], []
+    pp = LLMPostprocessor()
+    pp.gpu_layers = 99
+    pp.on_gpu_fallback = fallbacks.append
+    pp._pool.get = lambda spec: started.append(spec.gpu_layers) or FakeHost(spec)
+    with mock.patch("superdictate.llm.pipeline.is_present", return_value=True):
+        answer = pp._bundled_completion(BundledLLMModel.QWEN35_4B, [Message(Role.USER, "а")], 8)
+        again = pp._bundled_completion(BundledLLMModel.QWEN35_4B, [Message(Role.USER, "б")], 8)
+    _check("gpu fallback: the request is answered on the CPU", (answer, again), ("ok", "ok"))
+    _check("gpu fallback: GPU once, then the CPU for the session", started, [99, 0, 0])
+    _check("gpu fallback: the user is told once", fallbacks, [BundledLLMModel.QWEN35_4B])
+    pp.reset_gpu_fallbacks()
+    with mock.patch("superdictate.llm.pipeline.is_present", return_value=True):
+        pp._bundled_completion(BundledLLMModel.QWEN35_4B, [Message(Role.USER, "в")], 8)
+    _check("gpu fallback: a settings save gives the GPU another chance", started[3], 99)
+    FakeHost.garbage = True
+    pp.shutdown()
+    pp = LLMPostprocessor()
+    pp.gpu_layers = 99
+    started.clear()
+    pp._pool.get = lambda spec: started.append(spec.gpu_layers) or FakeHost(spec)
+    pp._pool_has = lambda spec: spec.gpu_layers in started
+    with mock.patch("superdictate.llm.pipeline.is_present", return_value=True):
+        answer = pp._bundled_completion(BundledLLMModel.RUADAPT_4B, [Message(Role.USER, "а")], 8)
+    _check("gpu canary: fluent garbage never reaches the text", answer, "ok")
+    _check("gpu canary: ...it is asked again on the CPU", started, [99, 0])
+
+    from .llm.guardrail import strip_reasoning
+    _check("reasoning: a finished <think> block is dropped",
+           strip_reasoning("<think>план</think>\n\nГотовый текст."), "Готовый текст.")
+    _check("reasoning: an unfinished one leaves nothing (the input is kept)",
+           strip_reasoning("<think>The user wants me to edit"), "")
+    _check("reasoning: a plain answer is untouched", strip_reasoning(" Текст. "), "Текст.")
+
+    # Until 0.9.1 the rewrite always used the endpoint: someone with one set
+    # up keeps it; nobody else is moved.
+    import json
+    for url, expected in (("https://openrouter.ai/api/v1", "customEndpoint"), ("", "bundledLocal")):
+        path = tempfile.mktemp(suffix=".json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"rewrite_engine_backend_v1": "bundledLocal",
+                       "rewrite_custom_base_url_v1": url}, handle)
+        _check(f"migration: rewrite backend with endpoint {url!r}",
+               Settings(path=path)._get("rewrite_engine_backend_v1"), expected)
+        os.unlink(path)
 
     from .llm.host import HostSpec, host_command
+    templated = HostSpec(model_path=r"C:\m\LFM.gguf", chat_template_path=r"C:\t\lfm.jinja")
+    argv, _, _ = host_command(r"C:\x\engines\superdictate-llm-host.exe", templated, 5000)
+    _check("own host: the chat-template override is passed",
+           argv[argv.index("--chat-template-file") + 1], r"C:\t\lfm.jinja")
     lora = r"C:\Program Files\SuperDictate\_internal\assets\models\gec-lora-adapter.gguf"
     gpu = HostSpec(model_path=r"C:\m\Qwen.gguf", lora_path=lora, lora_scale=4.0, gpu_layers=99)
     argv, cwd, env = host_command(r"C:\x\engines\llama\llama-server.exe", gpu, 5000)

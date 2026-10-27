@@ -28,6 +28,8 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "toast_rewrite_off": ("Рерайт · выкл", "Rewrite · off"),
     "toast_rewrite_style": ("Режим · {style}", "Style · {style}"),
     "toast_loading_model": ("Загружается модель…", "Loading model…"),
+    "toast_gpu_fallback": ("Видеокарта ошиблась · модель на процессоре",
+                           "GPU computed garbage · model moved to the CPU"),
     "rewrite_style_polish": ("Причесать", "Polish"),
     "rewrite_style_structured_task": ("Задача", "Structured task"),
     "rewrite_style_official": ("Официальный", "Formal"),
@@ -123,20 +125,29 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_model_absent": ("Не загружена · {size} МБ", "Not downloaded · {size} MB"),
     "settings_model_failed": ("Ошибка: {error}", "Failed: {error}"),
     "settings_model_download": ("Скачать", "Download"),
-    "llm_model_voicescribe": ("VoiceScribe (0.8B + адаптер)", "VoiceScribe (0.8B + adapter)"),
-    "llm_model_yandexgpt": ("Качественная (8B)", "Quality (8B)"),
+    "llm_model_voicescribe": ("VoiceScribe 0.8B + адаптер · быстрая · 0,7 ГБ", "VoiceScribe 0.8B + adapter · fast · 0.7 GB"),
+    "llm_model_qwen35_4b": ("Qwen3.5-4B · 3,8 ГБ", "Qwen3.5-4B · 3.8 GB"),
+    "llm_model_ruadapt4b": ("RuAdapt Qwen3-4B · 3,3 ГБ", "RuAdapt Qwen3-4B · 3.3 GB"),
+    "llm_model_qvikhr4b": ("QVikhr-3-4B · 3,3 ГБ", "QVikhr-3-4B · 3.3 GB"),
+    "llm_model_ministral3b": ("Ministral-3-3B · 2,8 ГБ", "Ministral-3-3B · 2.8 GB"),
+    "llm_model_phi4mini": ("Phi-4-mini · 3,2 ГБ", "Phi-4-mini · 3.2 GB"),
+    "llm_model_loqira": ("Loqira 0.8B · 0,6 ГБ", "Loqira 0.8B · 0.6 GB"),
+    "llm_model_vanilla08b": ("Qwen3.5-0.8B без адаптера · 0,7 ГБ", "Qwen3.5-0.8B, no adapter · 0.7 GB"),
+    "llm_model_lfm25": ("LFM2.5-2.6B (эксперимент) · 2,2 ГБ", "LFM2.5-2.6B (experimental) · 2.2 GB"),
+    "llm_model_yandexgpt": ("YandexGPT 5 Lite 8B · лучшая · 4,9 ГБ", "YandexGPT 5 Lite 8B · best · 4.9 GB"),
+    "llm_model_qwen35_9b": ("Qwen3.5-9B · 5,7 ГБ", "Qwen3.5-9B · 5.7 GB"),
+    "llm_model_gemma4e4b": ("Gemma 4 E4B · 5,2 ГБ", "Gemma 4 E4B · 5.2 GB"),
 
     # -- compute devices, one per engine -----------------------------
     "settings_llm_device": ("Где считать", "Where it runs"),
     "settings_llm_device_hint": (
         "Настраивается отдельно от распознавания речи. Видеокарта (Vulkan) "
-        "освобождает процессор; маленькой модели коррекции на встроенной "
-        "графике Intel хватает и процессора — около 0,3–0,5 с на фразу "
-        "в обоих случаях, результат одинаковый.",
-        "Set independently of speech recognition. The GPU (Vulkan) leaves "
-        "the CPU free; for the small correction model on Intel integrated "
-        "graphics the CPU is just as good: about 0.3-0.5 s per sentence "
-        "either way, with the same result."),
+        "нужна моделям 4–9B, особенно для переписывания: на ней это "
+        "секунды, на процессоре — десятки секунд. Маленькой модели "
+        "коррекции хватает и процессора.",
+        "Set independently of speech recognition. The GPU (Vulkan) is what "
+        "the 4-9B models need, rewrite above all: seconds there, tens of "
+        "seconds on the CPU. The small correction model is fine on the CPU."),
     "settings_llm_backend": ("Обработка текста", "Text post-processing"),
     "settings_llm_backend_gpu": ("Видеокарта (Vulkan)", "GPU (Vulkan)"),
     "settings_llm_backend_cpu": ("Процессор", "CPU"),

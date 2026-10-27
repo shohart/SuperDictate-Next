@@ -240,3 +240,21 @@ def correction_chunks(text: str, max_characters: int = 500) -> list[str]:
     if current:
         chunks.append(current)
     return [chunk for chunk in chunks if chunk]
+
+
+def strip_reasoning(raw: str) -> str:
+    """The answer without a leading ``<think>…</think>`` block.
+
+    ``enable_thinking: false`` and LFM2.5's template fix are not always
+    enough: it was trained to reason and sometimes still does. A finished
+    block is dropped; an unfinished one (the budget ran out mid-thought)
+    leaves nothing usable, so it reads as an empty answer and the caller
+    keeps its input.
+    """
+    text = raw.strip()
+    if not text.startswith("<think>"):
+        return text
+    end = text.find("</think>")
+    if end < 0:
+        return ""
+    return text[end + len("</think>"):].strip()

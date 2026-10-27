@@ -6,8 +6,9 @@
     Regenerates the icon, runs the self-tests (a failing port should never
     reach a build), builds and stages SuperDictateOnnxHost
     (tools\build-onnx-host.ps1) and Silero VAD (tools\build-engines.ps1),
-    then packages with PyInstaller. Release builds have no local LLM host:
-    correction and rewrite use an OpenAI-compatible endpoint.
+    then packages with PyInstaller. The LLM host (CPU + Vulkan) runs
+    correction and rewrite locally; -SkipEngines leaves it and the VAD out,
+    and the app then offers the OpenAI-compatible endpoint only.
 
 .EXAMPLE
     .\build.ps1
