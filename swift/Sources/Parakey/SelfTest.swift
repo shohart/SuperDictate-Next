@@ -188,6 +188,8 @@ enum ParakeySelfTest {
             return runSuite("llm-guardrail", testLLMCorrectionGuardrail)
         case "llm-rewrite-settings":
             return runSuite("llm-rewrite-settings", testRewriteAndTierSettings)
+        case "llm-proxy-policy":
+            return runSuite("llm-proxy-policy", testLLMProxyPolicy)
         case "llm-gec":
             return runSuite("llm-gec", testLLMGECIntegration)
         case "llm-rewrite":
@@ -270,6 +272,7 @@ enum ParakeySelfTest {
         try testLLMPostprocessingDelayedUnload()
         try testLLMCorrectionGuardrail()
         try testRewriteAndTierSettings()
+        try testLLMProxyPolicy()
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
@@ -3393,6 +3396,38 @@ enum ParakeySelfTest {
     /// correction/rewrite toggle independence, path-based host identities,
     /// neededHostIdentities (the delayed-unload keep-set), and per-model/
     /// per-style prompt selection. No model, no network; part of `all`.
+    /// Local LLM endpoints stay direct whatever the proxy toggle says;
+    /// internet ones honour it. Endpoint URLs given with or without `/v1`
+    /// reach `/v1/chat/completions`. Mirrors test_llm_proxy_policy on
+    /// Windows.
+    private static func testLLMProxyPolicy() throws {
+        for host in ["127.0.0.1", "127.10.0.2", "192.168.1.10", "10.0.0.5",
+                     "172.16.0.1", "172.31.255.255", "169.254.1.1",
+                     "100.64.0.1", "::1", "[::1]", "fe80::1", "fd00::1", "0.0.0.0",
+                     "localhost", "printer.local", "::ffff:192.168.1.5"] {
+            try expect(isLocalNetworkHost(host), equals: true, "local network: \(host)")
+        }
+        for host in ["8.8.8.8", "172.32.0.1", "203.0.113.10", "openrouter.ai", "fcc.example.com"] {
+            try expect(isLocalNetworkHost(host), equals: false, "internet: \(host)")
+        }
+        let cases: [(String, String)] = [
+            ("http://127.0.0.1:1234", "http://127.0.0.1:1234/v1/chat/completions"),
+            ("http://127.0.0.1:1234/", "http://127.0.0.1:1234/v1/chat/completions"),
+            ("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/chat/completions"),
+            ("https://openrouter.ai/api/v1/", "https://openrouter.ai/api/v1/chat/completions"),
+            ("https://api.example.com/v1/chat/completions", "https://api.example.com/v1/chat/completions"),
+        ]
+        for (base, expected) in cases {
+            try expect(chatCompletionsURL(URL(string: base)!)?.absoluteString, equals: expected,
+                       "endpoint URL for \(base)")
+        }
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.llm-proxy-\(UUID().uuidString)")!,
+                                vocabularyStore: .inMemoryFallback())
+        try expect(settings.llmUseSystemProxy, equals: true, "the system proxy is on by default")
+        settings.llmUseSystemProxy = false
+        try expect(settings.llmUseSystemProxy, equals: false, "turning the proxy off persists")
+    }
+
     private static func testRewriteAndTierSettings() throws {
         func freshSettings() -> Settings {
             Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-\(UUID().uuidString)")!,

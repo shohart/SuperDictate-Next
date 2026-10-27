@@ -86,6 +86,28 @@ func isLocalNetworkHost(_ host: String?) -> Bool {
     }
 }
 
+/// The request URL for an endpoint address as people write it. Provider
+/// docs give the base with its version ("https://openrouter.ai/api/v1",
+/// OpenAI SDK style); local servers are usually given bare
+/// ("http://127.0.0.1:1234"). Both work, and so does the full URL. Mirrors
+/// `chat_completions_url` in windows/superdictate/llm/host.py.
+func chatCompletionsURL(_ baseURL: URL) -> URL? {
+    guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+        return nil
+    }
+    var path = components.path
+    while path.hasSuffix("/") { path.removeLast() }
+    if path.hasSuffix("/chat/completions") {
+        // Already the full URL.
+    } else if path.hasSuffix("/v1") {
+        path += "/chat/completions"
+    } else {
+        path += "/v1/chat/completions"
+    }
+    components.path = path
+    return components.url
+}
+
 enum OpenAICompatibleRole: String, Codable, Sendable {
     case system
     case user
@@ -166,13 +188,7 @@ enum OpenAICompatibleClient {
                                 // scripts/build-test-app.sh's own comment
                                 // on debug vs release inference speed).
                                 timeoutInterval: TimeInterval = 60) async -> Result<String, LLMPostprocessError> {
-        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
-            return .failure(.invalidBaseURL)
-        }
-        components.path = components.path.hasSuffix("/")
-            ? components.path + "v1/chat/completions"
-            : components.path + "/v1/chat/completions"
-        guard let url = components.url else {
+        guard let url = chatCompletionsURL(baseURL) else {
             return .failure(.invalidBaseURL)
         }
 
