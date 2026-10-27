@@ -92,8 +92,9 @@ actor LLMPostprocessingCoordinator {
 
     /// Host identity for the bundled rewrite model — same path-based rule
     /// as correction, so picking the SAME bundled model for both passes
-    /// would share one host (the pickers offer disjoint model lists, so in
-    /// practice each pass runs its own host).
+    /// shares one host. The pickers overlap (YandexGPT, Phi-4-mini,
+    /// Ministral-3B and RuAdapt-4B are in both), and the host keeps a prefix
+    /// snapshot per stage, so a shared host loses nothing.
     static func rewriteHostIdentity(model: BundledLLMModel) -> String {
         bundledLLMModelPath(model).path + "|" + bundledLLMLoraPath(model)
     }
@@ -299,20 +300,24 @@ actor LLMPostprocessingCoordinator {
         await unloadHostsNoLongerNeeded(settings: settings)
         // Its own process on the CPU: loads alongside the LLM hosts.
         Task { [punctuation] in await punctuation.prewarm(settings: settings) }
-        var models: [(identity: String, model: BundledLLMModel, rewrite: Bool)] = []
+        // One host per model: the same model picked for both stages serves
+        // both, and is primed for both (`stages`).
+        var models: [(identity: String, model: BundledLLMModel, stages: [Bool])] = []
         if settings.textPostprocessingMode == .correction, settings.llmEngineBackend == .bundledLocal {
             let model = settings.correctionBundledModel
-            models.append((Self.correctionHostIdentity(model: model), model, false))
+            models.append((Self.correctionHostIdentity(model: model), model, [false]))
         }
         if settings.rewriteEnabled, settings.rewriteEngineBackend == .bundledLocal {
             let model = settings.rewriteBundledModel
             let identity = Self.rewriteHostIdentity(model: model)
-            if !models.contains(where: { $0.identity == identity }) {
-                models.append((identity, model, true))
+            if let shared = models.firstIndex(where: { $0.identity == identity }) {
+                models[shared].stages.append(true)
+            } else {
+                models.append((identity, model, [true]))
             }
         }
         let usedGPU = useGPU(settings)
-        for (identity, model, rewrite) in models where bundledLLMModelExists(model) {
+        for (identity, model, stages) in models where bundledLLMModelExists(model) {
             let hostProcess = hostProcess(forIdentity: identity)
             guard !(await hostProcess.isRunning) else { continue }
             let startedAt = ProcessInfo.processInfo.systemUptime
@@ -346,25 +351,29 @@ actor LLMPostprocessingCoordinator {
                                                                 userText: "Привет.",
                                                                 maxTokens: 4)
             }
-            // The host reuses the prompt opening a request shares with the
-            // previous one (system prompt + few-shot turns, ~270 of ~295
-            // tokens for correction): the first request of a kind decodes
-            // in full, the second snapshots the shared opening. Two requests
-            // shaped like the real ones do both here, so the very first
-            // dictation already decodes only its own sentence.
-            let primer = rewrite ? rewritePrompt(settings: settings)
-                                 : correctionPrompt(model: model, settings: settings)
-            for sample in ["Проверка связи.", "Раз, два, три."] {
-                _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
-                                                                apiKey: nil,
-                                                                model: "primer-\(model.rawValue)",
-                                                                systemPrompt: primer.system,
-                                                                exampleTurns: primer.examples,
-                                                                userText: rewrite
-                                                                    ? LLMRewritePrompt.userText(for: sample, token: primer.modeToken)
-                                                                    : sample,
-                                                                temperature: 0,
-                                                                maxTokens: 1)
+            // The host reuses the prompt opening a request shares with a
+            // recent one (system prompt + few-shot turns, ~270 of ~295
+            // tokens for correction; the style's system prompt, ~240 of
+            // ~275, for rewrite), keeping several such snapshots: the first
+            // request of a kind decodes in full, the second snapshots the
+            // shared opening. Two requests shaped like the real ones per
+            // stage do both here, so the very first dictation already
+            // decodes only its own sentence, in each stage the host serves.
+            for rewrite in stages {
+                let primer = rewrite ? rewritePrompt(settings: settings)
+                                     : correctionPrompt(model: model, settings: settings)
+                for sample in ["Проверка связи.", "Раз, два, три."] {
+                    _ = await OpenAICompatibleClient.chatCompletion(baseURL: baseURL,
+                                                                    apiKey: nil,
+                                                                    model: "primer-\(model.rawValue)",
+                                                                    systemPrompt: primer.system,
+                                                                    exampleTurns: primer.examples,
+                                                                    userText: rewrite
+                                                                        ? LLMRewritePrompt.userText(for: sample, token: primer.modeToken)
+                                                                        : sample,
+                                                                    temperature: 0,
+                                                                    maxTokens: 1)
+                }
             }
             log("LLM postprocessing: pre-warmed \(model.displayName) in \(String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startedAt)) s")
         }
@@ -385,11 +394,25 @@ actor LLMPostprocessingCoordinator {
     /// from its prefix snapshot (`usage.prompt_tokens_details.cached_tokens`).
     func correctionCachedTokensForTest(_ text: String, settings: Settings) async -> Int? {
         let model = settings.correctionBundledModel
-        guard let host = hostProcesses[Self.correctionHostIdentity(model: model)],
-              let baseURL = await host.baseURL else { return nil }
         let prompt = correctionPrompt(model: model, settings: settings)
         let messages = [OpenAICompatibleMessage(role: .system, content: prompt.system)]
             + prompt.examples + [OpenAICompatibleMessage(role: .user, content: text)]
+        return await cachedTokensForTest(identity: Self.correctionHostIdentity(model: model), messages: messages)
+    }
+
+    /// Test-only: the same, for a rewrite-shaped request to the rewrite host.
+    func rewriteCachedTokensForTest(_ text: String, settings: Settings) async -> Int? {
+        let model = settings.rewriteBundledModel
+        let prompt = rewritePrompt(settings: settings)
+        let messages = [OpenAICompatibleMessage(role: .system, content: prompt.system)]
+            + prompt.examples
+            + [OpenAICompatibleMessage(role: .user, content: LLMRewritePrompt.userText(for: text, token: prompt.modeToken))]
+        return await cachedTokensForTest(identity: Self.rewriteHostIdentity(model: model), messages: messages)
+    }
+
+    private func cachedTokensForTest(identity: String, messages: [OpenAICompatibleMessage]) async -> Int? {
+        guard let host = hostProcesses[identity],
+              let baseURL = await host.baseURL else { return nil }
         var req = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")

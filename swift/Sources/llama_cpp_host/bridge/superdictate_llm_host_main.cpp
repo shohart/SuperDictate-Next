@@ -364,57 +364,81 @@ public:
         //
         // What the requests do share is their opening: the correction
         // system prompt and its few-shot turns are ~270 of the ~295 prompt
-        // tokens, identical for every sentence. Decoding them once and
-        // restoring that state saves most of the prompt work. The model is
-        // a hybrid (Qwen3.5: recurrent + attention layers), whose memory
-        // cannot be trimmed back to a prefix with llama_memory_seq_rm, so
-        // the prefix is kept as a full sequence-state snapshot
-        // (llama_state_seq_get_data) and restored with
-        // llama_state_seq_set_data. Measured with llama.cpp b11826 on a
+        // tokens, identical for every sentence, and a rewrite style's system
+        // prompt ~240 of ~275. Decoding them once and restoring that state
+        // saves most of the prompt work. Qwen3.5 is a hybrid (recurrent +
+        // attention layers) whose memory cannot be trimmed back to a prefix
+        // with llama_memory_seq_rm, so each prefix is kept as a full
+        // sequence-state snapshot (llama_state_seq_get_data) and restored
+        // with llama_state_seq_set_data. Measured with llama.cpp b11826 on a
         // Core Ultra 5 225H CPU, 65-sentence correction corpus: p50 0.75 s
         // -> 0.32 s per sentence, identical outputs (65/65).
         //
-        // The prefix is learned, not configured: it is the part of this
-        // prompt shared with the previous one. The first request after a
-        // start decodes in full; the second snapshots the shared part;
-        // every later one restores it and decodes only its own sentence. A
-        // changed system prompt (custom prompt, other stage) simply makes
-        // the snapshot miss and be taken again at the new shared length.
+        // Prefixes are learned, not configured: one is the opening this
+        // prompt shares with one of the last few prompts. There are several
+        // (kPrefixSlots, least recently used goes first) because one host
+        // can serve more than one kind of request: the same model doing
+        // correction and rewrite alternates two system prompts, and the
+        // rewrite styles each have their own. With a single snapshot learned
+        // from the previous request only, that alternation never hit
+        // (YandexGPT on a CPU: 8 s correction and 11.6 s of rewrite prompt on
+        // every dictation instead of ~1.5 s each).
         common_sampler_reset(sampler_);
         llama_memory_t mem = llama_get_memory(ctx_);
         llama_memory_seq_rm(mem, 0, -1, -1);
 
+        auto common_prefix = [&](const std::vector<llama_token> & other) {
+            size_t n = 0;
+            while (n < tokens.size() && n < other.size() && tokens[n] == other[n]) {
+                n++;
+            }
+            return n;
+        };
+
+        // The longest snapshot this prompt starts with, leaving at least one
+        // token to decode (the logits come from the last one).
+        PrefixSlot * best = nullptr;
+        for (auto & slot : prefix_slots_) {
+            if (slot.tokens.size() < tokens.size() && common_prefix(slot.tokens) == slot.tokens.size() &&
+                (best == nullptr || slot.tokens.size() > best->tokens.size())) {
+                best = &slot;
+            }
+        }
+        // The longest opening shared with a recent prompt: a snapshot worth
+        // taking when it reaches kMinPrefixTokens past what is restored.
         size_t shared = 0;
-        while (prefix_reuse_enabled_ && shared < tokens.size() && shared < previous_tokens_.size() &&
-               tokens[shared] == previous_tokens_[shared]) {
-            shared++;
+        if (prefix_reuse_enabled_) {
+            for (const auto & recent : recent_prompts_) {
+                shared = std::max(shared, common_prefix(recent));
+            }
+            shared = std::min(shared, tokens.size() - 1);
         }
 
         int n_past = 0;
-        if (prefix_len_ > 0 && shared >= prefix_len_ && tokens.size() > prefix_len_ &&
-            llama_state_seq_set_data(ctx_, prefix_state_.data(), prefix_state_.size(), 0) ==
-                prefix_state_.size()) {
-            n_past = static_cast<int>(prefix_len_);
-        } else {
-            llama_memory_seq_rm(mem, 0, -1, -1);  // a failed restore may leave part of it
-            prefix_state_.clear();
-            prefix_len_ = 0;
-            if (shared >= kMinPrefixTokens && shared < tokens.size()) {
-                if (llama_decode(ctx_, llama_batch_get_one(tokens.data(), static_cast<int32_t>(shared)))) {
-                    out.error = "prompt decode failed";
-                    return out;
-                }
-                n_past = static_cast<int>(shared);
-                const size_t size = llama_state_seq_get_size(ctx_, 0);
-                prefix_state_.resize(size);
-                if (size > 0 && llama_state_seq_get_data(ctx_, prefix_state_.data(), size, 0) == size) {
-                    prefix_len_ = shared;
-                } else {
-                    prefix_state_.clear();
-                }
+        if (best != nullptr) {
+            if (llama_state_seq_set_data(ctx_, best->state.data(), best->state.size(), 0) == best->state.size()) {
+                n_past = static_cast<int>(best->tokens.size());
+                best->last_used = ++prefix_clock_;
+            } else {
+                llama_memory_seq_rm(mem, 0, -1, -1);  // a failed restore may leave part of it
+                prefix_slots_.erase(prefix_slots_.begin() + (best - prefix_slots_.data()));
             }
         }
-        previous_tokens_ = tokens;
+        if (shared >= static_cast<size_t>(n_past) + kMinPrefixTokens) {
+            if (llama_decode(ctx_, llama_batch_get_one(tokens.data() + n_past,
+                                                       static_cast<int32_t>(shared - n_past)))) {
+                out.error = "prompt decode failed";
+                return out;
+            }
+            n_past = static_cast<int>(shared);
+            take_prefix_snapshot(std::vector<llama_token>(tokens.begin(), tokens.begin() + shared));
+        }
+        if (prefix_reuse_enabled_) {
+            recent_prompts_.push_back(tokens);
+            if (recent_prompts_.size() > kRecentPrompts) {
+                recent_prompts_.erase(recent_prompts_.begin());
+            }
+        }
 
         const int n_rest = static_cast<int>(tokens.size()) - n_past;
         if (!common_prompt_batch_decode(ctx_, tokens, n_rest, n_past, llama_n_batch(ctx_), "", false)) {
@@ -454,6 +478,34 @@ public:
     }
 
 private:
+    struct PrefixSlot {
+        std::vector<llama_token> tokens;
+        std::vector<uint8_t>     state;
+        uint64_t                 last_used = 0;
+    };
+
+    // Snapshots the sequence state, whose memory holds exactly `prefix`,
+    // into a slot: the least recently used one goes when all are taken.
+    void take_prefix_snapshot(std::vector<llama_token> prefix) {
+        const size_t size = llama_state_seq_get_size(ctx_, 0);
+        if (size == 0 || size > kMaxPrefixStateBytes) {
+            return;
+        }
+        PrefixSlot slot;
+        slot.state.resize(size);
+        if (llama_state_seq_get_data(ctx_, slot.state.data(), size, 0) != size) {
+            return;
+        }
+        slot.tokens = std::move(prefix);
+        slot.last_used = ++prefix_clock_;
+        if (prefix_slots_.size() >= kPrefixSlots) {
+            auto oldest = std::min_element(prefix_slots_.begin(), prefix_slots_.end(),
+                [](const PrefixSlot & a, const PrefixSlot & b) { return a.last_used < b.last_used; });
+            prefix_slots_.erase(oldest);
+        }
+        prefix_slots_.push_back(std::move(slot));
+    }
+
     bool last_logits_finite() const {
         const float * logits = llama_get_logits_ith(ctx_, -1);
         if (logits == nullptr) {
@@ -484,9 +536,15 @@ private:
         const char * v = std::getenv("SUPERDICTATE_LLM_PREFIX_REUSE");
         return v == nullptr || std::strcmp(v, "0") != 0;
     }();
-    std::vector<llama_token>   previous_tokens_;
-    std::vector<uint8_t>       prefix_state_;
-    size_t                     prefix_len_ = 0;
+    // Correction, rewrite and the three rewrite styles fit, with room for a
+    // custom prompt; each snapshot of a ~250-token prefix is tens of MB for
+    // an 8B model, and one larger than kMaxPrefixStateBytes is not kept.
+    static constexpr size_t    kPrefixSlots = 6;
+    static constexpr size_t    kRecentPrompts = 6;
+    static constexpr size_t    kMaxPrefixStateBytes = 512u << 20;
+    std::vector<PrefixSlot>    prefix_slots_;
+    std::vector<std::vector<llama_token>> recent_prompts_;
+    uint64_t                   prefix_clock_ = 0;
 };
 
 sdlh_json make_error_json(const std::string & message) {

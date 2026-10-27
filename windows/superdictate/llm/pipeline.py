@@ -253,17 +253,27 @@ class LLMPostprocessor:
             log.info("Local correction warm-up failed (the first dictation will load it): %s", exc)
 
     def warm_up_rewrite(self, config: RewriteConfig) -> None:
-        """Load the local rewrite model ahead of the first rewrite. Blocking;
-        call from a background thread. A rewrite model is gigabytes, and
-        loading it on the dictation path is a several-second wait."""
+        """Load the local rewrite model and prime its prompt cache, as
+        :meth:`warm_up` does for correction. Blocking; call from a
+        background thread.
+
+        A style's system prompt is ~240 of a rewrite's ~275 prompt tokens.
+        Two requests shaped like real ones let the host snapshot it, so the
+        first rewrite decodes only the dictation (YandexGPT on a CPU: 15 s
+        -> 5 s). The host keeps several snapshots, so when the same model
+        also corrects, both stages stay primed.
+        """
         if not config.enabled or config.backend is not LLMBackend.BUNDLED_LOCAL:
             return
         if not is_present(profile(config.model).pin):
             return
+        system, token = self._rewrite_prompt(config)
         try:
-            self._bundled_completion(
-                config.model, [Message(Role.SYSTEM, "Ответь одним словом."),
-                               Message(Role.USER, "да")], max_tokens=1)
+            for text in ("Проверка связи.", "Раз, два, три."):
+                self._bundled_completion(
+                    config.model, [Message(Role.SYSTEM, system),
+                                   Message(Role.USER, prompts.rewrite_user_text(text, token))],
+                    max_tokens=1)
             log.info("Local rewrite host warmed up (%s)", config.model.value)
         except Exception as exc:
             log.info("Local rewrite warm-up failed (the first rewrite will load it): %s", exc)
@@ -303,19 +313,20 @@ class LLMPostprocessor:
             corrected.append(guardrail.sanitized_correction(chunk, raw))
         return " ".join(corrected) if corrected else text
 
-    def _rewritten(self, text: str, config: RewriteConfig) -> str:
+    def _rewrite_prompt(self, config: RewriteConfig) -> tuple[str, str]:
+        """The system prompt and the mode token for the selected style."""
         custom = config.custom_styles.get(config.custom_style_id) \
             if config.custom_style_id else None
         if custom:
             system = prompts.rewrite_system_prompt_custom(
                 str(custom.get("name", "")), str(custom.get("instruction", "")))
-            token = str(custom.get("name", "")).upper()
-        else:
-            override = str(config.system_prompt_overrides.get(
-                config.style.value, "")).strip()
-            system = override or prompts.rewrite_system_prompt(config.style)
-            token = config.style.token
+            return system, str(custom.get("name", "")).upper()
+        override = str(config.system_prompt_overrides.get(
+            config.style.value, "")).strip()
+        return override or prompts.rewrite_system_prompt(config.style), config.style.token
 
+    def _rewritten(self, text: str, config: RewriteConfig) -> str:
+        system, token = self._rewrite_prompt(config)
         messages = [
             Message(Role.SYSTEM, system),
             Message(Role.USER, prompts.rewrite_user_text(text, token)),

@@ -3184,6 +3184,33 @@ enum ParakeySelfTest {
         try runParakeetEngineSynchronously { await coordinator.stop() }
         try expect((cached ?? 0) >= 200, equals: true,
                    "the first correction after pre-warm must reuse the system prompt and few-shot turns")
+
+        // One model for both stages: one host, primed for both, and the
+        // host keeps a snapshot per stage, so neither evicts the other.
+        guard bundledLLMModelExists(.yandexGPT) else {
+            print("SKIP llm-prefix-primer (shared host): YandexGPT is not downloaded")
+            return
+        }
+        let shared = LLMPostprocessingCoordinator()
+        settings.correctionBundledModel = .yandexGPT
+        settings.rewriteEnabled = true
+        settings.rewriteEngineBackend = .bundledLocal
+        settings.rewriteBundledModel = .yandexGPT
+        settings.rewriteStyleID = RewriteStyle.official.rawValue
+        try runParakeetEngineSynchronously { await shared.prewarmNeededHosts(settings: settings) }
+        var counts: [Int?] = []
+        for text in ["я развернул дебиан сервер", "отправь отчёт директору"] {
+            counts.append(try runParakeetEngineSynchronously {
+                await shared.correctionCachedTokensForTest(text, settings: settings)
+            })
+            counts.append(try runParakeetEngineSynchronously {
+                await shared.rewriteCachedTokensForTest(text, settings: settings)
+            })
+        }
+        print("LLM prefix primer (shared host): correction/rewrite alternating reused \(counts.map { $0.map(String.init) ?? "nil" })")
+        try runParakeetEngineSynchronously { await shared.stop() }
+        try expect(counts.allSatisfy { ($0 ?? 0) >= 100 }, equals: true,
+                   "a host serving both stages must reuse each stage's system prompt on every request")
     }
 
     private static func testLLMGECIntegration() throws {
