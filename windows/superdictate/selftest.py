@@ -1773,10 +1773,11 @@ def test_hotkey_hook_refresh() -> None:
            hotkeys.HOOK_REFRESH_SECONDS <= 30, True)
 
 
-def _run_edit_watch(states, inserted, *, pid=42):
+def _run_edit_watch(states, inserted, *, pid=42, requests=(), events=None):
     """Drive edit_watch.EditWatcher through ``states``: ``[(at_seconds, text, element)]``,
     each field state holding from its time until the next one. Returns the
-    candidates it saved."""
+    candidates it saved. ``requests`` are ``[(at_seconds, "save" | "cancel")]``
+    from the pill; ``events`` collects what the pill was told."""
     import time as _time
 
     from . import edit_watch
@@ -1784,6 +1785,7 @@ def _run_edit_watch(states, inserted, *, pid=42):
 
     clock = {"t": 0.0}
     learned = []
+    pending_requests = sorted(requests)
 
     def read():
         current = None
@@ -1796,10 +1798,30 @@ def _run_edit_watch(states, inserted, *, pid=42):
         return FieldSnapshot(element=element, pid=pid, text=text,
                              caret=None, secure=text == "<password>")
 
+    watcher = None
+
     def fake_sleep(seconds):
         clock["t"] += seconds
+        while pending_requests and clock["t"] >= pending_requests[0][0]:
+            _, request = pending_requests.pop(0)
+            (watcher.confirm_now if request == "save" else watcher.cancel_pending)()
 
-    watcher = edit_watch.EditWatcher(read, lambda c: learned.append((c.source, c.replacement)) or True,
+    def learn(c):
+        learned.append((c.source, c.replacement))
+        if events is not None:
+            events.append(("saved", round(clock["t"], 1)))
+        return True
+
+    def on_pending(c, bounds):
+        if events is not None:
+            events.append(("pending", c.source, c.replacement))
+
+    def on_cleared():
+        if events is not None:
+            events.append(("cleared",))
+
+    watcher = edit_watch.EditWatcher(read, learn, on_pending=on_pending,
+                                     on_pending_cleared=on_cleared,
                                      clock=lambda: clock["t"], sleep=fake_sleep)
     watcher.begin(inserted)
     deadline = _time.monotonic() + 10
@@ -1848,6 +1870,113 @@ def test_edit_watch_learns_like_macos() -> None:
            _run_edit_watch([(0, "что-то другое", 1), (1, "что-то иное", 1)], dictated), [])
     _check("edit watch: nothing is learned after the 45 s window",
            _run_edit_watch([(0, field, 1), (50, fixed, 1)], dictated), [])
+
+
+def test_learn_pill_flow() -> None:
+    """The pending learn pill, as on macOS: shown while the save waits,
+    Enter saves at once, Escape drops it, typing on retargets it."""
+    before, after = "Письмо: ", " Спасибо."
+    dictated = "напиши на инглиш пожалуйста"
+    field = before + dictated + after
+    fixed = field.replace("инглиш", "English")
+
+    events = []
+    _check("learn pill: the window running out saves",
+           _run_edit_watch([(0, field, 1), (1, fixed, 1)], dictated, events=events),
+           [("инглиш", "English")])
+    _check("learn pill: shown before the save",
+           [e[0] for e in events], ["pending", "saved"])
+
+    events = []
+    _check("learn pill: Enter saves without waiting",
+           _run_edit_watch([(0, field, 1), (1, fixed, 1)], dictated,
+                           requests=[(2.0, "save")], events=events),
+           [("инглиш", "English")])
+    _check("learn pill: ...within a poll of the key", events[1][1] <= 2.4, True)
+
+    events = []
+    _check("learn pill: Escape saves nothing",
+           _run_edit_watch([(0, field, 1), (1, fixed, 1)], dictated,
+                           requests=[(2.0, "cancel")], events=events), [])
+    _check("learn pill: ...and the pill is told", ("cleared",) in events, True)
+    _check("learn pill: after Escape the watch goes on",
+           _run_edit_watch([(0, field, 1), (1, fixed, 1),
+                            (8, fixed.replace("пожалуйста", "please"), 1)], dictated,
+                           requests=[(2.0, "cancel")]),
+           [("пожалуйста", "please")])
+
+    events = []
+    _run_edit_watch([(0, field, 1), (1, field.replace("инглиш", "Eng"), 1),
+                     (2, fixed, 1)], dictated, events=events)
+    _check("learn pill: typing on shows the new candidate in place",
+           [e for e in events if e[0] == "pending"],
+           [("pending", "инглиш", "Eng"), ("pending", "инглиш", "English")])
+
+    events = []
+    _run_edit_watch([(0, field, 1), (1, fixed, 1), (2, field, 1)], dictated, events=events)
+    _check("learn pill: undoing the edit takes the pill down unsaved",
+           events, [("pending", "инглиш", "English"), ("cleared",)])
+
+    events = []
+    _run_edit_watch([(0, field, 1), (1, fixed, 1), (2, fixed, 2)], dictated, events=events)
+    _check("learn pill: focus moving away takes it down",
+           events, [("pending", "инглиш", "English"), ("cleared",)])
+
+    # The keys: Enter and Escape belong to the pill only while it waits.
+    from .hotkeys import VK_RETURN
+
+    def feed(machine, vk, down, modifiers=0, *, recording=False, pending=True):
+        return machine.transition(
+            _Event(vk=vk, is_down=down, modifiers=modifiers, is_repeat=False),
+            hotkey=HOTKEY, history_hotkey=HISTORY_HOTKEY, edit_hotkey=EDIT_HOTKEY,
+            trigger_mode=TriggerMode.TOGGLE, is_recording=recording,
+            learn_pending=pending)
+
+    machine = _machine()
+    down = feed(machine, VK_RETURN, True)
+    _check("learn keys: Enter saves", (down.suppress, down.actions), (True, [Action.LEARN_SAVE]))
+    up = feed(machine, VK_RETURN, False, pending=False)
+    _check("learn keys: ...and its key-up is swallowed too", (up.suppress, up.actions), (True, []))
+    machine = _machine()
+    down = feed(machine, VK_ESCAPE, True)
+    _check("learn keys: Escape cancels", (down.suppress, down.actions), (True, [Action.LEARN_CANCEL]))
+    up = feed(machine, VK_ESCAPE, False, pending=False)
+    _check("learn keys: ...key-up swallowed", up.suppress, True)
+    machine = _machine()
+    _check("learn keys: Ctrl+Enter stays the app's",
+           feed(machine, VK_RETURN, True, MOD_CTRL).suppress, False)
+    _check("learn keys: Enter with no pill stays the app's",
+           feed(_machine(), VK_RETURN, True, pending=False).suppress, False)
+    _check("learn keys: a recording keeps Escape",
+           feed(_machine(), VK_ESCAPE, True, recording=True).actions, [Action.CANCEL])
+    _check("learn keys: a recording keeps Enter",
+           Action.LEARN_SAVE in feed(_machine(), VK_RETURN, True, recording=True).actions, False)
+
+
+def test_learn_pill_drawing() -> None:
+    """The pill is the HUD capsule: its fill, the accent arrow, the flash."""
+    import tempfile as _tempfile
+
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication(["selftest"])  # noqa: F841 (fonts need it)
+    from .ui import learn_toast
+
+    _check("learn pill: never narrower than the macOS minimum",
+           learn_toast.pill_width("а", "б"), learn_toast.MIN_PILL_WIDTH)
+    _check("learn pill: never wider than the macOS maximum",
+           learn_toast.pill_width("очень " * 40, "длинно " * 40), learn_toast.MAX_PILL_WIDTH)
+    with _tempfile.TemporaryDirectory() as directory:
+        frames = learn_toast.export_preview_frames(directory, accent="#ff3b30")
+        _check("learn pill: the whole timeline renders", len(frames), 21)
+        settled = QImage(frames[6])     # entry finished
+        flash = QImage(frames[7])       # first frame of the save flash
+        y = settled.height() // 2
+        x = learn_toast.MARGIN + 10     # inside the left end, clear of the text
+        rest, lit = QColor(settled.pixel(x, y)), QColor(flash.pixel(x, y))
+        _check("learn pill: dark capsule fill at rest", rest.red() < 40, True)
+        _check("learn pill: the save flashes the accent", lit.red() > 180 and lit.green() < 120, True)
 
 
 def _speech_like(seconds_pattern, sample_rate=16000, seed=7):
@@ -2092,6 +2221,8 @@ _TESTS = [
     test_openvino_host_ipc,
     test_npu_encoder_background_compile,
     test_edit_watch_learns_like_macos,
+    test_learn_pill_flow,
+    test_learn_pill_drawing,
     test_hotkey_hook_refresh,
     test_alternate_finish_hotkey,
     test_incremental_stable_windows,

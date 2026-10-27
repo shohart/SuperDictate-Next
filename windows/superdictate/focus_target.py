@@ -141,6 +141,8 @@ class FieldSnapshot:
     text: str
     caret: Optional[int]  # characters before the caret, when the field says
     secure: bool
+    #: The field on screen (physical pixels), for the learn pill to sit by.
+    bounds: Optional[Rect] = None
 
 
 @dataclass(frozen=True)
@@ -725,7 +727,8 @@ class FocusProbe:
         if read is None:
             return None
         text, caret = read
-        return FieldSnapshot(uia.runtime_id(element), pid, text, caret, False)
+        return FieldSnapshot(uia.runtime_id(element), pid, text, caret, False,
+                             uia.bounds(element))
 
     # -- locating ---------------------------------------------------------
 

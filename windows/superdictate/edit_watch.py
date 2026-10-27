@@ -17,7 +17,9 @@ timing is the macOS one:
   :data:`DEBOUNCE_SECONDS`;
 * a candidate is saved only after another :data:`CONFIRM_SECONDS` without
   further edits, so a correction still being typed is never learned half
-  done;
+  done. Meanwhile the UI shows it as pending (``on_pending``): Enter saves
+  it at once (:meth:`EditWatcher.confirm_now`), Escape drops it
+  (:meth:`EditWatcher.cancel_pending`) and the watch goes on;
 * after a save the watch rebases on the corrected text and keeps going, so
   a second word fixed in the same dictation is learned on its own;
 * focus moving to another field, an edit outside the inserted region, a
@@ -89,6 +91,9 @@ class _Watch:
     changed_at: Optional[float] = None
     pending: Optional[LearnCandidate] = None
     confirm_at: float = 0.0
+    #: The UI is showing a pending candidate (``pending`` may already be
+    #: gone while the next one is being typed).
+    shown: bool = False
 
 
 class EditWatcher:
@@ -96,17 +101,26 @@ class EditWatcher:
 
     ``read_field`` returns a :class:`focus_target.FieldSnapshot` (or None);
     ``learn(candidate)`` saves a rule and returns what was saved (falsy when
-    the store declined: already known, or a cap). Both are called from the
-    watcher thread.
+    the store declined: already known, or a cap). ``on_pending(candidate,
+    bounds)`` reports a candidate waiting out its confirm window, with the
+    field's screen rectangle; ``on_pending_cleared()`` says it went away
+    without being saved (it was edited into nothing learnable, or the watch
+    ended). All of them are called from the watcher thread.
     """
 
     def __init__(self, read_field: Callable[[], object],
                  learn: Callable[[LearnCandidate], object], *,
+                 on_pending: Callable[[LearnCandidate, object], None] = lambda c, b: None,
+                 on_pending_cleared: Callable[[], None] = lambda: None,
                  own_pids: frozenset[int] = frozenset(),
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Optional[Callable[[float], object]] = None) -> None:
         self._read = read_field
         self._learn = learn
+        self._on_pending = on_pending
+        self._on_pending_cleared = on_pending_cleared
+        #: "save" or "cancel" from the UI, taken up by the next poll.
+        self._request: Optional[str] = None
         self._own = own_pids
         self._clock = clock
         #: Tests pass a fake; otherwise each watch sleeps on its own stop event.
@@ -135,6 +149,21 @@ class EditWatcher:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
 
+    def confirm_now(self) -> None:
+        """Enter on the pending pill: save without waiting the window out."""
+        with self._lock:
+            self._request = "save"
+
+    def cancel_pending(self) -> None:
+        """Escape on the pending pill: drop the candidate, keep watching."""
+        with self._lock:
+            self._request = "cancel"
+
+    def _take_request(self) -> Optional[str]:
+        with self._lock:
+            request, self._request = self._request, None
+        return request
+
     # -- thread ----------------------------------------------------------
 
     def _snapshot(self):
@@ -150,16 +179,21 @@ class EditWatcher:
         if watch is None:
             return
         log.info("Watching the field for corrections (%d characters inserted)", len(inserted))
-        while not stop.is_set():
-            sleep(POLL_SECONDS)
-            if stop.is_set():
-                return
-            now = self._clock()
-            if now >= watch.deadline:
-                log.debug("Edit watch window over")
-                return
-            if not self._step(watch, now):
-                return
+        self._take_request()  # a key meant for an earlier watch's pill
+        try:
+            while not stop.is_set():
+                sleep(POLL_SECONDS)
+                if stop.is_set():
+                    return
+                now = self._clock()
+                if now >= watch.deadline and watch.pending is None:
+                    log.debug("Edit watch window over")
+                    return
+                if not self._step(watch, now):
+                    return
+        finally:
+            if watch.shown:
+                self._clear(watch)
 
     def _arm(self, inserted: str, stop: threading.Event,
              sleep: Callable[[float], object]) -> Optional[_Watch]:
@@ -193,8 +227,25 @@ class EditWatcher:
             return None
         return text[len(watch.prefix):len(text) - len(watch.suffix)]
 
+    def _clear(self, watch: _Watch) -> None:
+        watch.pending, watch.shown = None, False
+        self._on_pending_cleared()
+
     def _step(self, watch: _Watch, now: float) -> bool:
         """One poll. False ends the watch."""
+        request = self._take_request()
+        if request == "cancel" and watch.pending is not None:
+            log.info("Edit watch: %r cancelled by the user; still watching",
+                     watch.pending.source)
+            self._clear(watch)
+            # Rebase on the edit the user kept but did not want learned, or
+            # it would come back folded into the next correction's diff.
+            region = self._region(watch, watch.last_text)
+            if region:
+                watch.inserted = region
+            return True
+        if request == "save" and watch.pending is not None:
+            watch.confirm_at = now  # saved below, on this very poll
         snapshot = self._snapshot()
         if snapshot is None:
             log.info("Edit watch ended: the field can no longer be read")
@@ -209,6 +260,8 @@ class EditWatcher:
             watch.last_text = snapshot.text
             watch.changed_at = now
             if watch.pending is not None:
+                # The pill stays up while the user types on: the next
+                # candidate replaces it, or it goes once there is none.
                 log.debug("Edit watch: further edit, pending candidate dropped")
                 watch.pending = None
             return True
@@ -221,15 +274,20 @@ class EditWatcher:
                 return False
             candidate = learn_candidate(watch.inserted, region)
             if candidate is None:
+                if watch.shown:
+                    self._clear(watch)
                 return True
-            log.info("Edit watch: candidate %r -> %r, saving in %.0fs",
+            log.info("Edit watch: candidate %r -> %r, saving in %.0fs (Enter = now, Esc = cancel)",
                      candidate.source, candidate.replacement, CONFIRM_SECONDS)
             watch.pending = candidate
             watch.confirm_at = now + CONFIRM_SECONDS
+            watch.shown = True
+            self._on_pending(candidate, getattr(snapshot, "bounds", None))
             return True
 
         if watch.pending is not None and now >= watch.confirm_at:
             candidate, watch.pending = watch.pending, None
+            watch.shown = False
             try:
                 saved = self._learn(candidate)
             except Exception as exc:
@@ -238,6 +296,7 @@ class EditWatcher:
             if not saved:
                 log.info("Edit watch: %r was not saved (already known or declined)",
                          candidate.source)
+                self._on_pending_cleared()
             region = self._region(watch, snapshot.text)
             if not region:
                 return False

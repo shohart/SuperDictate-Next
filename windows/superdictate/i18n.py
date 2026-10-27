@@ -21,11 +21,6 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "status_recording": ("Запись", "Recording"),
     "status_correcting": ("Обработка текста", "Post-processing"),
 
-    # -- vocabulary --------------------------------------------------
-    "vocabulary_learned_title": ("Запомнил:", "Learned:"),
-    "vocabulary_undo": ("Отменить", "Undo"),
-    "vocabulary_undone": ("Правило удалено", "Rule removed"),
-
     # -- post-processing toasts --------------------------------------
     "toast_correction_on": ("Коррекция · вкл", "Correction · on"),
     "toast_correction_off": ("Коррекция · выкл", "Correction · off"),

@@ -62,6 +62,7 @@ VK_LCONTROL, VK_RCONTROL = 0xA2, 0xA3
 VK_LMENU, VK_RMENU = 0xA4, 0xA5
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 VK_ESCAPE = 0x1B
+VK_RETURN = 0x0D
 
 MODIFIER_VK_FLAG: dict[int, int] = {
     VK_LSHIFT: MOD_SHIFT,
@@ -177,6 +178,10 @@ class Action(str, Enum):
     TOGGLE_REWRITE = "toggle_rewrite"
     CYCLE_REWRITE_STYLE = "cycle_rewrite_style"
     REJECTED_BUSY_PRESS = "rejected_busy_press"
+    # The pending learn pill (ui.learn_toast): Enter saves the correction
+    # now, Escape drops it. Only while the pill is up and nothing records.
+    LEARN_SAVE = "learn_save"
+    LEARN_CANCEL = "learn_cancel"
 
 
 class _Edge(str, Enum):
@@ -322,6 +327,7 @@ class HotkeyStateMachine:
         self._enter = _ShortcutState()
         self._toggle_active = False
         self._suppress_escape_up = False
+        self._suppress_return_up = False
         self._was_recording = False
 
     def reset_all(self) -> None:
@@ -334,6 +340,7 @@ class HotkeyStateMachine:
         self._enter.reset()
         self._toggle_active = False
         self._suppress_escape_up = False
+        self._suppress_return_up = False
         self._was_recording = False
 
     def reset_toggle(self) -> None:
@@ -353,6 +360,7 @@ class HotkeyStateMachine:
         rewrite_hotkey: HotkeyChoice = DEFAULT_REWRITE_HOTKEY,
         rewrite_style_hotkey: HotkeyChoice = DEFAULT_REWRITE_STYLE_HOTKEY,
         enter_hotkey: Optional[HotkeyChoice] = None,
+        learn_pending: bool = False,
     ) -> _Result:
         # Recording-start edge (macOS adoptPrimaryModifierDown): an
         # alternate finish built on the dictation key itself has that key
@@ -367,7 +375,9 @@ class HotkeyStateMachine:
         self._was_recording = is_recording
 
         if event.vk == VK_ESCAPE:
-            return self._transition_escape(event, is_recording)
+            return self._transition_escape(event, is_recording, learn_pending)
+        if event.vk == VK_RETURN and (learn_pending or self._suppress_return_up):
+            return self._transition_learn_return(event, is_recording, learn_pending)
 
         if enter_hotkey is not None and (is_recording or self._enter.is_engaged):
             finished = self._transition_enter(event, is_recording, enter_hotkey)
@@ -456,11 +466,17 @@ class HotkeyStateMachine:
         # fall through to the dictation shortcut and then to the app.
         return None
 
-    def _transition_escape(self, event: _Event, is_recording: bool) -> _Result:
+    def _transition_escape(self, event: _Event, is_recording: bool,
+                           learn_pending: bool = False) -> _Result:
         if event.is_down:
             if event.is_repeat and self._suppress_escape_up:
                 return _suppress_only()
             if not is_recording:
+                # The pending learn pill takes a bare Escape; a recording
+                # keeps it, as on macOS, and so does Ctrl+Shift+Esc.
+                if learn_pending and not event.is_repeat and _is_bare_key(event):
+                    self._suppress_escape_up = True
+                    return _Result(True, [Action.LEARN_CANCEL])
                 return _PASS
             self._suppress_escape_up = True
             return _suppress_only() if event.is_repeat else _Result(True, [Action.CANCEL])
@@ -468,6 +484,28 @@ class HotkeyStateMachine:
             self._suppress_escape_up = False
             return _suppress_only()
         return _PASS
+
+    def _transition_learn_return(self, event: _Event, is_recording: bool,
+                                 learn_pending: bool) -> _Result:
+        """Enter on the pending learn pill saves at once. The key-up of a
+        swallowed key-down is swallowed too, so the app never sees half a
+        keystroke; Ctrl+Enter, Alt+Enter and a recording keep their Enter."""
+        if event.is_down:
+            if event.is_repeat and self._suppress_return_up:
+                return _suppress_only()
+            if is_recording or not learn_pending or not _is_bare_key(event):
+                return _PASS
+            self._suppress_return_up = True
+            return _Result(True, [Action.LEARN_SAVE])
+        if self._suppress_return_up:
+            self._suppress_return_up = False
+            return _suppress_only()
+        return _PASS
+
+
+def _is_bare_key(event: _Event) -> bool:
+    """No Ctrl, Alt or Win held (Shift is fine, as on macOS)."""
+    return not event.modifiers & (MOD_CTRL | MOD_ALT | MOD_WIN)
 
 
 def is_altgr_phantom(vk: int, scan_code: int) -> bool:
@@ -582,6 +620,8 @@ class HotkeyListener:
         self.trigger_mode = TriggerMode.TOGGLE
         self.is_recording_active: Callable[[], bool] = lambda: False
         self.can_start_recording: Callable[[], bool] = lambda: True
+        #: The learn pill is waiting for Enter or Escape.
+        self.is_learn_pending: Callable[[], bool] = lambda: False
         # While the shortcut recorder window is open the listener stays
         # installed but stops acting, mirroring the macOS behaviour where
         # keys only record a new shortcut and never start dictation.
@@ -736,6 +776,7 @@ class HotkeyListener:
                     trigger_mode=self.trigger_mode,
                     is_recording=self.is_recording_active(),
                     can_start_recording=self.can_start_recording(),
+                    learn_pending=self.is_learn_pending(),
                 )
             except Exception:  # a raising hook is an evicted hook
                 return user32.CallNextHookEx(None, code, wparam, lparam)

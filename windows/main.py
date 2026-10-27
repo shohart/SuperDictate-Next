@@ -115,7 +115,10 @@ def main(argv: list[str]) -> int:
     controller.paste_redirected.connect(windows.show_warning)
     controller.dictation_failed.connect(windows.show_dictation_failure)
     controller.transcript_ready.connect(lambda _: windows.refresh_history())
-    controller.vocabulary_learned.connect(windows.show_learned_toast)
+    controller.learn_pending.connect(windows.learn_pill.show_pending)
+    controller.learn_pending_cleared.connect(windows.learn_pill.cleared)
+    controller.learn_key.connect(windows.learn_pill.key)
+    controller.vocabulary_learned.connect(lambda _: windows.learn_pill.saved())
     controller.state_toast_requested.connect(windows.show_state_toast)
     controller.loading_toast_requested.connect(windows.show_loading_toast)
     controller.state_changed.connect(windows.on_state_changed)
@@ -156,7 +159,7 @@ class _Windows:
         self._bubble = None
         self._bubble_history = None
         self._toasts = None
-        self._learn_toast = None
+        self._learn_pill = None
         self._state_toasts = None
         self.tray = None
         self._failure_message = ""
@@ -172,32 +175,29 @@ class _Windows:
             self._toasts = ToastManager()
         return self._toasts
 
-    def show_learned_toast(self, pairs: list) -> None:
-        """Offer an undo for rules the app just learned on its own.
+    @property
+    def learn_pill(self):
+        """The pill a correction learned from an edit waits in (Enter saves,
+        Escape drops it), as on macOS."""
+        if self._learn_pill is None:
+            from superdictate.ui import hud
+            from superdictate.ui.learn_toast import LearnPillController
 
-        One toast at a time: a second learn while the first is still up
-        replaces it rather than stacking, so the undo always refers to the
-        rule the user is actually looking at.
-        """
-        if not pairs:
-            return
-        from superdictate.ui.learn_toast import LearnedToast
+            controller = self._controller
 
-        if self._learn_toast is not None:
-            self._learn_toast.confirm()
-        toast = LearnedToast(pairs, on_undo=self._undo_learned)
-        self._learn_toast = toast
-        toast.destroyed.connect(lambda *_: setattr(self, "_learn_toast", None))
-        toast.present()
+            def accent():
+                from PySide6.QtGui import QColor
 
-    def _undo_learned(self, sources: list) -> None:
-        removed = sum(1 for source in sources
-                      if self._controller.corrections.delete_source(source))
-        if removed:
-            from superdictate.ui.toast import Level
-            from superdictate import i18n
+                spec = controller.settings.hud_recording_color.resolved(hud.uses_light_background())
+                return QColor(spec.start)
 
-            self.toasts.show(i18n.tr("vocabulary_undone"), Level.INFO)
+            self._learn_pill = LearnPillController(
+                accent=accent,
+                set_open=lambda value: setattr(controller, "learn_pill_open", value),
+                save_now=controller.edit_watch.confirm_now,
+                cancel=controller.edit_watch.cancel_pending,
+            )
+        return self._learn_pill
 
     @property
     def state_toasts(self):

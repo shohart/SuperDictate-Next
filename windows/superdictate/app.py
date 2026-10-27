@@ -117,8 +117,16 @@ class DictationController(QObject):
     # The speech model moved to another device (the NPU, once its background
     # compile finished); the panel shows the device.
     device_changed = Signal()
-    # Rules just learned, as (source, replacement) pairs. The UI
-    # offers an undo for them; see ui.learn_toast.
+    # A correction found in an edit, waiting out its confirm window:
+    # (source, replacement, field bounds or None). The UI shows the learn
+    # pill (ui.learn_toast); Enter saves now, Escape drops it.
+    learn_pending = Signal(str, str, object)
+    # The pending correction went away unsaved, without a key from the user.
+    learn_pending_cleared = Signal()
+    # Enter (True) or Escape (False) pressed on the pending learn pill.
+    learn_key = Signal(bool)
+    # Rules just learned, as (source, replacement) pairs: the pill plays
+    # its "saved" pulse and goes.
     vocabulary_learned = Signal(list)
     # A short-lived "X is now on/off" card. Carries (text, tone), where the
     # tone is "on", "off", or a rewrite style's value.
@@ -179,7 +187,12 @@ class DictationController(QObject):
         self.edit_watch = edit_watch.EditWatcher(
             lambda: self.focus.read_field().result(timeout=1.0),
             self._learn_from_edit,
+            on_pending=lambda c, bounds: self.learn_pending.emit(c.source, c.replacement, bounds),
+            on_pending_cleared=self.learn_pending_cleared.emit,
             own_pids=frozenset({os.getpid()}))
+        #: Set by the UI while the learn pill waits for a decision; read by
+        #: the keyboard hook, which then routes Enter and Escape to it.
+        self.learn_pill_open = False
         self._insertion_target: Optional[Future] = None
         self._terminating = False
         self.last_error: str = ""
@@ -198,6 +211,7 @@ class DictationController(QObject):
         self.listener = HotkeyListener(self._on_hotkey_actions)
         self._apply_hotkey_settings()
         self.listener.is_recording_active = lambda: self.state is AppState.RECORDING
+        self.listener.is_learn_pending = lambda: self.learn_pill_open
         self.listener.can_start_recording = self._can_start_recording
 
         # Hook-thread callbacks are marshalled onto the Qt thread through
@@ -425,6 +439,10 @@ class DictationController(QObject):
                 self.cycle_rewrite_style()
             elif action is Action.REJECTED_BUSY_PRESS:
                 self.sounds.play("rejected")
+            elif action is Action.LEARN_SAVE:
+                self.learn_key.emit(True)
+            elif action is Action.LEARN_CANCEL:
+                self.learn_key.emit(False)
 
     # -- post-processing shortcuts -------------------------------------
     #
@@ -923,9 +941,8 @@ class DictationController(QObject):
     # -- correcting the last dictation ---------------------------------
 
     def _learn_from_edit(self, candidate) -> list:
-        """Save one rule found by the edit watcher (its thread). The toast
-        is what makes it reversible: a rule learned from a typo the user
-        meant to keep is worse than no learning at all."""
+        """Save one rule found by the edit watcher (its thread), once its
+        pending pill has run out or the user pressed Enter on it."""
         records = self.corrections.learn([(candidate.source, candidate.replacement)])
         if records:
             log.info("Learned a correction from an edit in place: %r -> %r",
