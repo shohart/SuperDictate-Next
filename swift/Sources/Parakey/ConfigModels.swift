@@ -35,6 +35,12 @@ enum RecordingHUDMode {
     /// showCorrectingHUD gates the call), so nothing changes for users
     /// who never turned either feature on.
     case correcting
+    /// While the rewrite stage runs: the correcting motion with letters
+    /// and symbols in place of bars (RecordingHUDView.drawGlyphWave).
+    case rewriting
+    /// While punctuation restoration runs: the same motion with
+    /// punctuation marks.
+    case punctuating
     /// Brief flash shown when a dictation fails (transcription error,
     /// paste failure). Renders a static yellow capsule so the user
     /// gets visual feedback even when the menu-bar icon is hidden.

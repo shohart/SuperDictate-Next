@@ -60,6 +60,13 @@ actor LLMPostprocessingCoordinator {
     var onHostLoadFinished: (@Sendable @MainActor () -> Void)?
     /// Told once when a GPU fault moves the bundled hosts to the CPU.
     var onGPUFallback: (@Sendable @MainActor () -> Void)?
+    /// Told as each stage starts, so the HUD shows that stage's animation
+    /// (correcting bars, rewrite letters, punctuation marks).
+    var onStageStarted: (@Sendable @MainActor (RecordingHUDMode) -> Void)?
+
+    func setStageUI(_ handler: @escaping @Sendable @MainActor (RecordingHUDMode) -> Void) {
+        onStageStarted = handler
+    }
 
     /// Set when a bundled host running on the GPU returned NaN logits (HTTP
     /// 503 from the host) or died mid-request. A broken GPU path does that
@@ -146,12 +153,15 @@ actor LLMPostprocessingCoordinator {
         guard !text.isEmpty else { return text }
         var result = text
         if settings.textPostprocessingMode == .correction {
+            await onStageStarted?(.correcting)
             result = await correctedText(result, settings: settings)
         }
         if settings.rewriteEnabled {
+            await onStageStarted?(.rewriting)
             result = await rewrittenText(result, settings: settings)
         }
         if settings.punctuationRestorationEnabled {
+            await onStageStarted?(.punctuating)
             result = await punctuation.restore(result, settings: settings)
         }
         return result

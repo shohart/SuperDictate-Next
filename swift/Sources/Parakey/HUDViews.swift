@@ -259,7 +259,7 @@ final class RecordingHUDView: NSView {
         // transcription in the same "processing" family, and the product
         // ask was for the SAME color already configured for that stage,
         // just a different animation.
-        case .correcting:   accent = transcribingColor
+        case .correcting, .rewriting, .punctuating: accent = transcribingColor
         case .error:        accent = .systemYellow
         case .recording:    accent = recordingColor
         }
@@ -284,6 +284,15 @@ final class RecordingHUDView: NSView {
         }
         if mode == .correcting {
             drawCorrectingWave(in: capsuleRect, alpha: 1)
+            return
+        }
+        if mode == .rewriting {
+            drawGlyphWave(in: capsuleRect, glyphs: Self.rewriteGlyphs, sizeFactor: 1, alpha: 1)
+            return
+        }
+        if mode == .punctuating {
+            // Marks are thin and small; they get a larger font for the same ink.
+            drawGlyphWave(in: capsuleRect, glyphs: Self.punctuationGlyphs, sizeFactor: 1.3, alpha: 1)
             return
         }
         if mode == .error {
@@ -560,6 +569,84 @@ final class RecordingHUDView: NSView {
                           yRadius: barWidth / 2).fill()
         }
     }
+    static let rewriteGlyphs = ["А", "б", "Ж", "к", "Я", "ю", "Ф", "A", "g", "R", "e", "W", "&", "§", "¶", "@", "ß", "Ω"]
+    static let punctuationGlyphs = [".", ",", "?", "!", ":", ";", "–", "…", "«", "»", "(", ")"]
+
+    /// The rewrite and punctuation animations: `drawCorrectingWave`'s
+    /// motion — the same luminous front sweeping left->right, the same
+    /// raw/refined breathing and gradient — carried by glyphs instead of
+    /// bars. Each slot shows one glyph at a time on its own slow cycle: it
+    /// fades and grows in from nothing, breathes, and fades out to nothing;
+    /// the next glyph is picked only while the slot is invisible, so
+    /// nothing ever flickers or swaps in view. Slots stay inside the
+    /// capsule's straight section, clear of its rounded ends.
+    private func drawGlyphWave(in capsuleRect: NSRect, glyphs: [String], sizeFactor: CGFloat, alpha: CGFloat) {
+        guard alpha > 0.001, !glyphs.isEmpty else { return }
+        let slotCount = 5
+        let visualScale = self.visualScale
+        // About the footprint of the eight correcting bars, a little wider
+        // for glyphs, and never into the rounded ends.
+        let inset = capsuleRect.height * 0.5
+        let totalWidth = min(capsuleRect.width - (2 * inset), 42 * visualScale)
+        guard totalWidth > 0 else { return }
+        let slotWidth = totalWidth / CGFloat(slotCount)
+        let startX = capsuleRect.midX - (totalWidth / 2)
+        let maxFont = min(capsuleRect.height * 0.42, 10.5 * visualScale) * sizeFactor
+        let minFont = maxFont * 0.45
+
+        let sweepPosition = (phase / RECORDING_HUD_CORRECTING_SWEEP_RADIANS)
+            .truncatingRemainder(dividingBy: 1)
+        let seconds = phase / RECORDING_HUD_CORRECTING_PHASE_SPEED
+
+        for index in 0..<slotCount {
+            let i = CGFloat(index)
+            let xNorm = i / CGFloat(slotCount - 1)
+
+            // Same front, band and flash as the correcting bars.
+            var behind = sweepPosition - xNorm
+            if behind < 0 { behind += 1 }
+            let band = smoothstep(0.03, 0.20, behind) * (1 - smoothstep(0.52, 0.92, behind))
+            let dist = min(abs(sweepPosition - xNorm), 1 - abs(sweepPosition - xNorm))
+            let flash = exp(-((dist * dist) / (2 * 0.05 * 0.05)))
+            let raw = 0.30 + (0.10 * sin((2 * .pi * 4 * sweepPosition) + (i * 0.85)))
+            let refined = 0.66 + (0.12 * sin((2 * .pi * 2 * sweepPosition) - (i * 0.32)))
+            let activity = min(1, raw + ((refined - raw) * band) + (0.25 * flash))
+
+            // Per-slot appear/fade cycle, 2.2-3.6 s, offset so the slots
+            // never change together.
+            let period = 2.2 + (0.27 * CGFloat((index * 5) % slotCount))
+            let cycle = (seconds / period) + (CGFloat(index) * 0.37)
+            let cycleIndex = Int(floor(cycle))
+            let progress = cycle - floor(cycle)
+            let visibility = pow(sin(.pi * progress), 2)
+            guard visibility > 0.01 else { continue }
+            let hash = abs((index &* 7_919) &+ (cycleIndex &* 104_729)) % glyphs.count
+            let glyph = glyphs[hash]
+
+            let fontSize = (minFont + ((maxFont - minFont) * activity)) * (0.72 + (0.28 * visibility))
+            var color = transcribingColor.blended(withFraction: xNorm, of: correctingColor) ?? transcribingColor
+            color = color.blended(withFraction: 0.30 * (1 - band), of: .black) ?? color
+            color = color.blended(withFraction: flash * 0.75, of: .white) ?? color
+            let coreAlpha = min(1, 0.62 + (0.34 * band) + (0.40 * flash)) * visibility * alpha
+
+            let shadow = NSShadow()
+            shadow.shadowColor = color.withAlphaComponent(min(1, 0.25 + (0.35 * flash)) * visibility * alpha)
+            shadow.shadowBlurRadius = 2.2 * visualScale
+            shadow.shadowOffset = .zero
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
+                .foregroundColor: color.withAlphaComponent(coreAlpha),
+                .shadow: shadow,
+            ]
+            let string = NSAttributedString(string: glyph, attributes: attributes)
+            let bounds = string.boundingRect(with: NSSize(width: 100, height: 100),
+                                             options: [.usesLineFragmentOrigin, .usesFontLeading])
+            let centerX = startX + ((i + 0.5) * slotWidth)
+            string.draw(at: NSPoint(x: centerX - (bounds.width / 2) - bounds.minX,
+                                    y: capsuleRect.midY - (bounds.height / 2) - bounds.minY))
+        }
+    }
+
     /// Static exclamation mark drawn inside the yellow error capsule.
     private func drawErrorIndicator(in capsuleRect: NSRect) {
         let visualScale = self.visualScale
@@ -641,12 +728,15 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
     // A short `.correcting` segment follows transcription so the export also
     // previews the LLM-improvement animation (one full sweep is 3.2s).
     let correctingDuration = 4.00
+    // Then the rewrite letters and the punctuation marks, 4 s each.
+    let stageDuration = 4.00
     let emptyTail = 0.50
     let totalDuration = emptyLead
         + RECORDING_HUD_ANIMATE_IN_SECONDS
         + recordingDuration
         + transcribingDuration
         + correctingDuration
+        + (2 * stageDuration)
         + RECORDING_HUD_ANIMATE_OUT_SECONDS
         + emptyTail
     let frameCount = Int((totalDuration * framesPerSecond).rounded())
@@ -667,7 +757,9 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
             let recordingStart = revealStart + RECORDING_HUD_ANIMATE_IN_SECONDS
             let transcribingStart = recordingStart + recordingDuration
             let correctingStart = transcribingStart + transcribingDuration
-            let hideStart = correctingStart + correctingDuration
+            let rewritingStart = correctingStart + correctingDuration
+            let punctuatingStart = rewritingStart + stageDuration
+            let hideStart = punctuatingStart + stageDuration
             let tailStart = hideStart + RECORDING_HUD_ANIMATE_OUT_SECONDS
             let reveal: CGFloat
             let level: Float
@@ -700,17 +792,17 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
             } else if time < hideStart {
                 reveal = 1
                 level = 0
-                mode = .correcting
+                mode = time < rewritingStart ? .correcting : (time < punctuatingStart ? .rewriting : .punctuating)
                 transcribingElapsed = nil
             } else if time < tailStart {
                 reveal = 1 - CGFloat((time - hideStart) / RECORDING_HUD_ANIMATE_OUT_SECONDS)
                 level = 0
-                mode = .correcting
+                mode = .punctuating
                 transcribingElapsed = nil
             } else {
                 reveal = 0
                 level = 0
-                mode = .correcting
+                mode = .punctuating
                 transcribingElapsed = nil
             }
             phase += recordingHUDPhaseSpeed(mode: mode, level: level)

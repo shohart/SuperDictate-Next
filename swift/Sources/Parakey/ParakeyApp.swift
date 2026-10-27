@@ -280,6 +280,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onCycleRewriteStyle = { [weak self] in self?.cycleRewriteStyleViaHotkey() }
         hotkey.onActivateRewriteStyle = { [weak self] id in self?.activateRewriteStyleViaHotkey(id) }
         Task { [llmPostprocessing] in
+            await llmPostprocessing.setStageUI { [weak self] mode in
+                self?.switchProcessingHUD(to: mode)
+            }
             await llmPostprocessing.setHostLoadUI(stage: { [weak self] text in
                 self?.stateToastController.showLoading(text: text)
             }, finished: { [weak self] in
@@ -1533,6 +1536,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
               recordingHUDPanel?.isVisible == true else { return }
         updateRecordingHUD(mode: .correcting, level: 0)
         startRecordingHUDMotion()
+    }
+
+    /// Moves the "improving text" HUD to the animation of the stage that
+    /// just started. Only while that HUD is showing: a dictation without a
+    /// HUD, or one already finished, is left alone.
+    private func switchProcessingHUD(to mode: RecordingHUDMode) {
+        guard recordingHUDPanel?.isVisible == true,
+              let current = recordingHUDView?.mode,
+              [.correcting, .rewriting, .punctuating].contains(current),
+              current != mode else { return }
+        updateRecordingHUD(mode: mode, level: 0)
     }
 
     private func hideRecordingHUD() {
