@@ -65,8 +65,11 @@ add_library(sd_asr STATIC
   src/sha256.cpp
   src/families/family.cpp
   src/families/family_util.cpp
+  src/families/bpe_tokenizer.cpp
   src/families/gigaam_rnnt.cpp
+  src/families/modernbert_punct.cpp
   src/families/nemo_tdt.cpp
+  src/families/punct_text.cpp
 )
 target_include_directories(sd_asr
   PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -118,9 +121,13 @@ if(SD_ASR_BUILD_TESTS)
   sd_asr_executable(sd_asr_contract_tests tests/contract_tests.cpp)
   sd_asr_executable(sd_asr_ipc_tests tests/ipc_tests.cpp)
   sd_asr_executable(sd_asr_model_tests tests/model_tests.cpp)
+  sd_asr_executable(sd_asr_punct_tests tests/punct_tests.cpp)
   add_test(NAME contract COMMAND sd_asr_contract_tests "${CMAKE_CURRENT_SOURCE_DIR}/assets")
   add_test(NAME ipc COMMAND sd_asr_ipc_tests)
   # Skips (exit 77) unless SD_ASR_TEST_MODEL_DIR / SD_ASR_TEST_GOLDEN_DIR are set.
   add_test(NAME model COMMAND sd_asr_model_tests "${CMAKE_CURRENT_SOURCE_DIR}/assets")
   set_tests_properties(model PROPERTIES SKIP_RETURN_CODE 77)
+  # Skips (exit 77) unless SD_ASR_TEST_PUNCT_MODEL_DIR is set.
+  add_test(NAME punct COMMAND sd_asr_punct_tests "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+  set_tests_properties(punct PROPERTIES SKIP_RETURN_CODE 77)
 endif()

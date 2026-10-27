@@ -114,6 +114,10 @@ final class Settings: @unchecked Sendable {
     private static let keyCorrectionModelTier = "correction_model_tier_v1"
     private static let keyCorrectionBundledModel = "correction_bundled_model_v2"
     private static let keyRewriteEnabled = "rewrite_enabled_v1"
+    /// Punctuation restoration: the last text stage, after correction and
+    /// rewrite (PunctuationRestoration.swift). Off by default.
+    private static let keyPunctuationRestorationEnabled = "punctuation_restoration_enabled_v1"
+    private static let keyPunctuationModel = "punctuation_model_v1"
     private static let keyRewriteStyle = "rewrite_style_v1"
     private static let keyCustomRewriteStyles = "rewrite_custom_styles_v1"
     private static let keyRewriteBundledModel = "rewrite_bundled_model_v1"
@@ -1089,6 +1093,19 @@ final class Settings: @unchecked Sendable {
     var rewriteEnabled: Bool {
         get { defaults.bool(forKey: Self.keyRewriteEnabled) }
         set { defaults.set(newValue, forKey: Self.keyRewriteEnabled) }
+    }
+
+    var punctuationRestorationEnabled: Bool {
+        get { defaults.bool(forKey: Self.keyPunctuationRestorationEnabled) }
+        set { defaults.set(newValue, forKey: Self.keyPunctuationRestorationEnabled) }
+    }
+
+    /// Which punctuation model runs; Base unless the user picked Small.
+    var punctuationModel: PunctuationModel {
+        get {
+            defaults.string(forKey: Self.keyPunctuationModel).flatMap(PunctuationModel.init(rawValue:)) ?? .base
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyPunctuationModel) }
     }
 
     /// User-edited SYSTEM prompt for the correction pass. Empty string =

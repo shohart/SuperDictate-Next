@@ -71,7 +71,7 @@ DecodeError decode_request_header(const uint8_t *bytes, RequestHeader &out) {
 
     if (std::memcmp(bytes, kRequestMagic, 4) != 0) return DecodeError::BadMagic;
     if (out.version != kVersion) return DecodeError::BadVersion;
-    if (type < uint16_t(MessageType::Create) || type > uint16_t(MessageType::Shutdown)) return DecodeError::BadType;
+    if (type < uint16_t(MessageType::Create) || type > uint16_t(MessageType::Punctuate)) return DecodeError::BadType;
     if (out.json_len > kMaxJsonBytes) return DecodeError::JsonTooLarge;
     if (out.pcm_bytes > kMaxPcmBytes) return DecodeError::PcmTooLarge;
     if (out.pcm_bytes % 4 != 0) return DecodeError::PcmMisaligned;

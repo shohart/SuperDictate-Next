@@ -298,7 +298,17 @@ private func downloadOnnxFile(_ file: OnnxCatalogFile,
 @discardableResult
 func downloadOnnxModelIfNeeded(profile: SpeechModelProfile,
                                progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws -> URL {
-    let modelID = profile.onnxModelID
+    try await downloadOnnxModelIfNeeded(modelID: profile.onnxModelID,
+                                        checkDiskSpace: { try assertSufficientDiskSpaceForSpeechModelDownload(profile: profile) },
+                                        progressHandler: progressHandler)
+}
+
+/// Any catalog model (speech or punctuation) by id. `checkDiskSpace` runs
+/// only when something has to be fetched.
+@discardableResult
+func downloadOnnxModelIfNeeded(modelID: String,
+                               checkDiskSpace: () throws -> Void,
+                               progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws -> URL {
     guard let resources = resolvedOnnxAsrResources() else {
         throw OnnxModelDownloadError.resourcesUnavailable
     }
@@ -335,7 +345,7 @@ func downloadOnnxModelIfNeeded(profile: SpeechModelProfile,
     }
 
     if !missing.isEmpty {
-        try assertSufficientDiskSpaceForSpeechModelDownload(profile: profile)
+        try checkDiskSpace()
         let totalBytes = Double(max(1, missing.reduce(0) { $0 + $1.size }))
         var completedBytes: Int64 = 0
         log("ASR: downloading ONNX model \(modelID) (\(missing.map(\.path).joined(separator: ", ")))")

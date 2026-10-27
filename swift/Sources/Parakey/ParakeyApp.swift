@@ -1528,7 +1528,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// A no-op if the HUD panel isn't visible at all (e.g. showRecordingWaveform
     /// disabled, or the silent startup-recovery path that never shows a HUD).
     private func showCorrectingHUD() {
-        guard settings.textPostprocessingMode == .correction || settings.rewriteEnabled,
+        guard settings.textPostprocessingMode == .correction || settings.rewriteEnabled
+                || settings.punctuationRestorationEnabled,
               recordingHUDPanel?.isVisible == true else { return }
         updateRecordingHUD(mode: .correcting, level: 0)
         startRecordingHUDMotion()

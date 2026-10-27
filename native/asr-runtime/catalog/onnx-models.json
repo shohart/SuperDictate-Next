@@ -110,6 +110,66 @@
         "max_symbols_per_frame": 3,
         "pred_hidden": 320
       }
+    },
+    {
+      "model_id": "punct-small-int8",
+      "display_name": "Punctuation restoration Small (140M, ONNX int8)",
+      "family": "modernbert_punct",
+      "kind": "punctuation",
+      "source": "https://huggingface.co/Horizon-Labs/punctuation-restoration-small",
+      "base_model": "jhu-clsp/mmBERT-small",
+      "revision": "ee31fdfc5304f876ea3b0dd72d30eda7e940b2b1",
+      "license": "Apache-2.0",
+      "attribution": "Horizon Labs (punctuation-restoration), JHU CLSP (mmBERT)",
+      "quantization": "int8",
+      "languages": ["multilingual"],
+      "capabilities": {"punctuation": true},
+      "providers": ["cpu"],
+      "files": {
+        "model": {
+          "path": "model.int8.onnx",
+          "url": "https://huggingface.co/Horizon-Labs/punctuation-restoration-small/resolve/ee31fdfc5304f876ea3b0dd72d30eda7e940b2b1/onnx/model_quantized.onnx",
+          "size": 268414381,
+          "sha256": "5679870be92c7fa47c9be9b2872fac389ef28d43d2c33f35e1315b93a82f4ace"
+        },
+        "tokenizer": {
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/Horizon-Labs/punctuation-restoration-small/resolve/ee31fdfc5304f876ea3b0dd72d30eda7e940b2b1/tokenizer.json",
+          "size": 34363286,
+          "sha256": "f34b44a6dc8a0eef651bfa10e8325057530152606a69d9c3b6ae02efb1558f0a"
+        }
+      },
+      "params": {"labels": ["0", ".", ",", "?", "-", ":"], "cls_id": 2, "sep_id": 1, "chunk_tokens": 400, "overlap_tokens": 50}
+    },
+    {
+      "model_id": "punct-base-int8",
+      "display_name": "Punctuation restoration Base (307M, ONNX int8)",
+      "family": "modernbert_punct",
+      "kind": "punctuation",
+      "source": "https://huggingface.co/Horizon-Labs/punctuation-restoration-base",
+      "base_model": "jhu-clsp/mmBERT-base",
+      "revision": "63ec204eeed976c17dee33cb4677753ba2c9b605",
+      "license": "Apache-2.0",
+      "attribution": "Horizon Labs (punctuation-restoration), JHU CLSP (mmBERT)",
+      "quantization": "int8",
+      "languages": ["multilingual"],
+      "capabilities": {"punctuation": true},
+      "providers": ["cpu"],
+      "files": {
+        "model": {
+          "path": "model.int8.onnx",
+          "url": "https://huggingface.co/Horizon-Labs/punctuation-restoration-base/resolve/63ec204eeed976c17dee33cb4677753ba2c9b605/onnx/model_quantized.onnx",
+          "size": 641137205,
+          "sha256": "42f52bb955a7e158e629b4ee59d22ae75300b2ec37b7fb01fea80c09d9566fce"
+        },
+        "tokenizer": {
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/Horizon-Labs/punctuation-restoration-base/resolve/63ec204eeed976c17dee33cb4677753ba2c9b605/tokenizer.json",
+          "size": 34363286,
+          "sha256": "f34b44a6dc8a0eef651bfa10e8325057530152606a69d9c3b6ae02efb1558f0a"
+        }
+      },
+      "params": {"labels": ["0", ".", ",", "?", "-", ":"], "cls_id": 2, "sep_id": 1, "chunk_tokens": 400, "overlap_tokens": 50}
     }
   ]
 }

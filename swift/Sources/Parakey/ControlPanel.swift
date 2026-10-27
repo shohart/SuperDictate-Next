@@ -96,6 +96,8 @@ struct ControlPanelSettingsDraft: Equatable {
     /// instead of writing a replacement from scratch.
     var correctionSystemPrompt: String
     var rewriteEnabled: Bool
+    var punctuationRestorationEnabled: Bool
+    var punctuationModel: PunctuationModel
     var rewriteStyleID: String
     var customRewriteStyles: [CustomRewriteStyle]
     var rewriteBundledModel: BundledLLMModel
@@ -152,6 +154,8 @@ struct ControlPanelSettingsDraft: Equatable {
                 : override
         }()
         rewriteEnabled = settings.rewriteEnabled
+        punctuationRestorationEnabled = settings.punctuationRestorationEnabled
+        punctuationModel = settings.punctuationModel
         rewriteStyleID = settings.rewriteStyleID
         customRewriteStyles = settings.customRewriteStyles
         rewriteBundledModel = settings.rewriteBundledModel
@@ -246,6 +250,12 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private var llmModelDownloadProgress: (received: Int64, total: Int64)?
     private weak var llmDownloadStatusLabel: NSTextField?
     private weak var llmDownloadProgressBar: NSProgressIndicator?
+    private var punctuationDownloadTask: Task<Void, Never>?
+    private var punctuationDownloadModel: PunctuationModel?
+    private var punctuationDownloadFraction: Double?
+    private var punctuationDownloadError: String?
+    private weak var punctuationDownloadStatusLabel: NSTextField?
+    private weak var punctuationDownloadProgressBar: NSProgressIndicator?
     /// Which bundled LLM model an in-flight download is for (the Settings
     /// UI offers every benchmark-listed model as an independent download).
     private var llmModelDownloadModel: BundledLLMModel = .voiceScribe
@@ -808,6 +818,13 @@ case .text:
                 || (draft.rewriteEnabled && draft.rewriteEngineBackend == .customEndpoint)
             if usesCustomEndpoint {
                 content.addArrangedSubview(llmProxyRow(draft))
+            }
+            // Punctuation restoration — the last stage, after correction and
+            // rewrite (PunctuationRestoration.swift).
+            content.addArrangedSubview(punctuationModeRow(draft))
+            if draft.punctuationRestorationEnabled {
+                content.addArrangedSubview(punctuationModelRow(draft))
+                content.addArrangedSubview(punctuationModelStatusRow(model: draft.punctuationModel))
             }
 
         case .audio:
@@ -2435,6 +2452,124 @@ header.addArrangedSubview(panelLabel(
         return row
     }
 
+    private func punctuationModeRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Восстановление пунктуации", "Punctuation restoration"),
+            size: 13,
+            weight: .semibold
+        ))
+        let detail = panelLabel(
+            t("Последний этап после коррекции и рерайта: отдельная модель расставляет запятые, точки, вопросительные знаки, двоеточия и тире. Уже стоящие точки, «!» и «?» не убирает. Работает локально на процессоре.",
+              "The last stage, after correction and rewrite: a separate model places commas, periods, question marks, colons and dashes. It never removes periods, \"!\" or \"?\" that are already there. Runs locally on the CPU."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(togglePunctuationRestoration(_:))
+        toggle.state = draft.punctuationRestorationEnabled ? .on : .off
+        toggle.toolTip = t("Восстанавливать пунктуацию моделью.", "Restore punctuation with a model.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func punctuationModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Модель пунктуации", "Punctuation model"),
+            detail: t("Base точнее, Small быстрее и легче: ~60 и ~25 мс на фразу, ~1,5 и ~0,7 ГБ памяти.",
+                      "Base is more accurate, Small is faster and lighter: ~60 and ~25 ms per sentence, ~1.5 and ~0.7 GB of memory."),
+            selectedValue: draft.punctuationModel.rawValue,
+            options: PunctuationModel.allCases.map { model in
+                (model.displayName + (model == .base ? t(" — рекомендуется", " — recommended") : ""), model.rawValue)
+            },
+            action: #selector(selectPunctuationModel(_:)),
+            toolTip: t("Выбрать модель восстановления пунктуации.", "Choose the punctuation restoration model.")
+        )
+    }
+
+    private func punctuationModelStatusRow(model: PunctuationModel) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel("Horizon Labs punctuation-restoration \(model.displayName)",
+                                           size: 13, weight: .semibold))
+        let inFlight = punctuationDownloadTask != nil && punctuationDownloadModel == model
+        let ready = punctuationModelInstalled(model)
+        let statusText: String
+        let statusColor: NSColor
+        if inFlight {
+            statusText = t("Скачивание… \(Int((punctuationDownloadFraction ?? 0) * 100))%",
+                           "Downloading… \(Int((punctuationDownloadFraction ?? 0) * 100))%")
+            statusColor = .systemBlue
+        } else if let error = punctuationDownloadError, punctuationDownloadModel == model {
+            statusText = error
+            statusColor = .systemRed
+        } else if ready {
+            statusText = t("Готова · Apache-2.0", "Ready · Apache-2.0")
+            statusColor = .systemGreen
+        } else {
+            statusText = t("Не скачана (\(formattedByteCount(UInt64(model.downloadBytes)))). Пока модели нет, текст вставляется без этого этапа.",
+                           "Not downloaded (\(formattedByteCount(UInt64(model.downloadBytes)))). Until it is, text is inserted without this stage.")
+            statusColor = .secondaryLabelColor
+        }
+        let statusLabel = panelLabel(statusText, size: 12, color: statusColor)
+        statusLabel.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(statusLabel)
+        if inFlight { punctuationDownloadStatusLabel = statusLabel }
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        if inFlight {
+            row.addArrangedSubview(panelButton(t("Отменить", "Cancel"), action: #selector(cancelPunctuationModelDownload(_:))))
+        } else if !ready {
+            row.addArrangedSubview(panelButton(t("Скачать", "Download"), action: #selector(startPunctuationModelDownload(_:))))
+        }
+        container.addArrangedSubview(row)
+
+        if inFlight {
+            let bar = NSProgressIndicator()
+            bar.style = .bar
+            bar.controlSize = .small
+            bar.isIndeterminate = false
+            bar.minValue = 0
+            bar.maxValue = 1
+            bar.doubleValue = punctuationDownloadFraction ?? 0
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+            container.addArrangedSubview(bar)
+            bar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+            punctuationDownloadProgressBar = bar
+        }
+        return container
+    }
+
     private func rewriteStyleRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Режим реврайта", "Rewrite style"),
@@ -3133,6 +3268,61 @@ header.addArrangedSubview(panelLabel(
             draft.correctionSystemPrompt = defaultCorrectionSystemPrompt(for: model)
         }
         settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func togglePunctuationRestoration(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.punctuationRestorationEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectPunctuationModel(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let model = PunctuationModel(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.punctuationModel = model
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func startPunctuationModelDownload(_ sender: NSButton) {
+        guard punctuationDownloadTask == nil else { return }
+        let model = (settingsDraft ?? ControlPanelSettingsDraft(settings: settings)).punctuationModel
+        punctuationDownloadModel = model
+        punctuationDownloadFraction = 0
+        punctuationDownloadError = nil
+        refreshSettingsWindow()
+        punctuationDownloadTask = Task { [weak self, model] in
+            do {
+                try await downloadPunctuationModelIfNeeded(model, progressHandler: { [weak self] fraction in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.punctuationDownloadFraction = fraction
+                        // Direct view updates, as for the LLM download.
+                        self.punctuationDownloadStatusLabel?.stringValue = self.t(
+                            "Скачивание… \(Int(fraction * 100))%", "Downloading… \(Int(fraction * 100))%")
+                        self.punctuationDownloadProgressBar?.doubleValue = fraction
+                    }
+                })
+            } catch is CancellationError {
+            } catch {
+                guard let self else { return }
+                self.punctuationDownloadError = self.t("Не удалось скачать модель: \(error.localizedDescription)",
+                                                       "Couldn't download the model: \(error.localizedDescription)")
+            }
+            guard let self else { return }
+            self.punctuationDownloadTask = nil
+            self.punctuationDownloadFraction = nil
+            self.refreshSettingsWindow()
+        }
+    }
+
+    @objc private func cancelPunctuationModelDownload(_ sender: NSButton) {
+        punctuationDownloadTask?.cancel()
+        punctuationDownloadTask = nil
+        punctuationDownloadFraction = nil
         refreshSettingsWindow()
     }
 
@@ -4380,6 +4570,8 @@ header.addArrangedSubview(panelLabel(
                 forStyleID: styleEntry.id)
         }
         settings.rewriteEnabled = draft.rewriteEnabled
+        settings.punctuationRestorationEnabled = draft.punctuationRestorationEnabled
+        settings.punctuationModel = draft.punctuationModel
         settings.rewriteStyleID = draft.rewriteStyleID
         settings.customRewriteStyles = draft.customRewriteStyles
         settings.rewriteBundledModel = draft.rewriteBundledModel

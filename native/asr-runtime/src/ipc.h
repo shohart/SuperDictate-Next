@@ -26,6 +26,7 @@ enum class MessageType : uint16_t {
     Status = 3,
     Cancel = 4,
     Shutdown = 5,
+    Punctuate = 6,  // body {"text": "..."}, no PCM
 };
 
 struct RequestHeader {

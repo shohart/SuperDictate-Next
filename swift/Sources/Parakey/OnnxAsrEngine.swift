@@ -50,7 +50,7 @@ private enum OnnxIPC {
     static let maxJSONBytes: UInt32 = 1 << 20
 
     enum MessageType: UInt16 {
-        case create = 1, transcribe = 2, status = 3, cancel = 4, shutdown = 5
+        case create = 1, transcribe = 2, status = 3, cancel = 4, shutdown = 5, punctuate = 6
     }
 
     // sd_asr_status values (include/sd_asr.h).
@@ -226,6 +226,19 @@ actor OnnxAsrEngine {
         } catch {
             throw ASREngineError.tokenDecodeFailed(error.localizedDescription)
         }
+    }
+
+    /// Punctuation restoration with a text model (model_family
+    /// "modernbert_punct"); a speech model answers invalid_argument.
+    func punctuate(text: String) throws -> (text: String, processingSeconds: Double) {
+        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+        // ~60 ms per sentence on the CPU; the bound is for a stuck host.
+        let object = try roundTrip(type: .punctuate, json: body,
+                                   timeoutSeconds: 20 + Double(text.utf8.count) / 500)
+        guard let punctuated = object["text"] as? String else {
+            throw OnnxAsrEngineError.invalidResponse("missing text")
+        }
+        return (punctuated, object["processing_seconds"] as? Double ?? 0)
     }
 
     func shutdown() {

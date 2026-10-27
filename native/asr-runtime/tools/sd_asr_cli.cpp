@@ -3,8 +3,11 @@
 //
 //   sd_asr_cli --model <dir> --assets <dir> [--provider cpu] [--threads N]
 //              [--text-only] [--repeat N] file.wav...
+//   sd_asr_cli --model <punctuation model dir> --punctuate [--text-only] < lines.txt
+//              (one input line -> one output line)
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -17,6 +20,7 @@ int main(int argc, char **argv) {
     int threads = 0;
     int repeat = 1;
     bool text_only = false;
+    bool punctuate = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -33,9 +37,10 @@ int main(int argc, char **argv) {
         else if (arg == "--threads") threads = std::stoi(value("--threads"));
         else if (arg == "--repeat") repeat = std::stoi(value("--repeat"));
         else if (arg == "--text-only") text_only = true;
+        else if (arg == "--punctuate") punctuate = true;
         else files.push_back(arg);
     }
-    if (model_dir.empty() || files.empty()) {
+    if (model_dir.empty() || (files.empty() && !punctuate)) {
         std::fprintf(stderr, "usage: sd_asr_cli --model <dir> [--assets <dir>] [--provider p] [--threads n] "
                              "[--repeat n] [--text-only] file.wav...\n");
         return 64;
@@ -56,6 +61,27 @@ int main(int argc, char **argv) {
     sd_asr_free(status);
 
     int exit_code = 0;
+    if (punctuate) {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            char *result = nullptr;
+            if (sd_asr_punctuate_utf8(handle, line.c_str(), nullptr, &result, &error) != SD_ASR_OK) {
+                std::fprintf(stderr, "punctuate failed: %s\n", error ? error : "?");
+                sd_asr_free(error);
+                error = nullptr;
+                exit_code = 1;
+                std::printf("\n");
+                continue;
+            }
+            if (text_only) {
+                std::printf("%s\n", nlohmann::json::parse(result)["text"].get<std::string>().c_str());
+            } else {
+                std::printf("%s\n", result);
+            }
+            std::fflush(stdout);
+            sd_asr_free(result);
+        }
+    }
     for (const auto &file : files) {
         sdasr::WavAudio wav;
         std::string wav_error;

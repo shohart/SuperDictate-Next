@@ -212,6 +212,9 @@ sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle, const float *mono
     if (result_json) *result_json = nullptr;
     if (error_json) *error_json = nullptr;
     if (handle == nullptr) return fail(error_json, SD_ASR_INVALID_ARGUMENT, "handle is NULL");
+    if (sdasr::is_text_family(handle->manifest.family)) {
+        return fail(error_json, SD_ASR_INVALID_ARGUMENT, "this model restores punctuation; it does not transcribe audio");
+    }
 
     bool expected = false;
     if (!handle->busy.compare_exchange_strong(expected, true)) {
@@ -294,6 +297,76 @@ sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle, const float *mono
         }
         handle->requests_completed.fetch_add(1);
         set_out(result_json, result);
+        return SD_ASR_OK;
+    } catch (const Error &e) {
+        handle->requests_failed.fetch_add(1);
+        return fail(error_json, e.status(), e.what());
+    } catch (const std::exception &e) {
+        handle->requests_failed.fetch_add(1);
+        return fail(error_json, SD_ASR_INFERENCE_FAILED, e.what());
+    } catch (...) {
+        handle->requests_failed.fetch_add(1);
+        return fail(error_json, SD_ASR_INFERENCE_FAILED, "unknown error");
+    }
+}
+
+sd_asr_status sd_asr_punctuate_utf8(sd_asr_handle *handle, const char *text, const char *options_json,
+                                    char **result_json, char **error_json) {
+    if (result_json) *result_json = nullptr;
+    if (error_json) *error_json = nullptr;
+    if (handle == nullptr) return fail(error_json, SD_ASR_INVALID_ARGUMENT, "handle is NULL");
+    if (text == nullptr) return fail(error_json, SD_ASR_INVALID_ARGUMENT, "text is NULL");
+
+    bool expected = false;
+    if (!handle->busy.compare_exchange_strong(expected, true)) {
+        return fail(error_json, SD_ASR_BUSY, "another request is running on this handle");
+    }
+    struct BusyReset {
+        sd_asr_handle *h;
+        ~BusyReset() {
+            std::lock_guard<std::mutex> lock(h->request_mutex);
+            h->current_run_options = nullptr;
+            h->current_request_id.clear();
+            h->busy.store(false);
+        }
+    } busy_reset{handle};
+
+    try {
+        const json options = parse_object(options_json, "options");
+        std::string request_id = get_or<std::string>(options, "request_id", "");
+        if (request_id.empty()) request_id = std::to_string(handle->next_request_number.fetch_add(1));
+
+        Ort::RunOptions run_options;
+        {
+            std::lock_guard<std::mutex> lock(handle->request_mutex);
+            handle->cancelled.store(false);
+            handle->current_request_id = request_id;
+            handle->current_run_options = &run_options;
+        }
+        sdasr::RunContext context{&run_options, &handle->cancelled};
+
+        const auto started = Clock::now();
+        std::string punctuated;
+        try {
+            punctuated = handle->family->punctuate(text, context);
+        } catch (const Ort::Exception &e) {
+            if (handle->cancelled.load()) throw Error(SD_ASR_CANCELLED, "request cancelled");
+            throw Error(SD_ASR_INFERENCE_FAILED, e.what());
+        }
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        {
+            std::lock_guard<std::mutex> lock(handle->request_mutex);
+            handle->last_processing_seconds = seconds;
+            handle->last_rtf = 0;
+        }
+        handle->requests_completed.fetch_add(1);
+        set_out(result_json, json{
+                                 {"text", punctuated},
+                                 {"model_id", handle->manifest.model_id},
+                                 {"request_id", request_id},
+                                 {"processing_seconds", seconds},
+                                 {"provider_actual", handle->factory->resolution().actual},
+                             });
         return SD_ASR_OK;
     } catch (const Error &e) {
         handle->requests_failed.fetch_add(1);

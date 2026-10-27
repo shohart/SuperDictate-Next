@@ -80,7 +80,11 @@ bool Manifest::has_capability(const std::string &name) const {
 }
 
 bool is_supported_family(const std::string &family) {
-    return family == "nemo_tdt" || family == "gigaam_rnnt";
+    return family == "nemo_tdt" || family == "gigaam_rnnt" || is_text_family(family);
+}
+
+bool is_text_family(const std::string &family) {
+    return family == "modernbert_punct";
 }
 
 bool is_safe_file_name(const std::string &name) {
@@ -125,11 +129,14 @@ Manifest load_manifest(const fs::path &model_dir, const fs::path &assets_dir, bo
     manifest.license = optional_string(document, "license");
     manifest.quantization = optional_string(document, "quantization");
     auto rate = document.find("sample_rate");
-    if (rate == document.end() || !rate->is_number_unsigned() || rate->get<uint64_t>() == 0 ||
+    if (is_text_family(manifest.family) && rate == document.end()) {
+        manifest.sample_rate = 0;  // text in, text out
+    } else if (rate == document.end() || !rate->is_number_unsigned() || rate->get<uint64_t>() == 0 ||
         rate->get<uint64_t>() > 192000) {
         invalid("manifest: missing or invalid 'sample_rate'");
+    } else {
+        manifest.sample_rate = rate->get<uint32_t>();
     }
-    manifest.sample_rate = rate->get<uint32_t>();
     manifest.languages = string_array(document, "languages");
     manifest.providers = string_array(document, "providers");
     if (manifest.providers.empty()) manifest.providers.push_back("cpu");

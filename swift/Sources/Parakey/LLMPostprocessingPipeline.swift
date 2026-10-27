@@ -46,6 +46,9 @@ import Foundation
 // view.
 actor LLMPostprocessingCoordinator {
     private var hostProcesses: [String: LLMHostProcess] = [:]
+    /// The third and last stage, after correction and rewrite
+    /// (PunctuationRestoration.swift).
+    let punctuation = PunctuationRestorer()
 
     /// UI feedback for COLD host starts: loading a multi-GB model takes
     /// tens of seconds on first use, and without this the user stares at
@@ -122,8 +125,8 @@ actor LLMPostprocessingCoordinator {
 
     /// Applies the configured postprocessing stages to already-
     /// deterministically-corrected text. A no-op (returns `text`
-    /// unchanged, no async work) when neither stage is enabled or the
-    /// text is empty.
+    /// unchanged, no async work) when no stage is enabled or the text is
+    /// empty. Order: correction, rewrite, punctuation restoration.
     ///
     /// Foreign-term/script normalization (atom §14.1) is NOT done here.
     /// It already ran, before this function was ever called, as part of
@@ -147,6 +150,9 @@ actor LLMPostprocessingCoordinator {
         }
         if settings.rewriteEnabled {
             result = await rewrittenText(result, settings: settings)
+        }
+        if settings.punctuationRestorationEnabled {
+            result = await punctuation.restore(result, settings: settings)
         }
         return result
     }
@@ -246,6 +252,7 @@ actor LLMPostprocessingCoordinator {
         for host in hostProcesses.values {
             await host.stop()
         }
+        await punctuation.unload()
         hostProcesses.removeAll()
         // The GPU toggle stops the hosts before restarting them: a fresh
         // choice deserves a fresh try on the GPU.
@@ -260,6 +267,9 @@ actor LLMPostprocessingCoordinator {
     /// and before every dictation's postprocessing. Hosts still needed —
     /// e.g. a shared host while the other stage stays on — keep running.
     func unloadHostsNoLongerNeeded(settings: Settings) async {
+        if !settings.punctuationRestorationEnabled {
+            await punctuation.unload()
+        }
         let needed = Self.neededHostIdentities(settings: settings)
         for (identity, host) in hostProcesses where !needed.contains(identity) {
             await host.stop()
@@ -277,6 +287,8 @@ actor LLMPostprocessingCoordinator {
     /// lazy start in `finalizedText` to try again.
     func prewarmNeededHosts(settings: Settings) async {
         await unloadHostsNoLongerNeeded(settings: settings)
+        // Its own process on the CPU: loads alongside the LLM hosts.
+        Task { [punctuation] in await punctuation.prewarm(settings: settings) }
         var models: [(identity: String, model: BundledLLMModel, rewrite: Bool)] = []
         if settings.textPostprocessingMode == .correction, settings.llmEngineBackend == .bundledLocal {
             let model = settings.correctionBundledModel

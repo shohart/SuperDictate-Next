@@ -488,3 +488,56 @@ func runLLMDiagnostic(arguments: [String]) -> Int32? {
     }
     return exitCode.value
 }
+
+/// Production-shipped check of punctuation restoration for
+/// scripts/verify-release.sh: the real coordinator with only that stage on,
+/// SuperDictateOnnxHost from this bundle and the model from the app cache.
+///
+/// usage: SuperDictate --diagnose-punctuation small|base <text>
+///
+/// Prints one `PUNCT_DIAG` line. Fails when the model is not downloaded or
+/// the text comes back unchanged.
+func runPunctuationDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--diagnose-punctuation" else { return nil }
+    guard arguments.count == 3, let model = PunctuationModel(rawValue: arguments[1]) else {
+        fputs("usage: SuperDictate --diagnose-punctuation small|base <text>\n", stderr)
+        return EXIT_FAILURE
+    }
+    let text = arguments[2]
+    guard punctuationModelInstalled(model) else {
+        fputs("PUNCT_DIAG_FAILED: \(model.onnxModelID) is not downloaded\n", stderr)
+        return EXIT_FAILURE
+    }
+    let suite = "com.local.superdictate.diagnose-punctuation"
+    UserDefaults().removePersistentDomain(forName: suite)
+    let settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: .inMemoryFallback())
+    settings.textPostprocessingMode = .off
+    settings.rewriteEnabled = false
+    settings.punctuationRestorationEnabled = true
+    settings.punctuationModel = model
+
+    let semaphore = DispatchSemaphore(value: 0)
+    let exitCode = DiagnosticExitCode()
+    Task.detached {
+        defer { semaphore.signal() }
+        let coordinator = LLMPostprocessingCoordinator()
+        let started = ProcessInfo.processInfo.systemUptime
+        await coordinator.punctuation.prewarm(settings: settings)
+        let warmed = ProcessInfo.processInfo.systemUptime
+        let output = await coordinator.finalizedText(text, settings: settings)
+        let done = ProcessInfo.processInfo.systemUptime
+        let loaded = await coordinator.punctuation.isLoadedForTest
+        await coordinator.stop()
+        print(String(format: "PUNCT_DIAG model=%@ load=%.1fs request=%.3fs loaded=%@ output=\"%@\"",
+                     model.rawValue, warmed - started, done - warmed, "\(loaded)", output))
+        var problems: [String] = []
+        if !loaded { problems.append("the model host did not load") }
+        if output == text { problems.append("the text came back unchanged") }
+        for problem in problems { fputs("PUNCT_DIAG_FAILED: \(problem)\n", stderr) }
+        exitCode.set(problems.isEmpty ? EXIT_SUCCESS : EXIT_FAILURE)
+    }
+    while semaphore.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    return exitCode.value
+}

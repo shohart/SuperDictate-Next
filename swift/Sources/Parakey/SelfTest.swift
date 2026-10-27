@@ -190,6 +190,10 @@ enum ParakeySelfTest {
             return runSuite("llm-rewrite-settings", testRewriteAndTierSettings)
         case "llm-proxy-policy":
             return runSuite("llm-proxy-policy", testLLMProxyPolicy)
+        case "punctuation-settings":
+            return runSuite("punctuation-settings", testPunctuationSettings)
+        case "punctuation-real":
+            return runSuite("punctuation-real", testPunctuationRestorationReal)
         case "llm-gec":
             return runSuite("llm-gec", testLLMGECIntegration)
         case "llm-rewrite":
@@ -273,6 +277,7 @@ enum ParakeySelfTest {
         try testLLMCorrectionGuardrail()
         try testRewriteAndTierSettings()
         try testLLMProxyPolicy()
+        try testPunctuationSettings()
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
@@ -3400,6 +3405,73 @@ enum ParakeySelfTest {
     /// internet ones honour it. Endpoint URLs given with or without `/v1`
     /// reach `/v1/chat/completions`. Mirrors test_llm_proxy_policy on
     /// Windows.
+    /// Punctuation restoration settings and the stage's pass-through when
+    /// it is off or its model is missing (no model, no host).
+    private static func testPunctuationSettings() throws {
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.punct-\(UUID().uuidString)")!,
+                                vocabularyStore: .inMemoryFallback())
+        try expect(settings.punctuationRestorationEnabled, equals: false, "punctuation restoration is off by default")
+        try expect(settings.punctuationModel, equals: .base, "Base is the default punctuation model")
+        settings.punctuationModel = .small
+        try expect(settings.punctuationModel, equals: .small, "the model choice persists")
+        try expect(PunctuationModel.small.onnxModelID, equals: "punct-small-int8", "small catalog id")
+        try expect(PunctuationModel.base.onnxModelID, equals: "punct-base-int8", "base catalog id")
+        if let resources = resolvedOnnxAsrResources() {
+            for model in PunctuationModel.allCases {
+                let entry = try loadOnnxCatalogEntry(modelID: model.onnxModelID, catalogURL: resources.catalogURL)
+                try expect(entry.files.reduce(0) { $0 + $1.size }, equals: model.downloadBytes,
+                           "\(model.rawValue): downloadBytes matches the catalog")
+            }
+        }
+
+        settings.textPostprocessingMode = .off
+        settings.rewriteEnabled = false
+        let coordinator = LLMPostprocessingCoordinator()
+        let off = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("привет как дела", settings: settings)
+        }
+        try expect(off, equals: "привет как дела", "with every stage off the text passes through")
+    }
+
+    /// The real Base (or Small) model through the coordinator: needs it
+    /// downloaded into the app cache (Settings → Correction → Punctuation).
+    private static func testPunctuationRestorationReal() throws {
+        guard let model = [PunctuationModel.base, .small].first(where: punctuationModelInstalled) else {
+            print("SKIP punctuation-real: no punctuation model in \(onnxModelCacheDirectory(modelID: "punct-base-int8").path)")
+            return
+        }
+        let settings = Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.punct-real-\(UUID().uuidString)")!,
+                                vocabularyStore: .inMemoryFallback())
+        settings.textPostprocessingMode = .off
+        settings.rewriteEnabled = false
+        settings.punctuationRestorationEnabled = true
+        settings.punctuationModel = model
+        let coordinator = LLMPostprocessingCoordinator()
+        let started = ProcessInfo.processInfo.systemUptime
+        let first = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("Когда ты придёшь домой позвони мне пожалуйста", settings: settings)
+        }
+        print("punctuation-real: \(model.rawValue) first request (incl. load) \(String(format: "%.2f", ProcessInfo.processInfo.systemUptime - started)) s: \(first)")
+        try expect(first, equals: "Когда ты придёшь домой, позвони мне, пожалуйста.", "commas and the final period")
+        // Existing sentence ends survive; empty text passes through.
+        let second = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("Ура! пошли гулять", settings: settings)
+        }
+        try expect(second.hasPrefix("Ура!"), equals: true, "an existing \"!\" is kept: \(second)")
+        let empty = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("   ", settings: settings)
+        }
+        try expect(empty, equals: "   ", "blank text passes through")
+        // Turning the stage off frees the model host.
+        settings.punctuationRestorationEnabled = false
+        _ = try runParakeetEngineSynchronously {
+            await coordinator.finalizedText("ещё раз", settings: settings)
+        }
+        let loaded = try runParakeetEngineSynchronously { await coordinator.punctuation.isLoadedForTest }
+        try expect(loaded, equals: false, "switching the stage off unloads the model")
+        try runParakeetEngineSynchronously { await coordinator.stop() }
+    }
+
     private static func testLLMProxyPolicy() throws {
         for host in ["127.0.0.1", "127.10.0.2", "192.168.1.10", "10.0.0.5",
                      "172.16.0.1", "172.31.255.255", "169.254.1.1",

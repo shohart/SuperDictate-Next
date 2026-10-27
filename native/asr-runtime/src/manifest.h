@@ -46,6 +46,8 @@ inline constexpr int kManifestSchema = 1;
 // Known model families. A manifest naming anything else is refused with
 // SD_ASR_UNSUPPORTED_MODEL_FAMILY.
 bool is_supported_family(const std::string &family);
+// Families that take text instead of audio (no sample_rate).
+bool is_text_family(const std::string &family);
 
 // True for a plain file name: non-empty, no path separators, not "." or
 // "..", no NUL, not absolute, no drive letter.

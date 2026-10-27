@@ -82,6 +82,17 @@ SD_ASR_API sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle,
                                                    char **result_json,
                                                    char **error_json);
 
+/* Restores punctuation in UTF-8 `text` with a text model
+ * (model_family "modernbert_punct"). `*result_json` is
+ * {"text":..., "model_id":..., "request_id":..., "processing_seconds":...}.
+ * A speech model returns SD_ASR_INVALID_ARGUMENT. Same busy/cancel rules
+ * as a transcription. */
+SD_ASR_API sd_asr_status sd_asr_punctuate_utf8(sd_asr_handle *handle,
+                                               const char *text,
+                                               const char *options_json,
+                                               char **result_json,
+                                               char **error_json);
+
 /* Requests cancellation of the running request whose id equals
  * `request_id`, or of any running request when `request_id` is "*" or
  * NULL. Returns SD_ASR_OK when a running request was signalled and

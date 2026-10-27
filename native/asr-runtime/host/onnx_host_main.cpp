@@ -1,5 +1,6 @@
-// SuperDictateOnnxHost — one ONNX ASR model per process, driven over
-// stdin/stdout with framed IPC v1 (src/ipc.h, spec §8).
+// SuperDictateOnnxHost — one ONNX model (speech, or punctuation restoration
+// for text) per process, driven over stdin/stdout with framed IPC v1
+// (src/ipc.h, spec §8).
 //
 // Threads: the main thread only reads frames, so CANCEL / STATUS stay
 // responsive while a TRANSCRIBE runs on the single worker thread. Every
@@ -191,6 +192,40 @@ int main() {
                     state.worker_running.store(false);
                     const std::string response = status == SD_ASR_OK ? take(result) : take(error);
                     sd_asr_free(status == SD_ASR_OK ? error : result);  // the other one is NULL; belt and braces
+                    if (!respond(id, status, response)) {
+                        log_line("stdout closed; exiting");
+                        std::_Exit(0);
+                    }
+                });
+                break;
+            }
+            case ipc::MessageType::Punctuate: {
+                if (!state.handle) {
+                    respond(header.request_id, SD_ASR_INVALID_ARGUMENT,
+                            error_body(SD_ASR_INVALID_ARGUMENT, "no model loaded (send CREATE first)"));
+                    break;
+                }
+                if (state.worker_running.load()) {
+                    respond(header.request_id, SD_ASR_BUSY, error_body(SD_ASR_BUSY, "another request is running"));
+                    break;
+                }
+                const json request = body.empty() ? json::object() : json::parse(body, nullptr, false);
+                if (!request.is_object() || !request.contains("text") || !request["text"].is_string()) {
+                    respond(header.request_id, SD_ASR_INVALID_ARGUMENT,
+                            error_body(SD_ASR_INVALID_ARGUMENT, "body must be {\"text\": \"...\"}"));
+                    break;
+                }
+                state.join_worker();
+                state.worker_running.store(true);
+                state.worker = std::thread([&state, id = header.request_id, text = request["text"].get<std::string>(),
+                                            options_text = json{{"request_id", std::to_string(header.request_id)}}.dump()] {
+                    char *result = nullptr;
+                    char *error = nullptr;
+                    const sd_asr_status status =
+                        sd_asr_punctuate_utf8(state.handle, text.c_str(), options_text.c_str(), &result, &error);
+                    state.worker_running.store(false);
+                    const std::string response = status == SD_ASR_OK ? take(result) : take(error);
+                    sd_asr_free(status == SD_ASR_OK ? error : result);
                     if (!respond(id, status, response)) {
                         log_line("stdout closed; exiting");
                         std::_Exit(0);

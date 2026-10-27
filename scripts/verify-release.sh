@@ -18,7 +18,9 @@
 #   3. correction on the GPU and the CPU, rewrite on the GPU, through the
 #      real coordinator (`SuperDictate --diagnose-llm`);
 #   4. speech recognition (Parakeet, and GigaAM if downloaded) on a `say`
-#      recording (`SuperDictate --benchmark-transcribe`).
+#      recording (`SuperDictate --benchmark-transcribe`);
+#   5. punctuation restoration with every downloaded model
+#      (`SuperDictate --diagnose-punctuation`).
 # Never touches /Applications or the LaunchAgent. Any failure exits non-zero.
 # No `set -e`: a checker must run every check and report each failure.
 set -uo pipefail
@@ -143,6 +145,27 @@ for asr in $asr_models; do
         failed "ASR $asr: $(grep -E 'BENCH_RESULT|BENCH_FAILED' "$WORK/asr.out" | tail -1)"
     fi
 done
+
+step "5. Punctuation restoration through the shipped coordinator"
+# Same rule as --diagnose-llm: never pass a bundle an argument it does not know.
+if ! grep -q -- "--diagnose-punctuation" "$BIN"; then
+    failed "this build has no --diagnose-punctuation: punctuation restoration was not checked"
+else
+    punct_models=""
+    for size in base small; do
+        [[ -f "$HOME/Library/Application Support/SuperDictate/onnx/punct-$size-int8/manifest.json" ]] \
+            && punct_models="$punct_models $size"
+    done
+    [[ -n "$punct_models" ]] || failed "no punctuation model downloaded (Settings → Correction → Punctuation restoration)"
+    for size in $punct_models; do
+        if with_timeout 300 "$BIN" --diagnose-punctuation "$size" "когда ты придёшь домой позвони мне пожалуйста" \
+            > "$WORK/punct.out" 2>&1 && grep -q "домой, позвони мне, пожалуйста" "$WORK/punct.out"; then
+            pass "punctuation $size: $(grep '^PUNCT_DIAG ' "$WORK/punct.out" | sed 's/^PUNCT_DIAG //')"
+        else
+            failed "punctuation $size: $(grep 'PUNCT_DIAG' "$WORK/punct.out" | tr '\n' ' ')"
+        fi
+    done
+fi
 
 echo
 if (( failures > 0 )); then

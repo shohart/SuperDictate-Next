@@ -51,3 +51,8 @@ respective upstream projects.
   [istupakov/gigaam-v3-onnx](https://huggingface.co/istupakov/gigaam-v3-onnx)
   (MIT), an ONNX export of [GigaAM](https://github.com/salute-developers/GigaAM)
   v3 by SberDevices / GigaChat Team (MIT).
+- Punctuation restoration weights (downloaded at runtime, not bundled):
+  [Horizon-Labs/punctuation-restoration-small](https://huggingface.co/Horizon-Labs/punctuation-restoration-small)
+  and [-base](https://huggingface.co/Horizon-Labs/punctuation-restoration-base)
+  (Apache-2.0), fine-tunes of [mmBERT](https://huggingface.co/jhu-clsp/mmBERT-base)
+  by JHU CLSP (MIT).

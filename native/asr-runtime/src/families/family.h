@@ -42,6 +42,9 @@ class ModelFamily {
 public:
     virtual ~ModelFamily() = default;
     virtual FamilyResult transcribe(const std::vector<float> &samples, RunContext &context) = 0;
+    // Text families (punctuation restoration) override this; speech
+    // families refuse it.
+    virtual std::string punctuate(const std::string &text, RunContext &context);
 };
 
 // Throws Error(SD_ASR_UNSUPPORTED_MODEL_FAMILY / SD_ASR_INVALID_MODEL /
@@ -51,5 +54,6 @@ std::unique_ptr<ModelFamily> create_model_family(const Manifest &manifest, const
 // Per-family constructors behind create_model_family (family.cpp).
 std::unique_ptr<ModelFamily> create_nemo_tdt_family(const Manifest &manifest, const SessionFactory &factory);
 std::unique_ptr<ModelFamily> create_gigaam_rnnt_family(const Manifest &manifest, const SessionFactory &factory);
+std::unique_ptr<ModelFamily> create_modernbert_punct_family(const Manifest &manifest, const SessionFactory &factory);
 
 }  // namespace sdasr

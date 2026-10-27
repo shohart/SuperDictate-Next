@@ -9,6 +9,7 @@
 #include "audio.h"
 #include "common.h"
 #include "families/family_util.h"
+#include "families/punct_text.h"
 #include "manifest.h"
 #include "nlohmann/json.hpp"
 #include "sd_asr.h"
@@ -326,6 +327,36 @@ TEST_CASE("gigaam space rule matches onnx-asr text, words re-join to it") {
         CHECK(!sdasr::is_word_code_point(cp));
     }
     CHECK(sdasr::is_space_code_point(U' ') && sdasr::is_space_code_point(U'\u00A0') && !sdasr::is_space_code_point(U'\u2581'));
+}
+
+TEST_CASE("punctuation merge keeps sentence ends, applies the model elsewhere") {
+    auto run = [](const std::string &text, const std::vector<std::string> &labels) {
+        return sdasr::merge_punct_labels(sdasr::split_punct_words(text), labels);
+    };
+    // New marks; the word after a new sentence end is capitalised.
+    CHECK_EQ(run("привет как дела", {".", "0", "?"}), std::string("привет. Как дела?"));
+    // An existing "!" survives the model's "."; a lone "." may become "?".
+    CHECK_EQ(run("Ура! пошли.", {".", "?"}), std::string("Ура! Пошли?"));
+    // Existing commas the model disagrees with go away; ";" stays.
+    CHECK_EQ(run("раз, два; три", {"0", ",", "."}), std::string("раз два; три."));
+    // An abbreviation the model does not end a sentence at keeps the next word.
+    CHECK_EQ(run("т.е. мы", {"0", "."}), std::string("т.е. мы."));
+    // Standalone dashes: kept as typed, new ones are em dashes in Cyrillic.
+    CHECK_EQ(run("вот - это", {".", "0"}), std::string("вот - это"));
+    CHECK_EQ(run("вот это", {"-", "0"}), std::string("вот \u2014 это"));
+    CHECK_EQ(run("so this", {"-", "."}), std::string("so - this."));
+    // Detached marks join the word before; numbers keep inner marks.
+    CHECK_EQ(run("слово ? 3.14", {"0", "0"}), std::string("слово? 3.14"));
+    CHECK_EQ(run("«да» ушёл", {".", "0"}), std::string("«да». Ушёл"));
+    CHECK(sdasr::split_punct_words("  \t ").empty());
+    CHECK_EQ(sdasr::capitalize_first_letter("«ёлка"), std::string("«Ёлка"));
+    CHECK_EQ(sdasr::capitalize_first_letter("123"), std::string("123"));
+}
+
+TEST_CASE("modernbert_punct is a supported text family without sample_rate") {
+    CHECK(sdasr::is_supported_family("modernbert_punct"));
+    CHECK(sdasr::is_text_family("modernbert_punct"));
+    CHECK(!sdasr::is_text_family("nemo_tdt"));
 }
 
 int main(int argc, char **argv) {
