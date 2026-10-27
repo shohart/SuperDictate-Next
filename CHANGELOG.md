@@ -8,7 +8,7 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## 0.9.2 — 2026-10-27
 
-macOS (`mac-v0.9.2`); Windows (`win-v0.9.2`) follows with the same change.
+macOS (`mac-v0.9.2`) and Windows (`win-v0.9.2`).
 
 ### Changed
 - **Local rewrite answers sooner: its prompt is cached like the correction prompt.** A rewrite style's instructions are about 240 of a request's ~275 prompt tokens, the same in every request. The local model now keeps them prepared and reads only your dictation, from the first dictation after the app starts. With YandexGPT doing both correction and rewrite, the prompt work per dictation is:
@@ -30,6 +30,7 @@ macOS (`mac-v0.9.2`); Windows (`win-v0.9.2`) follows with the same change.
 ### Validation
 - macOS: the self-tests `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline` and `punctuation-real` pass. `llm-prefix-primer` now also checks a host shared by both stages: 159 correction tokens and 240 rewrite tokens are reused on every alternating request. `scripts/verify-release.sh` passes on this zip.
 - macOS 0.9.2 (build 65), x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `6458433c7dfdbd72c74da167f9f3bba591a49da77dd9dd1897c0b78f8240eb08`.
+- Windows: 68 self-tests pass. `SuperDictate-0.9.2-setup.exe` SHA-256: `8ff54c133efc083dca3838e4ab2cd6819e2dfc661e7830a6d5d235f59d090535`.
 
 ## 0.9.1 — 2026-10-27
 
