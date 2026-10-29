@@ -94,3 +94,9 @@ def test_events_log_every_accepted_change():
     with service.db() as conn:
         rows = conn.execute("SELECT source, replacement, platform FROM events WHERE source = 'клод'").fetchall()
     assert [tuple(r) for r in rows] == [("клод", "Claude", "")]
+
+
+def test_index_page():
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "SuperDictate" in r.text

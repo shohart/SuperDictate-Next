@@ -36,6 +36,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Iterator, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 DB_PATH = os.environ.get("VOCAB_SYNC_DB", "/data/vocab-sync.sqlite")
@@ -360,6 +361,24 @@ def push(body: PushRequest, account_id: int = Depends(current_account)) -> SyncR
                  int(change.deleted), change.updated_at))
         conn.execute("UPDATE accounts SET revision = ? WHERE id = ?", (revision, account_id))
         return _changes_since(conn, account_id, max(0, body.since))
+
+
+_INDEX_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SuperDictate Next — синхронизация словаря</title>
+<style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#222}
+@media (prefers-color-scheme:dark){body{background:#1c1c1e;color:#eee}}</style></head>
+<body><h1>SuperDictate Next</h1>
+<p>Сервер синхронизации словаря работает. Веб-интерфейса нет: войдите в приложении,
+в настройках словаря → «Синхронизация словаря».</p>
+<p lang="en">Vocabulary sync server. Sign in from the SuperDictate Next app.</p>
+</body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index() -> str:
+    return _INDEX_HTML
 
 
 @app.get("/healthz")
