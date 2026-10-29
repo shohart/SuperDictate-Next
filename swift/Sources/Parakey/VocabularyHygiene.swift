@@ -76,7 +76,11 @@ enum VocabularyHygiene {
         }
 
         // Rule 8: case unification against the other entries' replacements.
-        replacement = unifiedCase(of: replacement, among: existing)
+        // A case fix of the source itself («Github → GitHub») is the user
+        // choosing the casing, so it is kept as typed.
+        if source.lowercased() != replacement.lowercased() {
+            replacement = unifiedCase(of: replacement, among: existing.filter { key($0.source) != sourceKey })
+        }
 
         // Rule 7b: entries `X → source` now point at the final replacement.
         let rewrites = existing
@@ -352,10 +356,16 @@ enum VocabularyHygiene {
         // recently updated entry.
         var references = manual.map { VocabularyRecord(id: $0.id, source: $0.source, replacement: trimEdges($0.replacement),
                                                        origin: .manual, createdAt: $0.createdAt, updatedAt: $0.updatedAt) }
-        references += survivors.map { VocabularyRecord(id: $0.record.id, source: $0.source, replacement: $0.replacement,
-                                                       origin: .learned, createdAt: $0.record.createdAt,
-                                                       updatedAt: $0.record.updatedAt) }
-        for index in survivors.indices {
+        // Case fixes («Github → GitHub») are the user's explicit casing:
+        // they neither vote nor change.
+        let isCaseFix = { (survivor: (source: String, replacement: String)) in
+            survivor.source.lowercased() == survivor.replacement.lowercased()
+        }
+        references += survivors.filter { !isCaseFix(($0.source, $0.replacement)) }.map {
+            VocabularyRecord(id: $0.record.id, source: $0.source, replacement: $0.replacement,
+                             origin: .learned, createdAt: $0.record.createdAt, updatedAt: $0.record.updatedAt)
+        }
+        for index in survivors.indices where !isCaseFix((survivors[index].source, survivors[index].replacement)) {
             let unified = unifiedCase(of: survivors[index].replacement, among: references)
             if unified != survivors[index].replacement {
                 survivors[index].replacement = unified

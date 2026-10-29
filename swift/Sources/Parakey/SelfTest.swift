@@ -3979,7 +3979,7 @@ enum ParakeySelfTest {
             ("Pypline.", "Pipline.", [hygieneRecord(143, "Pipline.", "Pipeline.")], accept("Pypline", "Pipeline")),
             // §1 case conflicts: manual casing wins, else the newest entry
             ("Гетхаб.", "Github.", [manualGitHub], accept("Гетхаб", "GitHub")),
-            ("Зип,", "Zip,", [hygieneRecord(140, "ЗИП", "ZIP", updated: "2026-10-28T10:55:18Z")], accept("Зип", "ZIP")),
+            ("Зип,", "Zip,", [hygieneRecord(140, "ЗИП", "ZIP", updated: "2026-10-28T10:55:18Z")], accept("Зип", "Zip")),  // same key: the newer casing replaces it
             ("Интернейшн", "international",
              [hygieneRecord(12, "Интернейшнал.", "International.", updated: "2026-08-13T09:19:28Z")],
              accept("Интернейшн", "International")),
