@@ -83,6 +83,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var autoLearnVocabularyEnabled: Bool
     var asrHotwordsEnabled: Bool
     var asrHotwordsStrength: AsrHotwordsStrength
+    var polterTypeWordlistExportEnabled: Bool
     var textPostprocessingMode: TextPostprocessingMode
     var llmEngineBackend: LLMEngineBackend
     var llmCustomBaseURL: String
@@ -144,6 +145,7 @@ struct ControlPanelSettingsDraft: Equatable {
         autoLearnVocabularyEnabled = settings.autoLearnVocabularyEnabled
         asrHotwordsEnabled = settings.asrHotwordsEnabled
         asrHotwordsStrength = settings.asrHotwordsStrength
+        polterTypeWordlistExportEnabled = settings.polterTypeWordlistExportEnabled
         textPostprocessingMode = settings.textPostprocessingMode
         llmEngineBackend = settings.llmEngineBackend
         llmCustomBaseURL = settings.llmCustomBaseURL
@@ -598,6 +600,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         if draft.asrHotwordsEnabled {
             root.addArrangedSubview(asrHotwordsStrengthRow(draft))
         }
+        root.addArrangedSubview(polterTypeExportRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -790,6 +793,7 @@ case .text:
             if draft.asrHotwordsEnabled {
                 content.addArrangedSubview(asrHotwordsStrengthRow(draft))
             }
+            content.addArrangedSubview(polterTypeExportRow(draft))
             content.addArrangedSubview(separator())
             content.addArrangedSubview(vocabularySyncSection())
 
@@ -2103,6 +2107,47 @@ header.addArrangedSubview(panelLabel(
         toggle.state = draft.asrHotwordsEnabled ? .on : .off
         toggle.toolTip = t("Подсказывать модели распознавания термины из словаря (hotwords).",
                            "Bias the speech model toward vocabulary terms (hotwords).")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func polterTypeExportRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Передавать словарь в PolterType", "Share the vocabulary with PolterType"),
+            size: 13,
+            weight: .semibold
+        ))
+        let installed = PolterTypeWordlistExport.defaultWordlistDirectory() != nil
+        let detail = panelLabel(
+            installed
+                ? t("Правильные написания из словаря попадают в словари переключателя раскладок PolterType: он перестаёт «исправлять» ваши термины и предлагает их в подсказках. В PolterType нужно нажать «Reload Settings» или перезапустить его.",
+                    "Correct spellings from the vocabulary go into the PolterType layout switcher's wordlists: it stops \"fixing\" your terms and offers them as suggestions. Press \"Reload Settings\" in PolterType or restart it.")
+                : t("PolterType не найден: он ещё ни разу не запускался под этим пользователем.",
+                    "PolterType not found: it has never run for this user."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(togglePolterTypeExportSetting(_:))
+        toggle.state = draft.polterTypeWordlistExportEnabled ? .on : .off
+        toggle.isEnabled = installed || draft.polterTypeWordlistExportEnabled
         toggle.setContentHuggingPriority(.required, for: .horizontal)
 
         row.addArrangedSubview(text)
@@ -4664,6 +4709,13 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
+    @objc private func togglePolterTypeExportSetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.polterTypeWordlistExportEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectAsrHotwordsStrength(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let strength = AsrHotwordsStrength(rawValue: raw) else { return }
@@ -4867,6 +4919,10 @@ header.addArrangedSubview(panelLabel(
         settings.autoLearnVocabularyEnabled = draft.autoLearnVocabularyEnabled
         settings.asrHotwordsEnabled = draft.asrHotwordsEnabled
         settings.asrHotwordsStrength = draft.asrHotwordsStrength
+        settings.polterTypeWordlistExportEnabled = draft.polterTypeWordlistExportEnabled
+        if draft.polterTypeWordlistExportEnabled {
+            PolterTypeWordlistExport.exportIfEnabled(settings: settings, trigger: "settings")
+        }
         settings.textPostprocessingMode = draft.textPostprocessingMode
         settings.llmEngineBackend = draft.llmEngineBackend
         settings.llmCustomBaseURL = draft.llmCustomBaseURL

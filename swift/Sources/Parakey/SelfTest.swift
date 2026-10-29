@@ -79,6 +79,8 @@ enum ParakeySelfTest {
             return runSuite("asr-hotwords", testAsrHotwords)
         case "vocabulary-hygiene":
             return runSuite("vocabulary-hygiene", testVocabularyHygiene)
+        case "poltertype-export":
+            return runSuite("poltertype-export", testPolterTypeWordlistExport)
         case "vocabulary-cleanup-dry-run":
             // Prints the cleanup plan for a COPY of a corrections.sqlite
             // at SD_VOCAB_CLEANUP_DB; never applies it. Not part of `all`.
@@ -261,6 +263,7 @@ enum ParakeySelfTest {
         try testTranscriptCorrections()
         try testVocabularyStore()
         try testAsrHotwords()
+        try testPolterTypeWordlistExport()
         try testVocabularyHygiene()
         try testLearnCandidateDetector()
         try testFillerWordRemoval()
@@ -4333,6 +4336,59 @@ enum ParakeySelfTest {
         try runParakeetEngineSynchronously { [engine = a.engine] in await engine.signOut() }
         try expect(a.engine.isSignedIn, equals: false, "sign-out drops the token")
         try expect(a.settings.vocabularySyncLastServerRevision, equals: 0, "sign-out resets the cursor")
+    }
+
+    private static func testPolterTypeWordlistExport() throws {
+        typealias Export = PolterTypeWordlistExport
+        try expect(Export.words(in: "Gmail watcher,"), equals: ["Gmail", "watcher"], "split on spaces and punctuation")
+        try expect(Export.words(in: "Нью-Йорк, O'Reilly —"), equals: ["Нью-Йорк", "O'Reilly"], "inner hyphen and apostrophe kept")
+        try expect(Export.words(in: "37А 1mm. Alien_skaarj"), equals: [], "tokens with digits or underscores dropped whole")
+        try expect(Export.words(in: "X и «ЕГРЮЛ»"), equals: ["ЕГРЮЛ"], "single letters dropped, quotes stripped")
+        try expect(Export.stem(for: "Docker"), equals: "en_us", "Latin")
+        try expect(Export.stem(for: "café"), equals: "en_us", "Latin-1 letters count as Latin")
+        try expect(Export.stem(for: "Ничипуренко"), equals: "ru_ru", "Cyrillic")
+        try expect(Export.stem(for: "Київ"), equals: "uk_ua", "a letter Russian lacks")
+        try expect(Export.stem(for: "DDRпамять"), equals: nil, "mixed scripts")
+
+        let records = [("гитхаб", "GitHub"), ("Гетхаб.", "Github."), ("красненькову", "Красникову"),
+                       ("хаггинг фейс", "Hugging Face"), ("Нечепуренко", "Ничипуренко"), ("тридцать семь. А", "37А")]
+            .enumerated().map { VocabularyRecord(id: Int64($0.offset), source: $0.element.0, replacement: $0.element.1,
+                                                 origin: .learned, createdAt: "", updatedAt: "") }
+        let grouped = Export.wordsByStem(from: records)
+        try expect(grouped["en_us"] ?? [], equals: ["Face", "GitHub", "Hugging"], "replacements only, case-insensitive dedupe, sorted")
+        try expect(grouped["ru_ru"] ?? [], equals: ["Красникову", "Ничипуренко"], "misrecognised sources never exported")
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("poltertype-export-selftest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = try Export.export(records: records, to: directory)
+        try expect(first.written, equals: ["en_us", "ru_ru"], "first export writes the stems that have words")
+        let ruURL = directory.appendingPathComponent("ru_ru-extras.txt")
+        try expect(try String(contentsOf: ruURL, encoding: .utf8),
+                   equals: Export.managedHeader + "Красникову\nНичипуренко\n", "managed file contents")
+        try expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent("uk_ua-extras.txt").path),
+                   equals: false, "no file for a stem without words")
+        let second = try Export.export(records: records, to: directory)
+        try expect(second.written, equals: [], "unchanged export writes nothing")
+        try expect(second.unchanged, equals: ["en_us", "ru_ru"], "both reported up to date")
+
+        // A stem that lost its words is emptied, not left stale.
+        let latinOnly = try Export.export(records: Array(records.prefix(2)), to: directory)
+        try expect(latinOnly.written, equals: ["en_us", "ru_ru"], "shrunk export rewrites both")
+        try expect(try String(contentsOf: ruURL, encoding: .utf8), equals: Export.managedHeader, "emptied managed file")
+
+        // The user's own file is never overwritten.
+        let enURL = directory.appendingPathComponent("en_us-extras.txt")
+        try Data("kubectl\n".utf8).write(to: enURL)
+        let guarded = try Export.export(records: records, to: directory)
+        try expect(guarded.foreign, equals: ["en_us"], "unmanaged file reported")
+        try expect(try String(contentsOf: enURL, encoding: .utf8), equals: "kubectl\n", "unmanaged file untouched")
+
+        let suite = "com.local.superdictate.selftest.poltertype-export"
+        UserDefaults().removePersistentDomain(forName: suite)
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: .inMemoryFallback())
+        try expect(settings.polterTypeWordlistExportEnabled, equals: false, "export is off by default")
     }
 
     private static func testAsrHotwords() throws {

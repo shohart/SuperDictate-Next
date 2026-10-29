@@ -74,6 +74,7 @@ final class Settings: @unchecked Sendable {
     private static let keyDidMigrateTranscriptCorrectionsToSQLite = "did_migrate_transcript_corrections_to_sqlite_v1"
     private static let keyAutoLearnVocabularyEnabled = "auto_learn_vocabulary_enabled_v1"
     private static let keyAsrHotwordsEnabled = "asr_hotwords_enabled_v1"
+    private static let keyPolterTypeWordlistExportEnabled = "poltertype_wordlist_export_enabled_v1"
     private static let keyAsrHotwordsStrength = "asr_hotwords_strength_v1"
     // Account sync of the vocabulary (spec vocabulary-hygiene-and-sync §4.1).
     private static let keyVocabularySyncEnabled = "vocabulary_sync_enabled_v1"
@@ -901,6 +902,14 @@ final class Settings: @unchecked Sendable {
             defaults.object(forKey: Self.keyAsrHotwordsEnabled) as? Bool ?? true
         }
         set { defaults.set(newValue, forKey: Self.keyAsrHotwordsEnabled) }
+    }
+
+    /// Keep PolterType's `<stem>-extras.txt` overlays in step with the
+    /// vocabulary (PolterTypeWordlistExport.swift). Off by default: it
+    /// writes into another application's configuration.
+    var polterTypeWordlistExportEnabled: Bool {
+        get { defaults.object(forKey: Self.keyPolterTypeWordlistExportEnabled) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Self.keyPolterTypeWordlistExportEnabled) }
     }
 
     var asrHotwordsStrength: AsrHotwordsStrength {

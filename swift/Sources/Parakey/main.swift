@@ -52,6 +52,8 @@ if let benchmarkResult = runASRBenchmarkDiagnostic(arguments: launchArguments) {
     exit(llmResult)
 } else if let punctuationResult = runPunctuationDiagnostic(arguments: launchArguments) {
     exit(punctuationResult)
+} else if let polterTypeResult = runPolterTypeExportDiagnostic(arguments: launchArguments) {
+    exit(polterTypeResult)
 } else if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {

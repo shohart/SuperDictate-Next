@@ -600,3 +600,38 @@ func runPunctuationDiagnostic(arguments: [String]) -> Int32? {
     }
     return exitCode.value
 }
+
+/// `--export-poltertype-wordlists [directory]`: write the vocabulary into
+/// PolterType's managed `<stem>-extras.txt` overlays (PolterTypeWordlistExport.swift).
+/// PolterType picks them up on "Reload Settings" or its next start.
+func runPolterTypeExportDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--export-poltertype-wordlists" else { return nil }
+    guard arguments.count <= 2 else {
+        fputs("usage: SuperDictate --export-poltertype-wordlists [wordlists-directory]\n", stderr)
+        return EXIT_FAILURE
+    }
+    let directory: URL
+    if arguments.count == 2 {
+        directory = URL(fileURLWithPath: arguments[1], isDirectory: true)
+    } else if let found = PolterTypeWordlistExport.defaultWordlistDirectory() {
+        directory = found
+    } else {
+        fputs("POLTERTYPE_EXPORT_FAILED: PolterType has no configuration directory for this user (has it ever run?)\n", stderr)
+        return EXIT_FAILURE
+    }
+    do {
+        let dbURL = try superDictateApplicationSupportDirectory()
+            .appendingPathComponent("corrections.sqlite", isDirectory: false)
+        let store = try VocabularyStore(fileURL: dbURL)
+        let outcome = try PolterTypeWordlistExport.export(records: store.all(), to: directory)
+        let counts = PolterTypeWordlistExport.stems.map { "\($0)=\(outcome.counts[$0] ?? 0)" }.joined(separator: " ")
+        print("POLTERTYPE_EXPORT dir=\(directory.path) \(counts) written=\(outcome.written) unchanged=\(outcome.unchanged)")
+        for stem in outcome.foreign {
+            fputs("POLTERTYPE_EXPORT_SKIPPED: \(stem)-extras.txt is not managed by SuperDictate; left untouched\n", stderr)
+        }
+        return outcome.foreign.isEmpty ? EXIT_SUCCESS : EXIT_FAILURE
+    } catch {
+        fputs("POLTERTYPE_EXPORT_FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+}

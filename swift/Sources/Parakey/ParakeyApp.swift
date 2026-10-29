@@ -173,6 +173,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Account sync of the vocabulary (VocabularySync.swift): the agent owns
     // the automatic triggers (launch, 5 s after a local edit, every 15 min).
     private lazy var vocabularySync = VocabularySyncCoordinator(settings: settings, role: .agent)
+    private lazy var polterTypeWordlistSync = PolterTypeWordlistSync(settings: settings)
     private let stateToastController = StateToastController()
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
@@ -381,6 +382,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setMenuBarState(.loading)
         startCorrectionSyncIfConfigured()
         vocabularySync.start()
+        polterTypeWordlistSync.start()
         rebuildMenu()
 
         audio.onConfigurationChange = { [weak self] in
