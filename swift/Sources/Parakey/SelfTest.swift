@@ -4183,6 +4183,12 @@ enum ParakeySelfTest {
         for merge in plan.merges {
             print("MERGE   keep id=\(merge.keptId) «\(merge.keptSource)» ← \(merge.removed.map { "id=\($0.id) «\($0.source)»" }.joined(separator: ", "))")
         }
+        // SD_VOCAB_CLEANUP_APPLY=1 applies the plan to the COPY through the
+        // same store method as «Почистить словарь…».
+        if ProcessInfo.processInfo.environment["SD_VOCAB_CLEANUP_APPLY"] == "1" {
+            try store.applyCleanup(plan)
+            print("CLEANUP APPLIED to the copy: \(store.count()) entries left")
+        }
     }
 
     // MARK: - Vocabulary account sync (spec vocabulary-hygiene-and-sync §4, §5)
