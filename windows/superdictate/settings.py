@@ -346,11 +346,37 @@ _DEFAULTS: dict[str, Any] = {
     "rewrite_custom_base_url_v1": "",
     "rewrite_custom_api_key_v1": "",
     "rewrite_custom_model_name_v1": "",
+    # ASR hotwords (docs/specs/asr-hotwords-spec.md §8): the vocabulary's
+    # terms are handed to the speech model itself. normal = 2.0, strong = 3.0.
+    "asr_hotwords_enabled": True,
+    "asr_hotwords_strength": "normal",
+    # Account sync of the vocabulary (vocabulary-hygiene-and-sync spec §4).
+    # Everything but the server URL is written by the sync itself, never
+    # by the settings window's draft (see _RUNTIME_KEYS). The token is not
+    # here: it lives DPAPI-protected next to this file (vocabulary_sync).
+    "vocabulary_sync_enabled": False,
+    "vocabulary_sync_server_url": "https://superdictate.bykovlegal.ru",
+    "vocabulary_sync_email": "",
+    "vocabulary_sync_last_server_revision": 0,
+    "vocabulary_sync_last_pushed_local_stamp": "",
+    "vocabulary_sync_last_synced_at": 0.0,
     "last_seen_version": "",
     "skipped_versions": [],
     "update_reminder_paused_version": "",
     "update_reminder_paused_until": 0.0,
 }
+
+
+#: Written by the app while it runs, never by the settings window: its
+#: draft is a snapshot taken when it opened, and saving that would roll
+#: back a sign-in or the sync cursors that happened meanwhile.
+_RUNTIME_KEYS = frozenset({
+    "vocabulary_sync_enabled",
+    "vocabulary_sync_email",
+    "vocabulary_sync_last_server_revision",
+    "vocabulary_sync_last_pushed_local_stamp",
+    "vocabulary_sync_last_synced_at",
+})
 
 
 class Settings:
@@ -418,6 +444,14 @@ class Settings:
 
     def apply(self, changes: dict[str, Any]) -> None:
         """Apply a whole draft at once, the macOS `Save and restart` flow."""
+        with self._lock:
+            for key, value in changes.items():
+                if key in _DEFAULTS and key not in _RUNTIME_KEYS:
+                    self._data[key] = value
+        self.save()
+
+    def update_runtime(self, changes: dict[str, Any]) -> None:
+        """Write keys the app itself owns (the sync state) and save."""
         with self._lock:
             for key, value in changes.items():
                 if key in _DEFAULTS:
@@ -753,6 +787,62 @@ class Settings:
             custom_styles=custom,
             custom_style_id=str(self._get("rewrite_custom_style_id_v1") or ""),
         )
+
+    # -- ASR hotwords ---------------------------------------------------
+
+    @property
+    def asr_hotwords_enabled(self) -> bool:
+        return bool(self._get("asr_hotwords_enabled"))
+
+    @property
+    def asr_hotwords_strength(self) -> str:
+        from .asr_hotwords import DEFAULT_STRENGTH, STRENGTH_SCORES
+
+        value = str(self._get("asr_hotwords_strength") or "")
+        return value if value in STRENGTH_SCORES else DEFAULT_STRENGTH
+
+    def asr_hotwords_configuration(self, phrases):
+        """What the next dictation sends: ``phrases`` (the store's
+        selection) with the chosen weight, or nothing when switched off."""
+        from .asr_hotwords import DISABLED, HotwordsConfiguration, strength_score
+
+        if not self.asr_hotwords_enabled:
+            return DISABLED
+        return HotwordsConfiguration(phrases=tuple(phrases),
+                                     score=strength_score(self.asr_hotwords_strength))
+
+    # -- vocabulary sync -------------------------------------------------
+
+    @property
+    def vocabulary_sync_enabled(self) -> bool:
+        return bool(self._get("vocabulary_sync_enabled"))
+
+    @property
+    def vocabulary_sync_server_url(self) -> str:
+        url = str(self._get("vocabulary_sync_server_url") or "").strip()
+        return url or str(_DEFAULTS["vocabulary_sync_server_url"])
+
+    @property
+    def vocabulary_sync_email(self) -> str:
+        return str(self._get("vocabulary_sync_email") or "")
+
+    @property
+    def vocabulary_sync_last_server_revision(self) -> int:
+        try:
+            return max(0, int(self._get("vocabulary_sync_last_server_revision") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def vocabulary_sync_last_pushed_local_stamp(self) -> str:
+        return str(self._get("vocabulary_sync_last_pushed_local_stamp") or "")
+
+    @property
+    def vocabulary_sync_last_synced_at(self) -> float:
+        try:
+            return float(self._get("vocabulary_sync_last_synced_at") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     @property
     def last_seen_version(self) -> str:

@@ -12,6 +12,7 @@
         onnx-asr\onnx-models.json           pinned model catalog
         onnx-asr\nemo128.onnx               bundled feature graph (Parakeet)
         onnx-asr\gigaam_v3.onnx             bundled feature graph (GigaAM v3)
+        onnx-asr\gigaam_v3_spm.tsv          GigaAM hotword tokenizer (piece, score)
         onnx-asr\ThirdPartyNotices.txt, onnxruntime-LICENSE.txt, onnx-asr-LICENSE.txt
 
     The app finds it there both when run from source and inside the
@@ -85,6 +86,9 @@ Copy-Item (Join-Path $OrtRoot "lib\onnxruntime.dll") $Stage
 Copy-Item (Join-Path $RuntimeDir "catalog\onnx-models.json") $Stage
 Copy-Item (Join-Path $RuntimeDir "assets\nemo128.onnx") $Stage
 Copy-Item (Join-Path $RuntimeDir "assets\gigaam_v3.onnx") $Stage
+# GigaAM hotword tokenizer (asr-hotwords spec §5); without it GigaAM
+# hotwords are disabled with a reason and transcription is unaffected.
+Copy-Item (Join-Path $RuntimeDir "assets\gigaam_v3_spm.tsv") $Stage
 Copy-Item (Join-Path $RuntimeDir "assets\onnx-asr-LICENSE.txt") $Stage
 Copy-Item (Join-Path $OrtRoot "ThirdPartyNotices.txt") $Stage
 Copy-Item (Join-Path $OrtRoot "LICENSE") (Join-Path $Stage "onnxruntime-LICENSE.txt")

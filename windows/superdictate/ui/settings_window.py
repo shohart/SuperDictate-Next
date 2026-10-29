@@ -19,9 +19,11 @@ one long undifferentiated form.
 from __future__ import annotations
 
 import html
+import threading
+import time
 from typing import Any, Optional
 
-from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -46,7 +48,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import asr, audio, i18n
+from .. import asr, asr_hotwords, audio, i18n, vocabulary_hygiene
+from ..vocabulary import DraftEntry
 from ..hotkeys import HotkeyChoice, TriggerMode
 from ..keynames import hotkey_name
 from ..settings import (
@@ -55,7 +58,6 @@ from ..settings import (
     CONTRAST_COLOR,
     ColorSpec,
     CompletionBehavior,
-    Correction,
     HUDBackgroundStyle,
     HUDDisplayMode, HUDSize,
     PasteSuffix,
@@ -66,7 +68,8 @@ from ..textproc import PRESET_FILLERS
 from ..updater import PeriodicChecker
 from . import icons
 from .recorder import ShortcutRecorderDialog
-from .rows import PRIMARY_ROLE, SECONDARY_ROLE, CorrectionRowDelegate
+from .rows import (HINT_NONE, HINT_OFF, HINT_ON, HINT_ROLE, PRIMARY_ROLE, SECONDARY_ROLE,
+                   CorrectionRowDelegate)
 from .theme import Palette, palette, stylesheet
 
 # Four across: the filler words are short, and three columns made the list
@@ -295,6 +298,10 @@ def _page(*sections: QWidget) -> QWidget:
 
 
 class SettingsWindow(QDialog):
+    # A sign-in / sync / sign-out finished on its worker thread:
+    # (kind, detail), kind "ok" | "created" | "error".
+    _sync_done = Signal(str, str)
+
     def __init__(self, settings: Settings, corrections, controller, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(i18n.tr("settings_title"))
@@ -518,16 +525,23 @@ class SettingsWindow(QDialog):
         section = Section(i18n.tr("settings_tab_corrections"),
                           i18n.tr("corrections_note"))
 
+        column = QLabel(i18n.tr("corrections_hint_column"))
+        column.setObjectName("Caption")
+        column.setToolTip(i18n.tr("corrections_hint_tooltip"))
+        column.setAlignment(Qt.AlignmentFlag.AlignRight)
+        section.add_row(None, column)
+
         self._corrections_list = QListWidget()
         self._corrections_list.setItemDelegate(
-            CorrectionRowDelegate(self._palette, self._corrections_list))
+            CorrectionRowDelegate(self._palette, self._corrections_list, hint_column=True,
+                                  on_hint_clicked=self._toggle_asr_hint))
         self._corrections_list.setMouseTracking(True)
         self._corrections_list.setUniformItemSizes(True)
         self._corrections_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._corrections_list.setMinimumHeight(220)
-        for correction in self._corrections.all():
-            self._add_correction_item(correction)
+        self._corrections_baseline = []
+        self._load_corrections()
         section.add_row(None, self._corrections_list)
 
         editor = QWidget()
@@ -564,11 +578,264 @@ class SettingsWindow(QDialog):
         export.clicked.connect(self._export_corrections)
         import_merge = QPushButton(i18n.tr("corrections_import"))
         import_merge.clicked.connect(self._import_corrections)
+        cleanup = QPushButton(i18n.tr("corrections_cleanup"))
+        cleanup.clicked.connect(self._cleanup_corrections)
         transfer_row.addWidget(export)
         transfer_row.addWidget(import_merge)
         transfer_row.addStretch(1)
+        transfer_row.addWidget(cleanup)
         section.add_row(None, transfer)
-        return _page(section)
+
+        # ASR hotwords (asr-hotwords spec §8): drafts like every setting.
+        hotwords = Section(i18n.tr("settings_asr_hotwords"),
+                           i18n.tr("settings_asr_hotwords_hint"))
+        self._asr_hotwords = self._checkbox(
+            hotwords, "settings_asr_hotwords_enabled", "asr_hotwords_enabled")
+        self._asr_hotwords_strength = self._combo(
+            hotwords, "settings_asr_hotwords_strength", "asr_hotwords_strength",
+            [("normal", i18n.tr("settings_asr_hotwords_normal")),
+             ("strong", i18n.tr("settings_asr_hotwords_strong"))])
+        self._asr_hotwords_strength.setEnabled(self._asr_hotwords.isChecked())
+        self._asr_hotwords.toggled.connect(self._asr_hotwords_strength.setEnabled)
+
+        sections = [section, hotwords]
+        sync = self._sync_section()
+        if sync is not None:
+            sections.append(sync)
+        changed = getattr(self._controller, "vocabulary_changed", None)
+        if changed is not None:
+            changed.connect(self._on_vocabulary_changed)
+        return _page(*sections)
+
+    # -- the vocabulary list -------------------------------------------
+
+    def _load_corrections(self) -> None:
+        """(Re)fill the list from the store; the baseline the save diffs
+        against (VocabularyStore.apply_edits)."""
+        self._corrections_baseline = self._corrections.all()
+        self._corrections_list.clear()
+        for record in self._corrections_baseline:
+            self._add_correction_item(DraftEntry(record.source, record.replacement,
+                                                 record.asr_hint, record.origin))
+
+    def _current_entries(self) -> list:
+        return [self._corrections_list.item(index).data(Qt.ItemDataRole.UserRole)
+                for index in range(self._corrections_list.count())]
+
+    def _corrections_dirty(self) -> bool:
+        baseline = [(r.source, r.replacement, r.asr_hint) for r in self._corrections_baseline]
+        current = [(e.source, e.replacement, e.asr_hint) for e in self._current_entries()]
+        return baseline != current
+
+    def _on_vocabulary_changed(self, _kind: str) -> None:
+        """A learn or a sync changed the store: show it, unless the user is
+        in the middle of editing the list (their save diffs against the
+        baseline, so nothing of the sync's is lost either way)."""
+        if not self._corrections_dirty():
+            self._load_corrections()
+
+    @staticmethod
+    def _hint_state(entry: DraftEntry) -> int:
+        origin = getattr(entry.origin, "value", entry.origin)
+        if asr_hotwords.eligible_phrase(entry.source, entry.replacement) is None:
+            return HINT_NONE
+        return HINT_ON if asr_hotwords.is_effective(entry.source, entry.replacement, origin,
+                                                    entry.asr_hint) else HINT_OFF
+
+    def _toggle_asr_hint(self, row: int) -> None:
+        item = self._corrections_list.item(row)
+        if item is None:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        state = self._hint_state(entry)
+        if state == HINT_NONE:
+            return
+        # A click sets the opposite of what is shown, explicitly.
+        entry = DraftEntry(entry.source, entry.replacement, state != HINT_ON, entry.origin)
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        item.setData(HINT_ROLE, self._hint_state(entry))
+
+    def _cleanup_corrections(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        if self._corrections_dirty():
+            answer = QMessageBox.question(self, i18n.tr("corrections_cleanup_title"),
+                                          i18n.tr("corrections_cleanup_save_first"))
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._corrections.apply_edits(self._corrections_baseline, self._current_entries())
+            self._load_corrections()
+        plan = self._corrections.cleanup_plan()
+        if plan.is_empty:
+            self._warn(i18n.tr("corrections_cleanup_nothing"))
+            return
+        if CleanupPreviewDialog(plan, self._palette, self).exec() != QDialog.DialogCode.Accepted:
+            return
+        self._corrections.apply_cleanup(plan)
+        self._load_corrections()
+        self._warn(i18n.tr("corrections_cleanup_done", deleted=len(plan.deletions),
+                           rewritten=len(plan.rewrites)))
+
+    # -- account sync (hygiene spec §4.3) --------------------------------
+
+    def _sync_section(self) -> Optional["Section"]:
+        sync = getattr(self._controller, "vocabulary_sync", None)
+        if sync is None:
+            return None
+        self._sync = sync
+        section = Section(i18n.tr("sync_title"))
+
+        self._sync_form = QWidget()
+        self._sync_form.setObjectName("Plain")
+        form = QGridLayout(self._sync_form)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(8)
+        form.setColumnStretch(1, 1)
+        self._sync_email = QLineEdit(self._settings.vocabulary_sync_email)
+        self._sync_email.setPlaceholderText("name@example.com")
+        self._sync_password = QLineEdit()
+        self._sync_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self._sync_password.returnPressed.connect(self._sync_sign_in)
+        for row_index, (label_key, field) in enumerate(
+                (("sync_email", self._sync_email), ("sync_password", self._sync_password))):
+            key = QLabel(i18n.tr(label_key))
+            key.setObjectName("Key")
+            form.addWidget(key, row_index, 0)
+            form.addWidget(field, row_index, 1)
+        consent = QLabel(i18n.tr("sync_consent") + " " + i18n.tr("sync_new_account_note"))
+        consent.setObjectName("Caption")
+        consent.setWordWrap(True)
+        form.addWidget(consent, 2, 0, 1, 2)
+        self._sync_sign_in_button = QPushButton(i18n.tr("sync_sign_in"))
+        self._sync_sign_in_button.setObjectName("Primary")
+        self._sync_sign_in_button.clicked.connect(self._sync_sign_in)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self._sync_sign_in_button)
+        form.addLayout(buttons, 3, 0, 1, 2)
+        section.add_row(None, self._sync_form)
+
+        self._sync_account = QWidget()
+        self._sync_account.setObjectName("Plain")
+        account = QVBoxLayout(self._sync_account)
+        account.setContentsMargins(0, 0, 0, 0)
+        account.setSpacing(6)
+        self._sync_account_label = QLabel()
+        self._sync_account_label.setWordWrap(True)
+        self._sync_state_label = QLabel()
+        self._sync_state_label.setObjectName("Caption")
+        self._sync_state_label.setWordWrap(True)
+        account.addWidget(self._sync_account_label)
+        account.addWidget(self._sync_state_label)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._sync_now_button = QPushButton(i18n.tr("sync_sync_now"))
+        self._sync_now_button.clicked.connect(self._sync_now)
+        sign_out = QPushButton(i18n.tr("sync_sign_out"))
+        sign_out.clicked.connect(self._sync_sign_out)
+        actions.addWidget(self._sync_now_button)
+        actions.addWidget(sign_out)
+        actions.addStretch(1)
+        account.addLayout(actions)
+        section.add_row(None, self._sync_account)
+
+        self._sync_error = QLabel()
+        self._sync_error.setWordWrap(True)
+        self._sync_error.setStyleSheet(f"color: {self._palette.danger}; background: transparent;")
+        self._sync_error.setVisible(False)
+        section.add_row(None, self._sync_error)
+
+        self._sync_done.connect(self._on_sync_done)
+        status_signal = getattr(self._controller, "vocabulary_sync_status", None)
+        if status_signal is not None:
+            status_signal.connect(self._show_sync_status)
+        self._show_sync_status(sync.status)
+        return section
+
+    def _show_sync_status(self, status) -> None:
+        signed_in = status.signed_in
+        self._sync_form.setVisible(not signed_in)
+        self._sync_account.setVisible(signed_in)
+        self._sync_sign_in_button.setEnabled(True)
+        self._sync_sign_in_button.setText(i18n.tr("sync_sign_in"))
+        if signed_in:
+            self._sync_account_label.setText(i18n.tr("sync_signed_in_as", email=status.email))
+            when = (time.strftime("%d.%m.%Y %H:%M", time.localtime(status.last_synced_at))
+                    if status.last_synced_at else i18n.tr("sync_never"))
+            state = i18n.tr("sync_last", when=when)
+            if status.state == "syncing":
+                state = i18n.tr("sync_state_syncing")
+            elif status.state == "ok":
+                state = i18n.tr("sync_state_ok") + " · " + state
+            self._sync_state_label.setText(state)
+            self._sync_now_button.setEnabled(status.state != "syncing")
+        elif status.email and not self._sync_email.text():
+            self._sync_email.setText(status.email)
+        error = status.error or ("unauthorized" if status.state == "reauth" else "")
+        self._set_sync_error(error)
+
+    def _set_sync_error(self, kind: str) -> None:
+        self._sync_error.setText(i18n.tr(f"sync_error_{kind}") if kind else "")
+        self._sync_error.setVisible(bool(kind))
+
+    def _run_sync_job(self, job) -> None:
+        def work() -> None:
+            from ..vocabulary_sync import SyncError
+
+            try:
+                result = job()
+                self._sync_done.emit("created" if result is True else "ok", "")
+            except SyncError as exc:
+                self._sync_done.emit("error", exc.kind)
+            except Exception as exc:  # never let a worker die silently
+                self._sync_done.emit("error", "server")
+
+        threading.Thread(target=work, name="vocabulary-sync-ui", daemon=True).start()
+
+    def _sync_sign_in(self) -> None:
+        email = self._sync_email.text().strip()
+        password = self._sync_password.text()
+        if not email or not password:
+            self._set_sync_error("invalid")
+            return
+        self._set_sync_error("")
+        self._sync_sign_in_button.setEnabled(False)
+        self._sync_sign_in_button.setText(i18n.tr("sync_signing_in"))
+        self._run_sync_job(lambda: self._sync.sign_in(email, password))
+
+    def _sync_now(self) -> None:
+        self._sync_now_button.setEnabled(False)
+        self._run_sync_job(self._sync.sync_now)
+
+    def _sync_sign_out(self) -> None:
+        self._run_sync_job(self._sync.sign_out)
+
+    def _on_sync_done(self, kind: str, detail: str) -> None:
+        self._sync_password.clear()
+        self._show_sync_status(self._sync.status)
+        if kind == "error":
+            self._set_sync_error(detail)
+        elif kind == "created":
+            self._sync_state_label.setText(i18n.tr("sync_account_created"))
+
+    def done(self, result: int) -> None:  # noqa: D401 (Qt override)
+        """Detach from the app's long-lived signals: the dialog outlives
+        its exec() as a child of the panel."""
+        if getattr(self, "_detached", False):
+            super().done(result)
+            return
+        self._detached = True
+        for name, slot in (("vocabulary_sync_status", self._show_sync_status),
+                           ("vocabulary_changed", self._on_vocabulary_changed)):
+            signal = getattr(self._controller, name, None)
+            if signal is None:
+                continue
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        super().done(result)
 
     # -- import / export ----------------------------------------------
 
@@ -598,7 +865,6 @@ class SettingsWindow(QDialog):
         from PySide6.QtWidgets import QFileDialog
 
         from .. import vocabulary_transfer as transfer
-        from ..settings import Correction
 
         path, _ = QFileDialog.getOpenFileName(
             self, i18n.tr("corrections_import"), "", "JSON (*.json)")
@@ -633,7 +899,7 @@ class SettingsWindow(QDialog):
                 self._corrections_list.takeItem(index)
                 existing = {k: (v - 1 if v > index else v)
                             for k, v in existing.items() if v != index}
-            self._add_correction_item(Correction(source, replacement))
+            self._add_correction_item(DraftEntry(source, replacement))
             existing[source.casefold()] = self._corrections_list.count() - 1
             added += 1
         if document.skipped:
@@ -1275,10 +1541,11 @@ class SettingsWindow(QDialog):
         self._draft.update(filler_words=[
             word for word in words if word.lower() in self._filler_enabled])
 
-    def _add_correction_item(self, correction: Correction) -> None:
+    def _add_correction_item(self, correction: DraftEntry) -> None:
         item = QListWidgetItem()
         item.setData(PRIMARY_ROLE, correction.source)
         item.setData(SECONDARY_ROLE, correction.replacement)
+        item.setData(HINT_ROLE, self._hint_state(correction))
         item.setData(Qt.ItemDataRole.UserRole, correction)
         item.setToolTip(f"{correction.source} → {correction.replacement}")
         self._corrections_list.addItem(item)
@@ -1288,7 +1555,19 @@ class SettingsWindow(QDialog):
         replacement = self._correction_replacement.text().strip()
         if not source or not replacement:
             return
-        self._add_correction_item(Correction(source, replacement))
+        # The manual editor applies hygiene rules 1 and 3 only (spec §2).
+        verdict = vocabulary_hygiene.review_manual(source, replacement)
+        if isinstance(verdict, vocabulary_hygiene.Reject):
+            self._warn(i18n.tr("corrections_rejected_no_letters"))
+            return
+        source, replacement = verdict.source, verdict.replacement
+        # One answer per word: a new rule for a listed word replaces it.
+        key = " ".join(source.casefold().split())
+        for index in range(self._corrections_list.count() - 1, -1, -1):
+            entry = self._corrections_list.item(index).data(Qt.ItemDataRole.UserRole)
+            if " ".join(entry.source.casefold().split()) == key:
+                self._corrections_list.takeItem(index)
+        self._add_correction_item(DraftEntry(source, replacement))
         self._correction_source.clear()
         self._correction_replacement.clear()
 
@@ -1302,9 +1581,9 @@ class SettingsWindow(QDialog):
         previous = self._settings.snapshot()
         self._settings.apply(self._draft)
 
-        items = [self._corrections_list.item(index).data(Qt.ItemDataRole.UserRole)
-                 for index in range(self._corrections_list.count())]
-        self._corrections.replace_all(items)
+        # Only the difference from what the list was loaded from: a rule
+        # the sync or a learn changed meanwhile is not rolled back.
+        self._corrections.apply_edits(self._corrections_baseline, self._current_entries())
 
         self._controller.apply_settings()
 
@@ -1313,3 +1592,63 @@ class SettingsWindow(QDialog):
         if model_changed:
             self._controller.reload_model()
         self.accept()
+
+
+class CleanupPreviewDialog(QDialog):
+    """What «Почистить словарь…» would do (hygiene spec §3), for a yes/no."""
+
+    def __init__(self, plan, palette: Palette, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(i18n.tr("corrections_cleanup_title"))
+        self.resize(620, 520)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(10)
+        intro = QLabel(i18n.tr("corrections_cleanup_intro"))
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        listing = QListWidget()
+        listing.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+
+        def header(text: str) -> None:
+            item = QListWidgetItem(text)
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            item.setFlags(Qt.ItemFlag.NoItemFlags | Qt.ItemFlag.ItemIsEnabled)
+            listing.addItem(item)
+
+        def reason(key: str) -> str:
+            return i18n.tr(f"cleanup_reason_{key}")
+
+        others = [d for d in plan.deletions if d.reason != "duplicate"]
+        duplicates = plan.duplicates
+        if others or duplicates:
+            header(i18n.tr("corrections_cleanup_deletions", count=len(plan.deletions)))
+            for deletion in others:
+                listing.addItem(f"   {deletion.record.source} → {deletion.record.replacement}"
+                                f"   — {reason(deletion.reason)}")
+            if duplicates:
+                header(i18n.tr("corrections_cleanup_duplicates", count=len(duplicates)))
+                for deletion in duplicates:
+                    listing.addItem(f"   {deletion.record.source} → {deletion.record.replacement}")
+        if plan.rewrites:
+            header(i18n.tr("corrections_cleanup_rewrites", count=len(plan.rewrites)))
+            for rewrite in plan.rewrites:
+                listing.addItem(
+                    f"   {rewrite.record.source} → {rewrite.record.replacement}   ⇒   "
+                    f"{rewrite.source} → {rewrite.replacement}   — "
+                    + ", ".join(reason(r) for r in rewrite.reasons))
+        layout.addWidget(listing, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText(i18n.tr("corrections_cleanup_apply"))
+        ok.setObjectName("Primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(i18n.tr("settings_cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setStyleSheet(stylesheet(palette))

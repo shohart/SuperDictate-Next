@@ -24,7 +24,12 @@ timing is the macOS one:
   a second word fixed in the same dictation is learned on its own;
 * focus moving to another field, an edit outside the inserted region, a
   password field, or a field that cannot be read ends the watch. Nothing is
-  ever guessed.
+  ever guessed;
+* a candidate goes through the vocabulary hygiene first (``review``,
+  docs/specs/vocabulary-hygiene-and-sync-spec.md §2): a punctuation-only
+  edit, a grammar fix of an ordinary word or a sentence rewrite gets no
+  pill and no write, and a candidate may be shown rewritten (edge
+  punctuation trimmed, a chain followed to its end).
 """
 
 from __future__ import annotations
@@ -101,7 +106,9 @@ class EditWatcher:
 
     ``read_field`` returns a :class:`focus_target.FieldSnapshot` (or None);
     ``learn(candidate)`` saves a rule and returns what was saved (falsy when
-    the store declined: already known, or a cap). ``on_pending(candidate,
+    the store declined: already known, or a cap). ``review(candidate)``
+    returns the candidate to offer (possibly rewritten) or None to drop it
+    silently. ``on_pending(candidate,
     bounds)`` reports a candidate waiting out its confirm window, with the
     field's screen rectangle; ``on_pending_cleared()`` says it went away
     without being saved (it was edited into nothing learnable, or the watch
@@ -110,6 +117,7 @@ class EditWatcher:
 
     def __init__(self, read_field: Callable[[], object],
                  learn: Callable[[LearnCandidate], object], *,
+                 review: Callable[[LearnCandidate], Optional[LearnCandidate]] = lambda c: c,
                  on_pending: Callable[[LearnCandidate, object], None] = lambda c, b: None,
                  on_pending_cleared: Callable[[], None] = lambda: None,
                  own_pids: frozenset[int] = frozenset(),
@@ -117,6 +125,7 @@ class EditWatcher:
                  sleep: Optional[Callable[[float], object]] = None) -> None:
         self._read = read_field
         self._learn = learn
+        self._review = review
         self._on_pending = on_pending
         self._on_pending_cleared = on_pending_cleared
         #: "save" or "cancel" from the UI, taken up by the next poll.
@@ -273,6 +282,12 @@ class EditWatcher:
                 log.info("Edit watch ended: the text around the dictation changed")
                 return False
             candidate = learn_candidate(watch.inserted, region)
+            if candidate is not None:
+                try:
+                    candidate = self._review(candidate)
+                except Exception as exc:
+                    log.warning("Reviewing a learn candidate failed: %s", exc)
+                    candidate = None
             if candidate is None:
                 if watch.shown:
                     self._clear(watch)

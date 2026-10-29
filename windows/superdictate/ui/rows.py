@@ -14,8 +14,8 @@ and anything too long is elided instead of scrolled.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from .theme import Palette
@@ -24,6 +24,10 @@ from .theme import Palette
 META_ROLE = Qt.ItemDataRole.UserRole + 1
 PRIMARY_ROLE = Qt.ItemDataRole.UserRole + 2
 SECONDARY_ROLE = Qt.ItemDataRole.UserRole + 3
+#: The ASR hint column of the vocabulary list: HINT_ON / HINT_OFF, or
+#: HINT_NONE for an entry that can never be a hotword (no box drawn).
+HINT_ROLE = Qt.ItemDataRole.UserRole + 4
+HINT_NONE, HINT_OFF, HINT_ON = -1, 0, 1
 
 RADIUS = 9
 PADDING_X = 12
@@ -125,14 +129,65 @@ class HistoryRowDelegate(CardRowDelegate):
 
 
 class CorrectionRowDelegate(CardRowDelegate):
-    """``source  ->  replacement``, each field in its own half."""
+    """``source  ->  replacement``, each field in its own half, and the ASR
+    hint checkbox at the right edge when the list has that column."""
 
     ARROW = "→"
     ARROW_WIDTH = 22
+    HINT_WIDTH = 34
+    BOX = 15
+
+    def __init__(self, palette: Palette, parent=None, *, hint_column: bool = False,
+                 on_hint_clicked=None) -> None:
+        super().__init__(palette, parent)
+        self.hint_column = hint_column
+        #: ``on_hint_clicked(row)`` when a box is clicked.
+        self.on_hint_clicked = on_hint_clicked
+
+    def _hint_rect(self, option_rect) -> QRectF:
+        rect = QRectF(option_rect).adjusted(0, 1.5, 0, -1.5).adjusted(PADDING_X, 0, -PADDING_X, 0)
+        return QRectF(rect.right() - self.HINT_WIDTH, rect.top(), self.HINT_WIDTH, rect.height())
+
+    def editorEvent(self, event, model, option, index):  # noqa: N802 (Qt naming)
+        if (self.hint_column and event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+                and index.data(HINT_ROLE) not in (None, HINT_NONE)
+                and self._hint_rect(option.rect).contains(event.position())):
+            if self.on_hint_clicked is not None:
+                self.on_hint_clicked(index.row())
+            return True
+        return super().editorEvent(event, model, option, index)
+
+    def _paint_hint(self, painter: QPainter, area: QRectF, state, selected: bool) -> None:
+        if state in (None, HINT_NONE):
+            return
+        box = QRectF(area.center().x() - self.BOX / 2, area.center().y() - self.BOX / 2,
+                     self.BOX, self.BOX)
+        painter.save()
+        if state == HINT_ON:
+            fill = QColor(self.p.accent_text if selected else self.p.accent)
+            path = QPainterPath()
+            path.addRoundedRect(box, 4, 4)
+            painter.fillPath(path, fill)
+            tick = QPen(QColor(self.p.accent if selected else self.p.accent_text), 2)
+            tick.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(tick)
+            painter.drawPolyline([box.topLeft() + d for d in (
+                _pt(3.5, 7.8), _pt(6.5, 10.8), _pt(11.5, 4.5))])
+        else:
+            painter.setPen(QPen(self._muted_color(selected), 1.3))
+            painter.drawRoundedRect(box, 4, 4)
+        painter.restore()
 
     def paint_content(self, painter, rect, index, selected) -> None:
         source = str(index.data(PRIMARY_ROLE) or "")
         replacement = str(index.data(SECONDARY_ROLE) or "")
+        if self.hint_column:
+            hint_area = QRectF(rect.right() - self.HINT_WIDTH, rect.top(),
+                               self.HINT_WIDTH, rect.height())
+            self._paint_hint(painter, hint_area, index.data(HINT_ROLE), selected)
+            rect = QRectF(rect.left(), rect.top(), rect.width() - self.HINT_WIDTH - 6,
+                          rect.height())
 
         half = (rect.width() - self.ARROW_WIDTH) / 2.0
         left = QRectF(rect.left(), rect.top(), half, rect.height())
@@ -150,3 +205,9 @@ class CorrectionRowDelegate(CardRowDelegate):
         painter.setFont(bold)
         painter.setPen(self._text_color(selected))
         self._draw(painter, right, replacement)
+
+
+def _pt(x: float, y: float):
+    from PySide6.QtCore import QPointF
+
+    return QPointF(x, y)

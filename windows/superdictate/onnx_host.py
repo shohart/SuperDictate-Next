@@ -97,6 +97,27 @@ class HostTranscription:
     text: str
     processing_seconds: float
     words: tuple[HostWord, ...]
+    #: Hotword report (docs/specs/asr-hotwords-spec.md §7), present only
+    #: when hotwords were sent: phrases in the trie, phrases the model's
+    #: tokenizer could not take, and why the family has none at all.
+    hotwords_used: Optional[int] = None
+    hotwords_skipped: tuple[str, ...] = ()
+    hotwords_disabled_reason: str = ""
+
+
+def transcribe_options(*, timestamps: bool, sample_rate: int = 16000,
+                       hotwords: Sequence[str] = (),
+                       hotwords_score: float = 2.0) -> dict:
+    """The TRANSCRIBE options object (spec §7).
+
+    An empty hotword list adds nothing, so the request is byte-for-byte
+    the one a build without hotwords sends, and so is the transcript.
+    """
+    options: dict = {"timestamps": bool(timestamps), "sample_rate": int(sample_rate)}
+    if hotwords:
+        options["hotwords"] = [str(phrase) for phrase in hotwords]
+        options["hotwords_score"] = float(hotwords_score)
+    return options
 
 
 def timeout_seconds(sample_count: int, sample_rate: int = 16000) -> float:
@@ -247,11 +268,13 @@ class OnnxHost:
     # -- requests -------------------------------------------------------
 
     def transcribe(self, samples: np.ndarray, *, timestamps: bool = False,
-                   sample_rate: int = 16000) -> HostTranscription:
+                   sample_rate: int = 16000, hotwords: Sequence[str] = (),
+                   hotwords_score: float = 2.0) -> HostTranscription:
         pcm = np.ascontiguousarray(samples, dtype="<f4")
         if pcm.size == 0:
             raise OnnxHostError("empty audio")
-        options = {"timestamps": bool(timestamps), "sample_rate": int(sample_rate)}
+        options = transcribe_options(timestamps=timestamps, sample_rate=sample_rate,
+                                     hotwords=hotwords, hotwords_score=hotwords_score)
         result, _ = self._round_trip(TYPE_TRANSCRIBE, options, pcm.tobytes(),
                                      timeout=timeout_seconds(pcm.size, sample_rate))
         text = result.get("text")
@@ -268,9 +291,16 @@ class OnnxHost:
                      end=float(item.get("end", 0.0)))
             for item in result.get("words", ()) if isinstance(item, dict)
         )
+        used = result.get("hotwords_used")
+        skipped = result.get("hotwords_skipped")
         return HostTranscription(text=text,
                                  processing_seconds=float(result.get("processing_seconds", 0.0)),
-                                 words=words)
+                                 words=words,
+                                 hotwords_used=int(used) if isinstance(used, (int, float)) else None,
+                                 hotwords_skipped=tuple(str(p) for p in skipped)
+                                 if isinstance(skipped, list) else (),
+                                 hotwords_disabled_reason=str(
+                                     result.get("hotwords_disabled_reason", "") or ""))
 
     def punctuate(self, text: str) -> HostPunctuation:
         """Punctuation restoration with a text model (family modernbert_punct)."""

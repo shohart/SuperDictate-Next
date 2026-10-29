@@ -2336,6 +2336,28 @@ _TESTS = [
 ]
 
 
+def _vocabulary_suite():
+    """ASR hotwords, vocabulary hygiene and the account sync
+    (:mod:`superdictate.selftest_vocab`), each test reported by name."""
+    from . import selftest_vocab
+
+    def wrap(test):
+        def run() -> None:
+            selftest_vocab.FAILURES.clear()
+            try:
+                test()
+            finally:
+                _failures.extend(selftest_vocab.FAILURES)
+                selftest_vocab.FAILURES.clear()
+        run.__name__ = test.__name__
+        return run
+
+    return [wrap(test) for test in selftest_vocab.TESTS]
+
+
+_TESTS += _vocabulary_suite()
+
+
 def run_all() -> bool:
     _failures.clear()
     errored = 0

@@ -469,6 +469,91 @@ _STRINGS: dict[str, tuple[str, str]] = {
         "Replacements are applied before insertion; matching is "
         "case-insensitive and whole-word.",
     ),
+    "corrections_hint_column": ("Подсказка ASR", "ASR hint"),
+    "corrections_hint_tooltip": (
+        "Подсказывать этот термин модели распознавания. Галочка показывает "
+        "текущее состояние; щелчок задаёт его явно.",
+        "Hint this term to the speech model. The box shows the current "
+        "state; a click sets it explicitly."),
+    "corrections_rejected_no_letters": (
+        "Замена должна содержать хотя бы одну букву и быть не короче двух символов.",
+        "The replacement needs at least one letter and two characters."),
+
+    # -- ASR hotwords (asr-hotwords spec §8) ---------------------------
+    "settings_asr_hotwords": ("Подсказки распознаванию", "Recognition hints"),
+    "settings_asr_hotwords_hint": (
+        "Термины из словаря (латиница, аббревиатуры, отмеченные фамилии) "
+        "передаются модели распознавания, и она чаще пишет их правильно сразу.",
+        "Terms from the vocabulary (Latin spellings, acronyms, ticked "
+        "surnames) are handed to the speech model, so it gets them right "
+        "in the first place more often."),
+    "settings_asr_hotwords_enabled": ("Подсказывать распознаванию термины из словаря",
+                                      "Hint vocabulary terms to speech recognition"),
+    "settings_asr_hotwords_strength": ("Сила подсказки", "Hint strength"),
+    "settings_asr_hotwords_normal": ("Обычно", "Normal"),
+    "settings_asr_hotwords_strong": ("Сильнее", "Stronger"),
+
+    # -- vocabulary cleanup (hygiene spec §3) --------------------------
+    "corrections_cleanup": ("Почистить словарь…", "Clean up…"),
+    "corrections_cleanup_title": ("Очистка словаря", "Vocabulary cleanup"),
+    "corrections_cleanup_intro": (
+        "Будут изменены только выученные правила; ваши собственные не трогаются.",
+        "Only learned rules change; your own rules are never touched."),
+    "corrections_cleanup_nothing": ("Словарь уже в порядке: чистить нечего.",
+                                    "The vocabulary is already clean."),
+    "corrections_cleanup_save_first": (
+        "В списке есть несохранённые изменения. Сохранить их перед очисткой?",
+        "The list has unsaved changes. Save them before the cleanup?"),
+    "corrections_cleanup_apply": ("Применить", "Apply"),
+    "corrections_cleanup_done": ("Удалено: {deleted}, исправлено: {rewritten}",
+                                 "{deleted} deleted, {rewritten} rewritten"),
+    "corrections_cleanup_deletions": ("Удалить ({count})", "Delete ({count})"),
+    "corrections_cleanup_rewrites": ("Исправить ({count})", "Rewrite ({count})"),
+    "corrections_cleanup_duplicates": ("Из них дубликаты ({count})",
+                                       "Of these, duplicates ({count})"),
+    "cleanup_reason_punctuation": ("только пунктуация или регистр",
+                                   "punctuation or case only"),
+    "cleanup_reason_no-letters": ("нет букв", "no letters"),
+    "cleanup_reason_inflection": ("словоформа, не термин", "word form, not a term"),
+    "cleanup_reason_rewrite": ("переписанный текст, не термин", "rewritten text, not a term"),
+    "cleanup_reason_empty": ("пустое", "empty"),
+    "cleanup_reason_duplicate": ("дубликат", "duplicate"),
+    "cleanup_reason_noop": ("заменяет слово на само себя", "replaces a word with itself"),
+    "cleanup_reason_trim": ("пунктуация по краям", "edge punctuation"),
+    "cleanup_reason_chain": ("цепочка замен", "chain of replacements"),
+    "cleanup_reason_case": ("единый регистр", "one casing"),
+
+    # -- vocabulary sync (hygiene spec §4.3) ---------------------------
+    "sync_title": ("Синхронизация словаря", "Vocabulary sync"),
+    "sync_email": ("Эл. почта", "E-mail"),
+    "sync_password": ("Пароль", "Password"),
+    "sync_sign_in": ("Войти", "Sign in"),
+    "sync_signing_in": ("Вход…", "Signing in…"),
+    "sync_consent": (
+        "Словарь будет храниться на сервере SuperDictate и использоваться для "
+        "улучшения распознавания речи.",
+        "Your vocabulary is stored on the SuperDictate server and used to "
+        "improve speech recognition."),
+    "sync_new_account_note": (
+        "Если для этой почты ещё нет аккаунта, он будет создан.",
+        "If this e-mail has no account yet, one is created."),
+    "sync_sync_now": ("Синхронизировать сейчас", "Sync now"),
+    "sync_sign_out": ("Выйти", "Sign out"),
+    "sync_signed_in_as": ("Вход выполнен: {email}", "Signed in as {email}"),
+    "sync_last": ("Последняя синхронизация: {when}", "Last sync: {when}"),
+    "sync_never": ("ещё не было", "not yet"),
+    "sync_state_syncing": ("Синхронизация…", "Syncing…"),
+    "sync_state_ok": ("Словарь синхронизирован", "Vocabulary in sync"),
+    "sync_account_created": ("Аккаунт создан", "Account created"),
+    "sync_error_wrong_password": ("Неверный пароль", "Wrong password"),
+    "sync_error_rate_limited": ("Слишком много попыток. Попробуйте позже.",
+                                "Too many attempts. Try again later."),
+    "sync_error_network": ("Нет соединения с сервером", "No connection to the server"),
+    "sync_error_invalid": ("Проверьте адрес почты; пароль — не короче 8 символов.",
+                           "Check the e-mail; the password needs 8 characters or more."),
+    "sync_error_server": ("Ошибка сервера", "Server error"),
+    "sync_error_unauthorized": ("Войдите снова", "Sign in again"),
+    "sync_error_signed_out": ("Войдите снова", "Sign in again"),
 
     # -- history window ----------------------------------------------
     "history_title": ("История диктовок", "Dictation history"),

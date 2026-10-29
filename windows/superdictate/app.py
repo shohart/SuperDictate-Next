@@ -32,12 +32,13 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from . import (asr, audio, edit_watch, focus_target, i18n, incremental, inject, system,
-               textproc, transcription)
+               textproc, transcription, vocabulary_hygiene)
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
 from .llm import LLMPostprocessor
 from .punctuation import PunctuationRestorer
-from .vocabulary import VocabularyStore, migrate_json_if_needed
+from .vocabulary import LearnCandidate, VocabularyStore, migrate_json_if_needed
+from .vocabulary_sync import VocabularySync
 from .logging_setup import get as get_logger
 from .settings import CompletionBehavior, Settings
 
@@ -137,6 +138,11 @@ class DictationController(QObject):
     # The window the dictation started in was closed (or would not come
     # back): the text went to the clipboard instead of into another app.
     paste_redirected = Signal(str)
+    # The dictionary changed: "local" (a write here) or "sync" (applied
+    # from the account). Open vocabulary lists reload.
+    vocabulary_changed = Signal(str)
+    # Account sync status (vocabulary_sync.SyncStatus), for the settings.
+    vocabulary_sync_status = Signal(object)
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
@@ -150,6 +156,11 @@ class DictationController(QObject):
         # Corrections.json is folded in once, then set aside.
         self.corrections = VocabularyStore()
         migrate_json_if_needed(self.corrections)
+        self.corrections.add_listener(self.vocabulary_changed.emit)
+        # Account sync (vocabulary-hygiene-and-sync spec §4); idle until
+        # the user signs in from the settings.
+        self.vocabulary_sync = VocabularySync(
+            self.corrections, settings, on_status=self.vocabulary_sync_status.emit)
         # Post-processing hosts are started lazily, on the first dictation
         # that actually needs one — a multi-GB model must not be loaded at
         # launch for a feature the user may never turn on.
@@ -190,6 +201,7 @@ class DictationController(QObject):
         self.edit_watch = edit_watch.EditWatcher(
             lambda: self.focus.read_field().result(timeout=1.0),
             self._learn_from_edit,
+            review=self._review_learn_candidate,
             on_pending=lambda c, bounds: self.learn_pending.emit(c.source, c.replacement, bounds),
             on_pending_cleared=self.learn_pending_cleared.emit,
             own_pids=frozenset({os.getpid()}))
@@ -274,6 +286,8 @@ class DictationController(QObject):
         # offer; asking takes a helper process a second or two, so it is
         # asked now, long before anybody opens them.
         asr.probe_npu_async()
+        # Pushes and pulls the dictionary when signed in (a no-op otherwise).
+        self.vocabulary_sync.start()
         # Silero VAD places the seams of long dictations; its 885 KB model
         # is fetched in the background, as on macOS.
         from . import vad
@@ -302,6 +316,7 @@ class DictationController(QObject):
         self._stop_preview()
         self._discard_speculative()
         self.edit_watch.stop()
+        self.vocabulary_sync.stop()
         try:
             if self.recorder.is_recording:
                 self.recorder.discard()
@@ -576,6 +591,9 @@ class DictationController(QObject):
             self.listener.reset_toggle()
             return
         self._set_state(AppState.RECORDING)
+        # Before the recording-time windows start, so they and the final
+        # pass decode with the same list.
+        self._refresh_hotwords()
         # The mute waits for the start cue to finish. Muting first silenced
         # the cue along with everything else, so the one sound that says
         # "it is listening now" was the one nobody could hear.
@@ -805,6 +823,8 @@ class DictationController(QObject):
         if model is None or not model.is_ready:
             raise RuntimeError("Speech model is not ready")
 
+        if job.recovered:
+            self._refresh_hotwords()
         # Waits for the recording-time window in flight (one ASR call at a
         # time), then transcribes the full buffer, reusing what matches.
         cache = job.speculative.finish() if job.speculative is not None else None
@@ -948,12 +968,40 @@ class DictationController(QObject):
     def forget_history_entry(self, index: int) -> None:
         self.history.remove(index)
 
+    # -- ASR hotwords ---------------------------------------------------
+
+    def _refresh_hotwords(self) -> None:
+        """Hand the speech model this dictation's hotword list (asr-hotwords
+        spec §8): re-read every time, so a rule learned a minute ago is
+        already a hint."""
+        model = self._model
+        if model is None:
+            return
+        try:
+            phrases = (self.corrections.asr_hotword_phrases()
+                       if self.settings.asr_hotwords_enabled else [])
+            model.set_hotwords(self.settings.asr_hotwords_configuration(phrases))
+        except Exception as exc:
+            log.warning("Could not build the ASR hotword list: %s", exc)
+
     # -- correcting the last dictation ---------------------------------
+
+    def _review_learn_candidate(self, candidate) -> Optional[LearnCandidate]:
+        """The hygiene filter before a candidate is offered (spec §2)."""
+        verdict = self.corrections.review(candidate.source, candidate.replacement)
+        if isinstance(verdict, vocabulary_hygiene.Reject):
+            log.info("Edit watch: %r -> %r not offered (%s)",
+                     candidate.source, candidate.replacement, verdict.reason)
+            return None
+        if isinstance(verdict, vocabulary_hygiene.Accept):
+            return LearnCandidate(verdict.source, verdict.replacement)
+        return candidate  # an undo: offered as typed, applied on save
 
     def _learn_from_edit(self, candidate) -> list:
         """Save one rule found by the edit watcher (its thread), once its
         pending pill has run out or the user pressed Enter on it."""
-        records = self.corrections.learn([(candidate.source, candidate.replacement)])
+        outcome = self.corrections.learn_reviewed(candidate.source, candidate.replacement)
+        records = outcome.written
         if records:
             log.info("Learned a correction from an edit in place: %r -> %r",
                      candidate.source, candidate.replacement)

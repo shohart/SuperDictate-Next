@@ -37,7 +37,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import onnx_models, paths
+from . import asr_hotwords, onnx_models, paths
 from .audio import SAMPLE_RATE
 from .logging_setup import get as get_logger
 from .onnx_host import HostTranscription, OnnxHost, OnnxHostError, resolved_thread_count
@@ -203,6 +203,11 @@ class SpeechModel:
         #: Bumped on every load and unload, like the macOS
         #: ``TranscriptionWorker.engineGeneration``.
         self.generation = 0
+        #: Vocabulary hotwords sent with every TRANSCRIBE (asr-hotwords spec
+        #: §7–§8); set by the app when a dictation starts.
+        self._hotwords = asr_hotwords.DISABLED
+        self._hotwords_reported: Optional[tuple] = None
+        self._npu_hotwords_logged = False
 
     @property
     def state(self) -> State:
@@ -382,6 +387,49 @@ class SpeechModel:
             self._state = State.IDLE
             self.generation += 1
 
+    # -- hotwords -----------------------------------------------------
+
+    @property
+    def hotwords(self) -> asr_hotwords.HotwordsConfiguration:
+        return self._hotwords
+
+    def set_hotwords(self, configuration: asr_hotwords.HotwordsConfiguration) -> None:
+        """The list for the next requests. Taken as is; an empty list means
+        the unbiased path."""
+        self._hotwords = configuration
+
+    def _request_hotwords(self) -> asr_hotwords.HotwordsConfiguration:
+        """The OpenVINO (NPU) host decodes on its own and has no hotwords:
+        it gets nothing, and the log says so once."""
+        configuration = self._hotwords
+        if configuration.active and self.backend == BACKEND_NPU:
+            if not self._npu_hotwords_logged:
+                self._npu_hotwords_logged = True
+                log.info("ASR hotwords are not supported on the NPU path; %d phrase(s) ignored",
+                         len(configuration.phrases))
+            return asr_hotwords.DISABLED
+        return configuration
+
+    def _report_hotwords(self, configuration, result: HostTranscription) -> None:
+        """Log the host's hotword report once per list, not per request."""
+        if not configuration.active:
+            return
+        report = (configuration, result.hotwords_used, result.hotwords_skipped,
+                  result.hotwords_disabled_reason)
+        if report == self._hotwords_reported:
+            return
+        self._hotwords_reported = report
+        if result.hotwords_disabled_reason:
+            log.warning("ASR hotwords disabled by the host: %s", result.hotwords_disabled_reason)
+        elif result.hotwords_used is None:
+            log.info("ASR hotwords sent (%d), but this host does not report them "
+                     "(an older SuperDictateOnnxHost ignores them)", len(configuration.phrases))
+        else:
+            log.info("ASR hotwords: %d of %d phrase(s) in use, score %.1f%s",
+                     result.hotwords_used, len(configuration.phrases), configuration.score,
+                     f"; skipped: {', '.join(result.hotwords_skipped[:10])}"
+                     if result.hotwords_skipped else "")
+
     # -- inference ---------------------------------------------------
 
     def _call(self, samples: np.ndarray, timestamps: bool) -> HostTranscription:
@@ -391,8 +439,13 @@ class SpeechModel:
         if not self._host.is_alive:
             log.warning("ONNX host is gone; starting it again")
             self._start_host()
+        hotwords = self._request_hotwords()
         try:
-            return self._host.transcribe(samples, timestamps=timestamps)
+            result = self._host.transcribe(samples, timestamps=timestamps,
+                                           hotwords=hotwords.phrases,
+                                           hotwords_score=hotwords.score)
+            self._report_hotwords(hotwords, result)
+            return result
         except OnnxHostError as exc:
             if not exc.kills_host:
                 raise
