@@ -7,14 +7,20 @@ the golden transcripts that tests/model_tests.cpp compares against exactly
 (spec §2.4, §11.2). Never shipped; the app has no Python dependency.
 
 Requires onnxruntime==1.23.2 (the same version as the native SDK), numpy,
-soundfile; `--check-onnx-asr` additionally needs onnx-asr==0.12.0.
+and soundfile (without it, 16-bit PCM WAVs are read with the wave module);
+`--check-onnx-asr` additionally needs onnx-asr==0.12.0.
 
-    reference_gigaam.py [--check-onnx-asr] <model_dir> <assets_dir> <out_dir> file.wav...
+    reference_gigaam.py [--check-onnx-asr] [--hotwords <file> [--hotwords-score x]]
+                        <model_dir> <assets_dir> <out_dir> file.wav...
 
 writes, for each input, <out_dir>/<name>.txt (the text) and
 <out_dir>/<name>.tokens.json ({"frame_sec", "tokens": [[id, frame, conf]]}).
 `--check-onnx-asr` also transcribes each file with onnx-asr itself (CPU, the
 same gigaam_v3.onnx preprocessor graph) and fails unless the texts match.
+`--hotwords` (one phrase per line; docs/specs/asr-hotwords-spec.md §4-§5,
+tools/reference_hotwords.py) decodes with the phrases boosted (default score
+2.0), tokenized with <assets_dir>/gigaam_v3_spm.tsv, and writes
+<name>.hw.txt and <name>.hw.tokens.json instead.
 """
 import json
 import os
@@ -23,7 +29,10 @@ import sys
 
 import numpy as np
 import onnxruntime as ort
-import soundfile as sf
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reference_hotwords as hw  # noqa: E402
+from reference_tdt import read_audio, take_option  # noqa: E402
 
 # onnx-asr's _AsrWithDecoding.DECODE_SPACE_PATTERN: drop a leading space and
 # any space not followed by a word character; keep a space before a word.
@@ -39,6 +48,10 @@ def main():
     argv = sys.argv[1:]
     check = "--check-onnx-asr" in argv
     argv = [a for a in argv if a != "--check-onnx-asr"]
+    hotwords_file = take_option(argv, "--hotwords")
+    hotwords_score = take_option(argv, "--hotwords-score")
+    if check and hotwords_file is not None:
+        sys.exit("--check-onnx-asr compares the unbiased decoder; drop --hotwords")
     if len(argv) < 4:
         sys.exit(__doc__)
     model_dir, assets_dir, out_dir, wavs = argv[0], argv[1], argv[2], argv[3:]
@@ -73,6 +86,13 @@ def main():
     max_symbols, hidden = p["max_symbols_per_frame"], p["pred_hidden"]
     frame_sec = p["hop_seconds"] * p["subsampling_factor"]
 
+    root = None
+    if hotwords_file is not None:
+        score = hw.clamp_score(hotwords_score if hotwords_score is not None else hw.DEFAULT_SCORE)
+        tokenizer = hw.UnigramTokenizer(os.path.join(assets_dir, "gigaam_v3_spm.tsv"), pieces)
+        root, used, skipped = hw.compile_hotwords(hw.load_phrases(hotwords_file), score, tokenizer)
+        print(f"# hotwords: {used} used, score {score}, skipped {skipped}")
+
     def run_decoder(token, h, c):
         out, h2, c2 = dec.run(["dec", "h", "c"], {"x": np.array([[token]], np.int64), "h.1": h, "c.1": c})
         return out.transpose(0, 2, 1), h2, c2  # dec [1,1,H] -> joint input [1,H,1]
@@ -92,6 +112,8 @@ def main():
         # Decoder output for (last emitted token or blank, state); recomputed
         # only after an emission, exactly like onnx-asr's cached state.
         d, h2, c2 = run_decoder(blank, h, c)
+        if root is not None:
+            return finish(decode_biased(e, frames, h, c, d, h2, c2))
         tokens, t, emitted = [], 0, 0
         while t < frames:
             logits = joi.run(["joint"], {"enc": e[None, :, t:t + 1], "dec": d})[0].reshape(-1)
@@ -107,9 +129,46 @@ def main():
             if token == blank or emitted == max_symbols:
                 t += 1
                 emitted = 0
+        return finish(tokens)
+
+    def finish(tokens):
         text = "".join(pieces[i] for i, _, _ in tokens).replace("▁", " ")
         text = DECODE_SPACE_PATTERN.sub(lambda m: " " if m.group(1) else "", text)
         return text, tokens
+
+    def decode_biased(e, frames, h, c, d, h2, c2):
+        """Greedy RNN-T with hotword boosting and rollback (spec §4.2-§4.3)."""
+        bias = hw.Biasing(root)
+        tokens, t, emitted, saved = [], 0, 0, None
+        while True:
+            if t >= frames:
+                if not bias.at_end():
+                    break
+                t, emitted, h, c, d, h2, c2, n = saved
+                del tokens[n:]
+                bias.rolled_back(t, n)
+                continue
+            logits = joi.run(["joint"], {"enc": e[None, :, t:t + 1], "dec": d})[0].reshape(-1)
+            token = int(bias.boost(logits, t, len(tokens)).argmax())
+            if token != blank:
+                action = bias.on_token(pieces[token], token, t, len(tokens))
+                if action == "rollback":
+                    t, emitted, h, c, d, h2, c2, n = saved
+                    del tokens[n:]
+                    bias.rolled_back(t, n)
+                    continue
+                if action == "snapshot":
+                    saved = (t, emitted, h, c, d, h2, c2, len(tokens))
+                if not is_control_piece(pieces[token]):
+                    z = logits.astype(np.float64) - float(logits.max())
+                    tokens.append([token, t, float(np.exp(z[token]) / np.exp(z).sum())])
+                h, c = h2, c2
+                d, h2, c2 = run_decoder(token, h, c)
+                emitted += 1
+            if token == blank or emitted == max_symbols:
+                t += 1
+                emitted = 0
+        return tokens
 
     asr = None
     if check:
@@ -123,16 +182,16 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
     mismatches = 0
+    suffix = ".hw" if root is not None else ""
     for wav in wavs:
-        audio, rate = sf.read(wav, dtype="float32", always_2d=True)
+        mono, rate = read_audio(wav)
         if rate != 16000:
             sys.exit(f"{wav}: {rate} Hz, need 16000")
-        mono = audio.mean(axis=1)
         text, tokens = transcribe(mono)
         name = os.path.splitext(os.path.basename(wav))[0]
-        with open(os.path.join(out_dir, name + ".txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(out_dir, name + suffix + ".txt"), "w", encoding="utf-8") as f:
             f.write(text + "\n")
-        with open(os.path.join(out_dir, name + ".tokens.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(out_dir, name + suffix + ".tokens.json"), "w", encoding="utf-8") as f:
             json.dump({"frame_sec": frame_sec, "tokens": tokens}, f)
             f.write("\n")
         print(f"{name}: {text}")

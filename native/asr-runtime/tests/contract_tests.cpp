@@ -4,11 +4,13 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 #include "audio.h"
 #include "common.h"
 #include "families/family_util.h"
+#include "families/hotwords.h"
 #include "families/punct_text.h"
 #include "manifest.h"
 #include "nlohmann/json.hpp"
@@ -357,6 +359,211 @@ TEST_CASE("modernbert_punct is a supported text family without sample_rate") {
     CHECK(sdasr::is_supported_family("modernbert_punct"));
     CHECK(sdasr::is_text_family("modernbert_punct"));
     CHECK(!sdasr::is_text_family("nemo_tdt"));
+}
+
+// ---- ASR hotwords (docs/specs/asr-hotwords-spec.md §4-§5, §7) -------------
+
+namespace {
+
+// One token per byte (id = byte value); '#' is "outside the vocabulary".
+class ByteTokenizer final : public sdasr::hotwords::PhraseTokenizer {
+public:
+    bool encode(const std::string &phrase, std::vector<int> &ids) const override {
+        ids.clear();
+        for (unsigned char c : phrase) {
+            if (c == '#') return false;
+            ids.push_back(int(c));
+        }
+        return !ids.empty();
+    }
+};
+
+std::vector<int> encoded(const sdasr::hotwords::PhraseTokenizer &tokenizer, const std::string &phrase) {
+    std::vector<int> ids;
+    if (!tokenizer.encode(phrase, ids)) return {-1};
+    return ids;
+}
+
+sd_asr_status parse_status(const json &options, std::vector<std::string> &phrases, double &score) {
+    try {
+        sdasr::hotwords::parse_options(options, phrases, score);
+    } catch (const sdasr::Error &e) {
+        return e.status();
+    }
+    return SD_ASR_OK;
+}
+
+}  // namespace
+
+TEST_CASE("manifest: the bundled hotword_tokenizer role is optional, but verified when present") {
+    TempDir dir;
+    json m = fake_manifest();
+    m["files"]["hotword_tokenizer"] = {{"bundled", "not-shipped.tsv"}, {"sha256", std::string(64, 'a')}};
+    populate(dir.path, m);
+    const sdasr::Manifest loaded = sdasr::load_manifest(dir.path, g_assets, false);
+    CHECK(loaded.files.count("hotword_tokenizer") == 0);
+    CHECK(loaded.files.count("preprocessor") == 1);
+
+    m["files"]["hotword_tokenizer"] = {{"bundled", "gigaam_v3_spm.tsv"}, {"sha256", std::string(64, 'a')}};
+    populate(dir.path, m);
+    bool refused = false;
+    try {
+        sdasr::load_manifest(dir.path, g_assets, false);
+    } catch (const sdasr::Error &e) {
+        refused = e.status() == SD_ASR_INVALID_MODEL;
+    }
+    CHECK(refused);  // present but not the pinned bytes
+
+    m["files"]["hotword_tokenizer"]["sha256"] = sdasr::sha256_file(g_assets / "gigaam_v3_spm.tsv");
+    populate(dir.path, m);
+    CHECK(sdasr::load_manifest(dir.path, g_assets, false).files.count("hotword_tokenizer") == 1);
+    CHECK(!sdasr::is_optional_bundled_role("preprocessor"));
+}
+
+TEST_CASE("hotwords: phrase normalization and word boundaries") {
+    using sdasr::hotwords::is_boundary_piece;
+    using sdasr::hotwords::normalize_phrase;
+    CHECK_EQ(normalize_phrase("  DDR4 \t DIMM\n"),
+             (std::vector<std::string>{"▁", "D", "D", "R", "4", "▁", "D", "I", "M", "M"}));
+    CHECK_EQ(normalize_phrase("ЕСИА"), (std::vector<std::string>{"▁", "Е", "С", "И", "А"}));
+    CHECK(normalize_phrase(" \t ").empty());
+    CHECK(is_boundary_piece("▁при") && is_boundary_piece("▁") && is_boundary_piece("-"));
+    CHECK(is_boundary_piece(",") && is_boundary_piece("«") && is_boundary_piece("_x") && is_boundary_piece("<unk>"));
+    CHECK(!is_boundary_piece("вет") && !is_boundary_piece("M") && !is_boundary_piece("4") && !is_boundary_piece("ё"));
+}
+
+TEST_CASE("hotwords: SentencePiece BPE merges the lowest-id pair") {
+    const std::vector<std::string> pieces = {"<unk>", "▁", "a", "b", "c", "ab", "▁a", "bc", "▁ab", "<blk>"};
+    const sdasr::hotwords::BpeTokenizer bpe(pieces);
+    // ▁ a b c: "ab" (5) beats "▁a" (6) and "bc" (7); then "▁ab" (8).
+    CHECK_EQ(encoded(bpe, "abc"), (std::vector<int>{8, 4}));
+    CHECK_EQ(encoded(bpe, "a  b"), (std::vector<int>{6, 1, 3}));
+    CHECK_EQ(encoded(bpe, "c"), (std::vector<int>{1, 4}));
+    CHECK_EQ(encoded(bpe, "ax"), (std::vector<int>{-1}));      // 'x' is not in the vocabulary
+    CHECK_EQ(encoded(bpe, "<blk>"), (std::vector<int>{-1}));   // control pieces are never matched
+    CHECK_EQ(encoded(bpe, "   "), (std::vector<int>{-1}));
+}
+
+// Expected ids: HF `tokenizers` Unigram over the same piece scores with a
+// Metaspace("▁", prepend always) pre-tokenizer, i.e. SentencePiece unigram.
+TEST_CASE("hotwords: unigram over the bundled GigaAM scores matches SentencePiece") {
+    std::vector<std::string> pieces;
+    {
+        std::ifstream in(g_assets / "gigaam_v3_spm.tsv", std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) pieces.push_back(line.substr(0, line.find('\t')));
+    }
+    CHECK_EQ(pieces.size(), size_t(1024));
+    pieces.push_back("<blk>");
+    const sdasr::hotwords::UnigramTokenizer unigram(g_assets / "gigaam_v3_spm.tsv", pieces);
+    CHECK_EQ(encoded(unigram, "DDR4 DIMM"), (std::vector<int>{521, 982, 499, 408, 521, 570, 894, 894}));
+    CHECK_EQ(encoded(unigram, "Красникову"), (std::vector<int>{118, 31, 6, 41, 278, 11}));
+    CHECK_EQ(encoded(unigram, "ЕСИА"), (std::vector<int>{348, 268, 531, 615}));
+    CHECK_EQ(encoded(unigram, "Gmail watcher"), (std::vector<int>{613, 252, 85, 733, 3, 618, 85, 134, 349, 290, 421}));
+    CHECK_EQ(encoded(unigram, "TickTick"), (std::vector<int>{621, 684, 372, 934, 684, 372}));
+    CHECK_EQ(encoded(unigram, "Ничипуренко"), (std::vector<int>{479, 110, 300, 57, 10, 62}));
+    CHECK_EQ(encoded(unigram, "High-res"), (std::vector<int>{3, 710, 116, 350, 290, 25, 190, 79, 132}));
+    CHECK_EQ(encoded(unigram, "Alien_skaarj"), (std::vector<int>{-1}));  // '_' is not a piece
+
+    // A scores file that is not in the model's vocabulary order is refused.
+    std::vector<std::string> shifted(pieces.begin() + 1, pieces.end());
+    bool refused = false;
+    try {
+        sdasr::hotwords::UnigramTokenizer bad(g_assets / "gigaam_v3_spm.tsv", shifted);
+    } catch (const std::runtime_error &) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+TEST_CASE("hotwords: trie, duplicates and limits") {
+    using namespace sdasr::hotwords;
+    const ByteTokenizer bytes;
+    const std::string long_phrase(kMaxPhraseTokens + 1, 'z');
+    Compiled c = compile({"ab", "ab", "ac", "a#", "", long_phrase, "a", std::string(kMaxPhraseTokens, 'y')}, 2.0, bytes);
+    CHECK_EQ(c.used, size_t(4));
+    CHECK_EQ(c.skipped, (std::vector<std::string>{"a#", "", long_phrase}));
+    const Trie &trie = c.trie;
+    CHECK(!trie.empty());
+    const int a = trie.child(0, 'a');
+    CHECK(a > 0);
+    if (a > 0) {
+        CHECK(trie.node(a).is_end);  // "a" is itself a phrase
+        CHECK_EQ(trie.node(a).token_score, 2.0);
+        CHECK_EQ(trie.node(a).children.size(), size_t(2));
+        CHECK(trie.child(a, 'b') > 0 && trie.node(trie.child(a, 'b')).is_end);
+        CHECK_EQ(trie.child(a, 'd'), -1);
+    }
+    CHECK_EQ(trie.child(0, 'b'), -1);
+    CHECK_EQ(trie.node(0).children.size(), size_t(2));  // 'a', 'y'
+
+    std::vector<std::string> many;
+    for (size_t i = 0; i < kMaxPhrases + 5; ++i) many.push_back("p" + std::to_string(i));
+    Compiled capped = compile(many, 2.0, bytes);
+    CHECK_EQ(capped.used, kMaxPhrases);
+    CHECK_EQ(capped.skipped.size(), size_t(5));
+    CHECK_EQ(capped.skipped.front(), "p" + std::to_string(kMaxPhrases));
+    CHECK(compile({"#"}, 2.0, bytes).trie.empty());
+}
+
+TEST_CASE("hotwords: matcher boosts children, commits at a boundary, rolls back otherwise") {
+    using namespace sdasr::hotwords;
+    using Step = Matcher::Step;
+    Trie trie;
+    trie.insert({5, 6}, 2.0);
+    // Unbiased argmax is 1; token 5 is 1.5 below it, token 6 is 3 below it.
+    const std::vector<float> logits = {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, -0.5f, -2.0f, 0.0f};
+    {
+        Matcher m(trie);
+        CHECK_EQ(m.biased_argmax(logits.data(), logits.size(), 0, 0), int64_t(5));
+        CHECK(m.step(5, true, 0, 0) == Step::kAcceptAndSnapshot);
+        CHECK_EQ(m.biased_argmax(logits.data(), logits.size(), 0, 1), int64_t(1));  // only 6 is boosted now: 0.0 < 1.0
+        CHECK(m.step(1, false, 0, 1) == Step::kRollback);
+        m.rolled_back(0, 0);
+        CHECK_EQ(m.biased_argmax(logits.data(), logits.size(), 0, 0), int64_t(1));  // root boost suppressed here
+        CHECK(m.step(5, true, 0, 0) == Step::kAccept);                              // ... and no new match starts
+        CHECK_EQ(m.biased_argmax(logits.data(), logits.size(), 0, 1), int64_t(5));  // boosted again elsewhere
+        CHECK(!m.finish());
+    }
+    {
+        Matcher m(trie);
+        CHECK(m.step(5, true, 0, 0) == Step::kAcceptAndSnapshot);
+        CHECK(m.step(6, false, 0, 1) == Step::kAccept);       // complete, pending a word boundary
+        CHECK(m.step(3, false, 1, 2) == Step::kRollback);     // the word goes on: not the phrase
+        m.rolled_back(0, 0);
+        CHECK(m.step(5, true, 1, 1) == Step::kAcceptAndSnapshot);
+        CHECK(m.step(6, false, 1, 2) == Step::kAccept);
+        CHECK(m.step(5, true, 2, 3) == Step::kAcceptAndSnapshot);  // boundary: commit, the next match starts
+        CHECK(m.finish());                                         // ... unfinished at the end: roll back
+    }
+    {
+        Matcher m(trie);
+        CHECK(m.step(5, true, 0, 0) == Step::kAcceptAndSnapshot);
+        CHECK(m.step(6, false, 0, 1) == Step::kAccept);
+        CHECK(!m.finish());  // pending at the end commits
+    }
+}
+
+TEST_CASE("hotwords: TRANSCRIBE options validation and score clamp") {
+    using sdasr::hotwords::kDefaultScore;
+    std::vector<std::string> phrases;
+    double score = kDefaultScore;
+    CHECK_EQ(parse_status(json::object(), phrases, score), SD_ASR_OK);
+    CHECK(phrases.empty() && score == kDefaultScore);
+    CHECK_EQ(parse_status({{"hotwords", nullptr}, {"hotwords_score", nullptr}}, phrases, score), SD_ASR_OK);
+    CHECK_EQ(parse_status({{"hotwords", {"DDR4 DIMM", "ЕСИА"}}, {"hotwords_score", 3}}, phrases, score), SD_ASR_OK);
+    CHECK_EQ(phrases, (std::vector<std::string>{"DDR4 DIMM", "ЕСИА"}));
+    CHECK_EQ(score, 3.0);
+    CHECK_EQ(parse_status({{"hotwords_score", 10.5}}, phrases, score), SD_ASR_OK);
+    CHECK_EQ(score, 5.0);
+    CHECK_EQ(parse_status({{"hotwords_score", 0.1}}, phrases, score), SD_ASR_OK);
+    CHECK_EQ(score, 0.5);
+    for (const json &bad : {json{{"hotwords", "DDR4"}}, json{{"hotwords", {1, 2}}}, json{{"hotwords", {{"a", 1}}}},
+                            json{{"hotwords_score", "2"}}, json{{"hotwords_score", true}}}) {
+        std::vector<std::string> p;
+        double s = kDefaultScore;
+        CHECK_EQ(parse_status(bad, p, s), SD_ASR_INVALID_ARGUMENT);
+    }
 }
 
 int main(int argc, char **argv) {

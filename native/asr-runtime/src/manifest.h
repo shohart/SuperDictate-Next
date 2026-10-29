@@ -49,6 +49,11 @@ bool is_supported_family(const std::string &family);
 // Families that take text instead of audio (no sample_rate).
 bool is_text_family(const std::string &family);
 
+// Bundled roles a model works without ("hotword_tokenizer", spec
+// asr-hotwords §5): when the asset is missing the role is left out of
+// Manifest::files instead of refusing the manifest.
+bool is_optional_bundled_role(const std::string &role);
+
 // True for a plain file name: non-empty, no path separators, not "." or
 // "..", no NUL, not absolute, no drive letter.
 bool is_safe_file_name(const std::string &name);

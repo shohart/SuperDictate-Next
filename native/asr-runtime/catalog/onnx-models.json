@@ -99,6 +99,10 @@
         "preprocessor": {
           "bundled": "gigaam_v3.onnx",
           "sha256": "919c3bc8a434b6e733e5fe5dcd247974d0a7b1f2bc5b6995b6ad55f7225e014d"
+        },
+        "hotword_tokenizer": {
+          "bundled": "gigaam_v3_spm.tsv",
+          "sha256": "af72e53d851552fca7510fd1aa8ca7db340407ee1c57bd34c4bafaec1a79529c"
         }
       },
       "params": {

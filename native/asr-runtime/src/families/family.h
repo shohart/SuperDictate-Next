@@ -13,6 +13,11 @@
 
 namespace sdasr {
 
+namespace hotwords {
+class PhraseTokenizer;
+class Trie;
+}  // namespace hotwords
+
 struct DecodedToken {
     int id = 0;
     double t = 0;      // seconds from the start of the buffer passed in
@@ -36,6 +41,9 @@ struct FamilyResult {
 struct RunContext {
     Ort::RunOptions *run_options = nullptr;     // terminate flag for in-graph cancellation
     const std::atomic<bool> *cancelled = nullptr;  // polled between decoder steps
+    // Compiled hotwords (spec asr-hotwords §4); nullptr or an empty trie
+    // selects the unbiased decoder, bit-identical to a request without them.
+    const hotwords::Trie *hotwords = nullptr;
 };
 
 class ModelFamily {
@@ -45,6 +53,9 @@ public:
     // Text families (punctuation restoration) override this; speech
     // families refuse it.
     virtual std::string punctuate(const std::string &text, RunContext &context);
+    // How this model tokenizes hotword phrases, or nullptr with `reason`
+    // set when it cannot use hotwords (spec asr-hotwords §5, §7).
+    virtual const hotwords::PhraseTokenizer *hotword_tokenizer(std::string &reason) const;
 };
 
 // Throws Error(SD_ASR_UNSUPPORTED_MODEL_FAMILY / SD_ASR_INVALID_MODEL /

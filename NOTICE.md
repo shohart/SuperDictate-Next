@@ -41,6 +41,13 @@ respective upstream projects.
   (`onnx_asr/preprocessors/data/gigaam_v3.onnx`, sha256
   `919c3bc8a434b6e733e5fe5dcd247974d0a7b1f2bc5b6995b6ad55f7225e014d`), MIT;
   licence text in `native/asr-runtime/assets/onnx-asr-LICENSE.txt`.
+- `native/asr-runtime/assets/gigaam_v3_spm.tsv` — the GigaAM v3 SentencePiece
+  piece scores (hotword tokenizer), converted by
+  `native/asr-runtime/tools/spm_to_tsv.py` from
+  [ai-sage/GigaAM-v3](https://huggingface.co/ai-sage/GigaAM-v3) revision
+  `7655ad717f8122257385bb4b2f373db3697e8680`, `tokenizer.model` (sha256
+  `828c12c991019eef952a960661f25a92d6ad279591e2ea466b4aeddf1d20a18a`),
+  MIT, SberDevices / GigaChat Team.
 - `native/asr-runtime/third_party/nlohmann/json.hpp` —
   [nlohmann/json](https://github.com/nlohmann/json) 3.11.3 (MIT).
 - Parakeet Ultra ONNX int8 weights (downloaded at runtime, not bundled):

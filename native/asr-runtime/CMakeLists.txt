@@ -67,6 +67,7 @@ add_library(sd_asr STATIC
   src/families/family_util.cpp
   src/families/bpe_tokenizer.cpp
   src/families/gigaam_rnnt.cpp
+  src/families/hotwords.cpp
   src/families/modernbert_punct.cpp
   src/families/nemo_tdt.cpp
   src/families/punct_text.cpp

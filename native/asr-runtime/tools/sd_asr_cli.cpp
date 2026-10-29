@@ -2,11 +2,13 @@
 // Development / diagnostics tool; prints one result JSON per line.
 //
 //   sd_asr_cli --model <dir> --assets <dir> [--provider cpu] [--threads N]
-//              [--text-only] [--repeat N] file.wav...
+//              [--text-only] [--repeat N] [--hotwords <file> [--hotwords-score x]] file.wav...
+//              (--hotwords: one phrase per line, blank lines ignored)
 //   sd_asr_cli --model <punctuation model dir> --punctuate [--text-only] < lines.txt
 //              (one input line -> one output line)
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -16,7 +18,8 @@
 #include "wav.h"
 
 int main(int argc, char **argv) {
-    std::string model_dir, assets_dir, provider = "auto";
+    std::string model_dir, assets_dir, provider = "auto", hotwords_file;
+    double hotwords_score = -1;
     int threads = 0;
     int repeat = 1;
     bool text_only = false;
@@ -36,15 +39,35 @@ int main(int argc, char **argv) {
         else if (arg == "--provider") provider = value("--provider");
         else if (arg == "--threads") threads = std::stoi(value("--threads"));
         else if (arg == "--repeat") repeat = std::stoi(value("--repeat"));
+        else if (arg == "--hotwords") hotwords_file = value("--hotwords");
+        else if (arg == "--hotwords-score") hotwords_score = std::stod(value("--hotwords-score"));
         else if (arg == "--text-only") text_only = true;
         else if (arg == "--punctuate") punctuate = true;
         else files.push_back(arg);
     }
     if (model_dir.empty() || (files.empty() && !punctuate)) {
         std::fprintf(stderr, "usage: sd_asr_cli --model <dir> [--assets <dir>] [--provider p] [--threads n] "
-                             "[--repeat n] [--text-only] file.wav...\n");
+                             "[--repeat n] [--text-only] [--hotwords file [--hotwords-score x]] file.wav...\n");
         return 64;
     }
+
+    nlohmann::json options = nlohmann::json::object();
+    if (!hotwords_file.empty()) {
+        std::ifstream in(hotwords_file, std::ios::binary);
+        if (!in) {
+            std::fprintf(stderr, "cannot read %s\n", hotwords_file.c_str());
+            return 64;
+        }
+        nlohmann::json phrases = nlohmann::json::array();
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.find_first_not_of(" \t") != std::string::npos) phrases.push_back(line);
+        }
+        options["hotwords"] = std::move(phrases);
+    }
+    if (hotwords_score >= 0) options["hotwords_score"] = hotwords_score;
+    const std::string options_json = options.dump();
 
     nlohmann::json config = {{"model_directory", model_dir}, {"assets_directory", assets_dir},
                              {"provider", provider}, {"intra_op_threads", threads}};
@@ -93,7 +116,7 @@ int main(int argc, char **argv) {
         for (int r = 0; r < repeat; ++r) {
             char *result = nullptr;
             const sd_asr_status rc = sd_asr_transcribe_pcm_f32(handle, wav.samples.data(), wav.samples.size(),
-                                                               wav.sample_rate, nullptr, &result, &error);
+                                                               wav.sample_rate, options_json.c_str(), &result, &error);
             if (rc != SD_ASR_OK) {
                 std::fprintf(stderr, "%s: %s\n", file.c_str(), error ? error : "?");
                 sd_asr_free(error);

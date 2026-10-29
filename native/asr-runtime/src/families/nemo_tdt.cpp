@@ -11,6 +11,7 @@
 #include <limits>
 
 #include "family_util.h"
+#include "hotwords.h"
 
 namespace sdasr {
 
@@ -45,6 +46,7 @@ public:
         }
 
         pieces_ = load_tokens(manifest.file("tokens").path, vocab_size_);
+        hotword_tokenizer_ = std::make_unique<hotwords::BpeTokenizer>(pieces_);
 
         try {
             preprocessor_ = std::make_unique<Ort::Session>(factory.open_cpu(manifest.file("preprocessor").path));
@@ -142,6 +144,11 @@ public:
 
         FamilyResult result;
         result.frame_sec = frame_sec_;
+        if (context.hotwords != nullptr && !context.hotwords->empty()) {
+            decode_with_hotwords(context, frame_major, frames, h, c, dec_out, h_next, c_next, result);
+            build_text_and_words(result, double(frames) * frame_sec_);
+            return result;
+        }
         std::vector<float> enc_frame(static_cast<size_t>(encoder_dim_));
         int64_t t = 0;
         int64_t emitted_this_frame = 0;
@@ -178,7 +185,89 @@ public:
         return result;
     }
 
+    const hotwords::PhraseTokenizer *hotword_tokenizer(std::string &) const override {
+        return hotword_tokenizer_.get();
+    }
+
 private:
+    // Greedy TDT with hotword boosting and rollback (spec asr-hotwords
+    // §4.2-§4.3). A separate copy of the loop in transcribe(), so the
+    // unbiased path stays untouched: the token is the biased argmax, the
+    // duration, confidence and decoder updates are exactly as there.
+    void decode_with_hotwords(RunContext &context, const std::vector<float> &frame_major, int64_t frames,
+                              std::vector<float> &h, std::vector<float> &c, std::vector<float> &dec_out,
+                              std::vector<float> &h_next, std::vector<float> &c_next, FamilyResult &result) {
+        Ort::RunOptions &run_options = *context.run_options;
+        hotwords::Matcher matcher(*context.hotwords);
+        struct Snapshot {
+            int64_t t = 0, emitted = 0;
+            size_t tokens = 0;
+            std::vector<float> h, c, dec_out, h_next, c_next;
+        } snapshot;
+        std::vector<float> enc_frame(static_cast<size_t>(encoder_dim_));
+        int64_t t = 0;
+        int64_t emitted_this_frame = 0;
+        auto roll_back = [&] {
+            t = snapshot.t;
+            emitted_this_frame = snapshot.emitted;
+            h = snapshot.h;
+            c = snapshot.c;
+            dec_out = snapshot.dec_out;
+            h_next = snapshot.h_next;
+            c_next = snapshot.c_next;
+            result.tokens.resize(snapshot.tokens);
+            matcher.rolled_back(t, snapshot.tokens);
+        };
+        while (true) {
+            if (t >= frames) {
+                if (!matcher.finish()) break;
+                roll_back();  // an unfinished match at the end
+                continue;
+            }
+            check_cancelled(context);
+            std::copy_n(frame_major.begin() + t * encoder_dim_, encoder_dim_, enc_frame.begin());
+            const std::vector<float> logits = run_joiner(run_options, enc_frame, dec_out);
+
+            const auto token_end = logits.begin() + vocab_size_;
+            const int64_t token = matcher.biased_argmax(logits.data(), size_t(vocab_size_), t, result.tokens.size());
+            const int64_t duration_index = std::distance(token_end, std::max_element(token_end, logits.end()));
+            const int64_t skip = durations_[size_t(duration_index)];
+
+            if (token != blank_id_) {
+                const std::string &piece = pieces_[size_t(token)];
+                const auto step = matcher.step(int(token), hotwords::is_boundary_piece(piece), t, result.tokens.size());
+                if (step == hotwords::Matcher::Step::kRollback) {
+                    roll_back();
+                    continue;
+                }
+                if (step == hotwords::Matcher::Step::kAcceptAndSnapshot) {
+                    snapshot.t = t;
+                    snapshot.emitted = emitted_this_frame;
+                    snapshot.tokens = result.tokens.size();
+                    snapshot.h = h;
+                    snapshot.c = c;
+                    snapshot.dec_out = dec_out;
+                    snapshot.h_next = h_next;
+                    snapshot.c_next = c_next;
+                }
+                if (!is_control_piece(piece)) {
+                    result.tokens.push_back({int(token), double(t) * frame_sec_, softmax_probability(logits.data(), size_t(vocab_size_), size_t(token))});
+                }
+                h.swap(h_next);
+                c.swap(c_next);
+                run_decoder(run_options, int32_t(token), h, c, dec_out, h_next, c_next);
+                ++emitted_this_frame;
+            }
+            if (skip > 0) {
+                t += skip;
+                emitted_this_frame = 0;
+            } else if (token == blank_id_ || emitted_this_frame >= max_symbols_) {
+                t += 1;
+                emitted_this_frame = 0;
+            }
+        }
+    }
+
     void run_decoder(Ort::RunOptions &run_options, int32_t token, std::vector<float> &h, std::vector<float> &c,
                      std::vector<float> &dec_out, std::vector<float> &h_next, std::vector<float> &c_next) {
         int32_t target = token;
@@ -258,6 +347,7 @@ private:
     Ort::MemoryInfo memory_;
     std::unique_ptr<Ort::Session> preprocessor_, encoder_, decoder_, joiner_;
     std::vector<std::string> pieces_;
+    std::unique_ptr<hotwords::BpeTokenizer> hotword_tokenizer_;
     std::vector<int64_t> durations_;
     int64_t feature_dim_ = 0, vocab_size_ = 0, blank_id_ = 0, pred_hidden_ = 0, pred_layers_ = 0;
     int64_t max_symbols_ = 0, encoder_dim_ = 0;

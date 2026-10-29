@@ -87,6 +87,10 @@ bool is_text_family(const std::string &family) {
     return family == "modernbert_punct";
 }
 
+bool is_optional_bundled_role(const std::string &role) {
+    return role == "hotword_tokenizer";
+}
+
 bool is_safe_file_name(const std::string &name) {
     if (name.empty() || name == "." || name == "..") return false;
     for (char c : name) {
@@ -185,6 +189,13 @@ Manifest load_manifest(const fs::path &model_dir, const fs::path &assets_dir, bo
             file.path = model_dir / fs::u8path(name);
         }
 
+        // An optional bundled asset missing from this app build (a frontend
+        // packaged before it existed) drops its role: the feature that needs
+        // it is disabled instead of the model being refused.
+        if (file.bundled && is_optional_bundled_role(role)) {
+            std::error_code missing;
+            if (fs::symlink_status(file.path, missing).type() == fs::file_type::not_found) continue;
+        }
         require_regular_file(file.path, role);
         const uint64_t actual_size = fs::file_size(file.path, ec);
         if (ec) invalid("manifest: cannot stat '" + role + "'");

@@ -73,7 +73,12 @@ SD_ASR_API sd_asr_status sd_asr_get_status(sd_asr_handle *handle,
                                            char **status_json);
 
 /* Transcribes mono float32 PCM. `options_json` may be NULL or e.g.
- * {"request_id":"42","timestamps":true}. */
+ * {"request_id":"42","timestamps":true}. Optional hotwords bias the
+ * decoder towards phrases ("hotwords": ["DDR4 DIMM", ...],
+ * "hotwords_score": 2.0, clamped to [0.5, 5.0]); the result then carries
+ * "hotwords_used", "hotwords_skipped" (when not empty) and, if the model
+ * cannot use them, "hotwords_disabled_reason". No list or an empty one is
+ * the unbiased decoder. */
 SD_ASR_API sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle,
                                                    const float *mono_samples,
                                                    uint64_t count,

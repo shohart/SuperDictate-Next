@@ -12,6 +12,7 @@
 #include "audio.h"
 #include "common.h"
 #include "families/family.h"
+#include "families/hotwords.h"
 #include "manifest.h"
 #include "ort_session.h"
 
@@ -36,6 +37,18 @@ struct sd_asr_handle {
     std::atomic<uint64_t> next_request_number{1};
     double last_processing_seconds = 0;
     double last_rtf = 0;
+
+    // Hotwords compiled for the last request that had any (spec
+    // asr-hotwords §7), keyed by the exact list and score: the overlap-window
+    // path sends the same list with every request. Touched only by the
+    // request holding `busy`.
+    struct HotwordCache {
+        bool valid = false;
+        std::vector<std::string> phrases;
+        double score = 0;
+        sdasr::hotwords::Compiled compiled;
+        std::string disabled_reason;
+    } hotwords;
 };
 
 namespace {
@@ -73,6 +86,22 @@ T get_or(const json &object, const char *key, T fallback) {
     } catch (const json::exception &) {
         throw Error(SD_ASR_INVALID_ARGUMENT, std::string("config field '") + key + "' has the wrong type");
     }
+}
+
+const sd_asr_handle::HotwordCache &compiled_hotwords(sd_asr_handle *h, const std::vector<std::string> &phrases,
+                                                     double score) {
+    auto &cache = h->hotwords;
+    if (cache.valid && cache.score == score && cache.phrases == phrases) return cache;
+    cache.valid = false;
+    cache.phrases = phrases;
+    cache.score = score;
+    cache.compiled = sdasr::hotwords::Compiled();
+    cache.disabled_reason.clear();
+    if (const auto *tokenizer = h->family->hotword_tokenizer(cache.disabled_reason)) {
+        cache.compiled = sdasr::hotwords::compile(phrases, score, *tokenizer);
+    }
+    cache.valid = true;
+    return cache;
 }
 
 json build_status(sd_asr_handle *h) {
@@ -237,6 +266,11 @@ sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle, const float *mono
         if (request_id.empty()) request_id = std::to_string(handle->next_request_number.fetch_add(1));
         const bool want_timestamps = get_or<bool>(options, "timestamps", true) &&
                                      handle->manifest.has_capability("timestamps");
+        std::vector<std::string> hotword_phrases;
+        double hotword_score = sdasr::hotwords::kDefaultScore;
+        sdasr::hotwords::parse_options(options, hotword_phrases, hotword_score);
+        const sd_asr_handle::HotwordCache *hotwords =
+            hotword_phrases.empty() ? nullptr : &compiled_hotwords(handle, hotword_phrases, hotword_score);
 
         // Register the request before any real work, so a cancel issued as
         // soon as the status reports "inference" always finds it.
@@ -248,6 +282,7 @@ sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle, const float *mono
             handle->current_run_options = &run_options;
         }
         sdasr::RunContext context{&run_options, &handle->cancelled};
+        if (hotwords != nullptr && !hotwords->compiled.trie.empty()) context.hotwords = &hotwords->compiled.trie;
 
         sdasr::CanonicalAudio audio =
             sdasr::canonicalize_audio(mono_samples, count, sample_rate, handle->manifest.sample_rate);
@@ -289,6 +324,11 @@ sd_asr_status sd_asr_transcribe_pcm_f32(sd_asr_handle *handle, const float *mono
             result["words"] = std::move(words);
         }
         if (!audio.warnings.empty()) result["warnings"] = audio.warnings;
+        if (hotwords != nullptr) {
+            result["hotwords_used"] = hotwords->compiled.used;
+            if (!hotwords->compiled.skipped.empty()) result["hotwords_skipped"] = hotwords->compiled.skipped;
+            if (!hotwords->disabled_reason.empty()) result["hotwords_disabled_reason"] = hotwords->disabled_reason;
+        }
 
         {
             std::lock_guard<std::mutex> lock(handle->request_mutex);
