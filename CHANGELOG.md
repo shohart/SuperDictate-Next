@@ -33,6 +33,15 @@ macOS (`mac-v0.9.3`) and Windows (`win-v0.9.3`).
 - sherpa-onnx v2.0.0 was evaluated and not adopted. On our models it is no faster and slightly less accurate. Its NeMo log-guard fix was already in our feature graph.
 - Sync server: `server/vocab-sync` (FastAPI + SQLite), at `https://superdictate.bykovlegal.ru`. Spec: `docs/specs/vocabulary-hygiene-and-sync-spec.md`.
 
+### Validation
+- Hotwords, measured with the user's filtered vocabulary (80 phrases):
+  - Test sentences with vocabulary terms: GigaAM fixes DIMM, Красникову and ЕСИА; Parakeet fixes Ничипуренко, DDR4 DIMM, Gmail watcher and Красникову.
+  - Unchanged: 5 control sentences, the golden recordings, and 5 minutes of real dictation. Of 15 trap sentences with look-alike words, only «зип-пакеты» → «ZIP-пакеты» changed (ZIP is in the vocabulary).
+  - The C++ decoders match the independent Python references exactly. The installed bundle and the Windows build give the same text.
+- macOS: the self-tests `all`, `llm-guardrail`, `llm-gec`, `llm-rewrite`, `llm-prefix-primer`, `full-pipeline`, `vocabulary-hygiene` and `vocabulary-sync` pass. `vocabulary-sync` passes against a local server and against the production server. `scripts/verify-release.sh` passes on this zip.
+- macOS 0.9.3 (build 66), x86_64, signed "PolterType Dev". `SuperDictate.zip` SHA-256: `343d20bca2ec5cba8b149ea74e3a076f46d5e2b96f756afc148a23889fe0d011`.
+- Windows: 78 self-tests pass, 10 of them new. The sync test runs against a local server, and the token is protected with DPAPI. `SuperDictate-0.9.3-setup.exe` SHA-256: `6176d7f96fc82891d750abd437f21b266e268f24aa69e3c942cd3c8521680012`.
+
 ## 0.9.2 — 2026-10-27
 
 macOS (`mac-v0.9.2`) and Windows (`win-v0.9.2`).
