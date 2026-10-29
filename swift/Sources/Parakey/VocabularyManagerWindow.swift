@@ -12,6 +12,7 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     private var window: NSWindow?
     private var tableView: NSTableView?
     private var records: [VocabularyRecord] = []
+    private var changeObserver: NSObjectProtocol?
 
     init(store: VocabularyStore) {
         self.store = store
@@ -25,7 +26,7 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 420),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -36,11 +37,22 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         window.contentView = buildContentView()
         window.center()
         self.window = window
+        // Learning in the agent, the account sync and other windows change
+        // the store behind this table: reload on the shared notification.
+        changeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: VOCABULARY_CHANGED_NOTIFICATION, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reload() }
+        }
         reload()
         window.makeKeyAndOrderFront(nil)
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let changeObserver {
+            DistributedNotificationCenter.default().removeObserver(changeObserver)
+        }
+        changeObserver = nil
         window = nil
         tableView = nil
     }
@@ -73,11 +85,19 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         let dateColumn = NSTableColumn(identifier: .init("date"))
         dateColumn.title = "Добавлено"
         dateColumn.width = 90
+        let asrHintColumn = NSTableColumn(identifier: .init("asrHint"))
+        asrHintColumn.title = t("Подсказка ASR", "ASR hint")
+        asrHintColumn.width = 90
+        asrHintColumn.headerToolTip = t(
+            "Подсказывать ли распознаванию эту замену как термин. По умолчанию: ручные записи — да, выученные — только термины (латиница, цифры, аббревиатуры). Щелчок задаёт значение явно.",
+            "Whether recognition is biased toward this replacement as a term. By default manual entries are, learned ones only when term-like (Latin, digits, acronyms). A click sets it explicitly."
+        )
 
         tableView.addTableColumn(sourceColumn)
         tableView.addTableColumn(replacementColumn)
         tableView.addTableColumn(originColumn)
         tableView.addTableColumn(dateColumn)
+        tableView.addTableColumn(asrHintColumn)
 
         scrollView.documentView = tableView
         self.tableView = tableView
@@ -91,8 +111,11 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         let deleteButton = makeButton(title: "Удалить", action: #selector(deleteTapped))
         let importButton = makeButton(title: "Импорт…", action: #selector(importTapped))
         let exportButton = makeButton(title: "Экспорт…", action: #selector(exportTapped))
+        let cleanupButton = makeButton(title: t("Почистить словарь…", "Clean up…"), action: #selector(cleanupTapped))
+        cleanupButton.toolTip = t("Найти в выученных записях мусор (правки пунктуации, словоформы, переписанный текст), цепочки, дубликаты и разнобой регистра. Перед изменением будет показан список. Ручные записи не трогаются.",
+                                  "Find junk in learned entries (punctuation edits, inflections, rewritten text), chains, duplicates and case conflicts. A preview is shown before anything changes. Manual entries are never touched.")
 
-        [addButton, editButton, deleteButton, importButton, exportButton].forEach { buttonRow.addArrangedSubview($0) }
+        [addButton, editButton, deleteButton, importButton, exportButton, cleanupButton].forEach { buttonRow.addArrangedSubview($0) }
 
         root.addArrangedSubview(scrollView)
         root.addArrangedSubview(buttonRow)
@@ -102,6 +125,10 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         ])
 
         return root
+    }
+
+    private func t(_ russian: String, _ english: String) -> String {
+        localizedText(russian, english, language: Settings.shared.interfaceLanguage)
     }
 
     private func makeButton(title: String, action: Selector) -> NSButton {
@@ -122,6 +149,9 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard records.indices.contains(row), let identifier = tableColumn?.identifier else { return nil }
         let record = records[row]
+        if identifier.rawValue == "asrHint" {
+            return asrHintCheckbox(for: record)
+        }
         let text: String
         switch identifier.rawValue {
         case "source": text = record.source
@@ -134,10 +164,54 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         return field
     }
 
+    /// Shows the effective state (AsrHotwordSelection); an entry that can
+    /// never be a hotword (too short, too long, a punctuation-only edit)
+    /// is shown off and disabled.
+    private func asrHintCheckbox(for record: VocabularyRecord) -> NSView {
+        let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(asrHintToggled(_:)))
+        let eligible = AsrHotwordSelection.eligiblePhrase(source: record.source, replacement: record.replacement) != nil
+        checkbox.state = AsrHotwordSelection.isEffective(record) ? .on : .off
+        checkbox.isEnabled = eligible
+        if !eligible {
+            checkbox.toolTip = t("Эта замена не подходит для подсказки: слишком короткая или длинная, без букв или отличается только пунктуацией.",
+                                 "This replacement cannot be a hint: too short or too long, no letters, or a punctuation-only edit.")
+        } else if record.asrHint == nil {
+            checkbox.toolTip = t("Автоматически", "Automatic")
+        } else {
+            checkbox.toolTip = t("Задано вручную", "Set explicitly")
+        }
+        return checkbox
+    }
+
+    @objc private func asrHintToggled(_ sender: NSButton) {
+        guard let tableView else { return }
+        let row = tableView.row(for: sender)
+        guard records.indices.contains(row) else { return }
+        do {
+            try store.setAsrHint(id: records[row].id, hint: sender.state == .on)
+        } catch {
+            presentError(t("Не удалось сохранить подсказку ASR: \(error.localizedDescription)",
+                           "Could not save the ASR hint: \(error.localizedDescription)"))
+        }
+        reload()
+    }
+
     // MARK: - Actions
 
+    /// Spec vocabulary-hygiene §2: the manual editor applies only rule 1
+    /// (trim edge punctuation) and rule 3 (junk replacement).
+    private func manualHygiene(_ pair: (source: String, replacement: String)) -> (source: String, replacement: String)? {
+        guard let reviewed = VocabularyHygiene.reviewManual(source: pair.source, replacement: pair.replacement) else {
+            presentError(t("Замена должна содержать букву и быть не короче 2 символов (без учёта пунктуации по краям).",
+                           "The replacement needs a letter and at least 2 characters (edge punctuation is not counted)."))
+            return nil
+        }
+        return reviewed
+    }
+
     @objc private func addTapped() {
-        guard let pair = promptForCorrection(existingSource: "", existingReplacement: "") else { return }
+        guard let prompted = promptForCorrection(existingSource: "", existingReplacement: ""),
+              let pair = manualHygiene(prompted) else { return }
         guard let validated = normalizedTranscriptCorrections(
             [TranscriptCorrection(source: pair.source, replacement: pair.replacement)]
         ).first else {
@@ -173,7 +247,8 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     @objc private func editTapped() {
         guard let tableView, tableView.selectedRow >= 0, records.indices.contains(tableView.selectedRow) else { return }
         let record = records[tableView.selectedRow]
-        guard let pair = promptForCorrection(existingSource: record.source, existingReplacement: record.replacement) else { return }
+        guard let prompted = promptForCorrection(existingSource: record.source, existingReplacement: record.replacement),
+              let pair = manualHygiene(prompted) else { return }
         guard let validated = normalizedTranscriptCorrections(
             [TranscriptCorrection(source: pair.source, replacement: pair.replacement)]
         ).first else {
@@ -188,11 +263,16 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
             presentError("A correction for \"\(validated.source)\" already exists.")
             return
         }
-        if normalizedTranscriptCorrectionSource(validated.source) != normalizedTranscriptCorrectionSource(record.source) {
+        let sourceChanged = normalizedTranscriptCorrectionSource(validated.source) != normalizedTranscriptCorrectionSource(record.source)
+        if sourceChanged {
             store.delete(id: record.id)
         }
         do {
-            _ = try store.upsert(source: validated.source, replacement: validated.replacement, origin: record.origin)
+            let saved = try store.upsert(source: validated.source, replacement: validated.replacement, origin: record.origin)
+            // A changed source is a fresh row: carry the explicit ASR hint over.
+            if sourceChanged, let hint = record.asrHint {
+                try store.setAsrHint(id: saved.id, hint: hint)
+            }
         } catch {
             presentError("Could not save that correction: \(error.localizedDescription)")
             reload()
@@ -279,6 +359,103 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
             try TranscriptCorrectionsTransfer.write(corrections, to: url)
         } catch {
             presentError("Could not save that corrections file: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Cleanup (spec vocabulary-hygiene §3)
+
+    @objc private func cleanupTapped() {
+        let plan = store.cleanupPlan()
+        guard !plan.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = t("Словарь в порядке", "The vocabulary is clean")
+            alert.informativeText = t("В выученных записях нечего удалять или исправлять.",
+                                      "Nothing to delete or fix in the learned entries.")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = t("Почистить словарь?", "Clean up the vocabulary?")
+        let duplicateCount = plan.deletions.filter { if case .duplicate = $0.reason { return true } else { return false } }.count
+        alert.informativeText = t(
+            "Удалить: \(plan.deletions.count - duplicateCount), исправить: \(plan.rewrites.count), убрать дубликатов: \(duplicateCount). Ручные записи не меняются.",
+            "Delete: \(plan.deletions.count - duplicateCount), fix: \(plan.rewrites.count), remove duplicates: \(duplicateCount). Manual entries stay unchanged."
+        )
+        alert.addButton(withTitle: t("Почистить", "Clean Up"))
+        alert.addButton(withTitle: t("Отмена", "Cancel"))
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 320))
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.isEditable = false
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 12)
+        textView.autoresizingMask = [.width]
+        textView.string = cleanupPreviewText(plan)
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try store.applyCleanup(plan)
+            log("vocabulary: cleanup applied — \(plan.deletions.count) deleted, \(plan.rewrites.count) rewritten")
+        } catch {
+            presentError(t("Не удалось почистить словарь: \(error.localizedDescription)",
+                           "Could not clean up the vocabulary: \(error.localizedDescription)"))
+        }
+        reload()
+    }
+
+    private func cleanupPreviewText(_ plan: VocabularyHygiene.CleanupPlan) -> String {
+        func pair(_ source: String, _ replacement: String) -> String { "«\(source)» → «\(replacement)»" }
+        var lines: [String] = []
+        let rejected = plan.deletions.compactMap { deletion -> (VocabularyRecord, VocabularyHygiene.RejectReason)? in
+            if case .rejected(let reason) = deletion.reason { return (deletion.record, reason) }
+            return nil
+        }
+        if !rejected.isEmpty {
+            lines.append(t("Удалить (\(rejected.count)):", "Delete (\(rejected.count)):"))
+            for (record, reason) in rejected {
+                lines.append("  " + pair(record.source, record.replacement) + " — " + reasonText(reason))
+            }
+            lines.append("")
+        }
+        if !plan.rewrites.isEmpty {
+            lines.append(t("Исправить (\(plan.rewrites.count)):", "Fix (\(plan.rewrites.count)):"))
+            for rewrite in plan.rewrites {
+                let kinds = rewrite.kinds.map(kindText).joined(separator: ", ")
+                lines.append("  " + pair(rewrite.record.source, rewrite.record.replacement)
+                             + "  ⇒  " + pair(rewrite.source, rewrite.replacement) + " — " + kinds)
+            }
+            lines.append("")
+        }
+        if !plan.merges.isEmpty {
+            let removed = plan.merges.reduce(0) { $0 + $1.removed.count }
+            lines.append(t("Объединить дубликаты (удалить \(removed)):", "Merge duplicates (delete \(removed)):"))
+            for merge in plan.merges {
+                let names = merge.removed.map { pair($0.source, $0.replacement) }.joined(separator: ", ")
+                lines.append("  " + names + t("  — остаётся «\(merge.keptSource)»", "  — keeps «\(merge.keptSource)»"))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func reasonText(_ reason: VocabularyHygiene.RejectReason) -> String {
+        switch reason {
+        case .punctuation: return t("правка только пунктуации или регистра", "punctuation or case only")
+        case .noLetters: return t("в замене нет букв", "no letters in the replacement")
+        case .inflection: return t("смена словоформы", "word-form change")
+        case .rewrite: return t("переписан текст, а не термин", "text rewrite, not a term")
+        }
+    }
+
+    private func kindText(_ kind: VocabularyHygiene.CleanupRewriteKind) -> String {
+        switch kind {
+        case .trimmed: return t("пунктуация по краям", "edge punctuation")
+        case .chain: return t("цепочка", "chain")
+        case .caseUnified: return t("единый регистр", "unified case")
         }
     }
 

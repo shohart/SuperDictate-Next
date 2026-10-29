@@ -98,7 +98,12 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// same segmentation a recorded dictation goes through, with each engine's
 /// helper resolved from Contents/Helpers) — never a mock.
 ///
-/// usage: SuperDictate --benchmark-transcribe [onnx|gigaam] cpu <threads> <wav1> [wav2 ...]
+/// usage: SuperDictate --benchmark-transcribe [onnx|gigaam] [--hotwords <file> [--hotwords-score x]] cpu <threads> <wav1> [wav2 ...]
+///
+/// `--hotwords` biases every request toward the phrases in `<file>` (one
+/// per line, blank lines ignored; spec asr-hotwords §7) at weight
+/// `--hotwords-score` (default 2.0, the host clamps to 0.5…5.0). Without
+/// it the requests carry no hotword keys at all.
 ///
 /// `onnx` (or no backend word) = Parakeet Ultra, as before; `gigaam` =
 /// GigaAM v3 e2e RNN-T. Either model is downloaded into the app cache if
@@ -115,8 +120,17 @@ func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
 /// a message on stderr for any failure.
 func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     guard arguments.first == "--benchmark-transcribe" else { return nil }
-    let usage = "usage: SuperDictate --benchmark-transcribe [onnx|gigaam] cpu <threads> <wav1> [wav2 ...]\n"
+    let usage = "usage: SuperDictate --benchmark-transcribe [onnx|gigaam] [--hotwords <file> [--hotwords-score x]] cpu <threads> <wav1> [wav2 ...]\n"
     var rest = Array(arguments.dropFirst())
+    let hotwords: AsrHotwordsConfiguration
+    switch benchmarkExtractHotwords(&rest) {
+    case .success(let configuration):
+        hotwords = configuration
+    case .failure(let message):
+        fputs("benchmark: \(message.text)\n", stderr)
+        fputs(usage, stderr)
+        return EXIT_FAILURE
+    }
     if let first = rest.first, first == "whisper" || first == "parakeet" {
         fputs("benchmark: the \(first) backend was removed; speech recognition is ONNX on the CPU only\n", stderr)
         return EXIT_FAILURE
@@ -150,7 +164,8 @@ func runASRBenchmarkDiagnostic(arguments: [String]) -> Int32? {
     Task.detached {
         defer { semaphore.signal() }
         do {
-            try await runSegmentedBenchmark(profile: profile, threads: threads, wavPaths: wavPaths)
+            try await runSegmentedBenchmark(profile: profile, threads: threads, wavPaths: wavPaths,
+                                            hotwords: hotwords)
             exitCode.set(EXIT_SUCCESS)
         } catch {
             fputs("BENCH_FAILED: \(error.localizedDescription)\n", stderr)
@@ -309,6 +324,47 @@ private func runStreamingBenchmark(profile: SpeechModelProfile, threads: Int, sp
     return allIdentical
 }
 
+struct BenchmarkArgumentError: Error {
+    let text: String
+}
+
+/// Removes `--hotwords <file>` and `--hotwords-score <x>` from `arguments`
+/// (anywhere before the WAV list) and reads the phrase file.
+func benchmarkExtractHotwords(_ arguments: inout [String]) -> Result<AsrHotwordsConfiguration, BenchmarkArgumentError> {
+    var file: String?
+    var score = AsrHotwordsStrength.normal.score
+    var index = 0
+    while index < arguments.count {
+        switch arguments[index] {
+        case "--hotwords", "--hotwords-score":
+            guard index + 1 < arguments.count else {
+                return .failure(BenchmarkArgumentError(text: "\(arguments[index]) needs a value"))
+            }
+            let value = arguments[index + 1]
+            if arguments[index] == "--hotwords" {
+                file = value
+            } else {
+                guard let parsed = Double(value), parsed.isFinite, parsed > 0 else {
+                    return .failure(BenchmarkArgumentError(text: "invalid --hotwords-score \(value)"))
+                }
+                score = parsed
+            }
+            arguments.removeSubrange(index...(index + 1))
+        default:
+            index += 1
+        }
+    }
+    guard let file else { return .success(.disabled) }
+    guard let contents = try? String(contentsOfFile: file, encoding: .utf8) else {
+        return .failure(BenchmarkArgumentError(text: "cannot read hotwords file \(file)"))
+    }
+    let phrases = contents
+        .split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return .success(AsrHotwordsConfiguration(phrases: phrases, score: score))
+}
+
 private func benchmarkEscapedText(_ text: String) -> String {
     text
         .replacingOccurrences(of: "\\", with: "\\\\")
@@ -322,7 +378,8 @@ private func benchmarkEscapedText(_ text: String) -> String {
 /// exactly as a recorded dictation. Never a raw whole-file engine call: the
 /// app never hands the engine a long unsegmented clip, and the benchmark
 /// must not either.
-private func runSegmentedBenchmark(profile: SpeechModelProfile, threads: Int, wavPaths: [String]) async throws {
+private func runSegmentedBenchmark(profile: SpeechModelProfile, threads: Int, wavPaths: [String],
+                                   hotwords: AsrHotwordsConfiguration = .disabled) async throws {
     // The worker reads its thread count from this override (1...32).
     setenv("SUPERDICTATE_ASR_THREADS", String(threads), 1)
     let worker = TranscriptionWorker()
@@ -330,6 +387,8 @@ private func runSegmentedBenchmark(profile: SpeechModelProfile, threads: Int, wa
     let loadStart = ProcessInfo.processInfo.systemUptime
     try await worker.load(profile: profile)
     let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStart
+    // After load(): its own warm-up stays unbiased, like the agent's.
+    await worker.setHotwords(hotwords)
     // load() already warmed the engine; this second pass mirrors the
     // agent's own post-load warm-up through the worker. Not worker.warmUp():
     // that resolves the dictation language from the keyboard layout on the
@@ -343,7 +402,7 @@ private func runSegmentedBenchmark(profile: SpeechModelProfile, threads: Int, wa
     let deviceArg = "cpu"
     let actualDevice = "cpu"
 
-    print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented model=\(profile.onnxModelID)")
+    print("BENCH_LOAD backend=\(backend) device=\(deviceArg) requested_threads=\(threads) load_s=\(loadSeconds) warmup_s=\(warmSeconds) actual_device=\(actualDevice) path=segmented model=\(profile.onnxModelID) hotwords=\(hotwords.phrases.count) hotwords_score=\(hotwords.phrases.isEmpty ? 0 : hotwords.score)")
 
     for path in wavPaths {
         let samples = try benchmarkReadMonoPCM(fileURL: URL(fileURLWithPath: path))

@@ -123,6 +123,13 @@ actor OnnxAsrEngine {
     private(set) var modelID = ""
     private(set) var loadSeconds = 0.0
     let threadCount: Int
+    /// ASR hotwords (spec asr-hotwords §7), sent with every TRANSCRIBE.
+    /// Empty = the unbiased path; no hotword keys are sent at all.
+    private(set) var hotwords: [String] = []
+    private(set) var hotwordsScore = AsrHotwordsStrength.normal.score
+    /// Set when the list changes; the next result's hotword report is
+    /// logged once and the flag cleared.
+    private var hotwordsReportPending = false
 
     /// Spawns the helper and loads the model (CREATE). `modelDirectory`
     /// must hold a verified install (downloadOnnxModelIfNeeded). A non-nil
@@ -241,6 +248,50 @@ actor OnnxAsrEngine {
         return (punctuated, object["processing_seconds"] as? Double ?? 0)
     }
 
+    /// No-op when unchanged, so callers may re-apply the same list before
+    /// every request.
+    func setHotwords(_ phrases: [String], score: Double) {
+        guard phrases != hotwords || score != hotwordsScore else { return }
+        hotwords = phrases
+        hotwordsScore = score
+        hotwordsReportPending = !phrases.isEmpty
+        if phrases.isEmpty {
+            log("ASR hotwords: off")
+        } else {
+            log("ASR hotwords: \(phrases.count) phrase(s), score \(score)")
+        }
+    }
+
+    /// TRANSCRIBE options (spec asr-hotwords §7). The hotword keys are
+    /// added only for a non-empty list, so the unbiased request is
+    /// byte-for-byte the pre-hotwords one.
+    static func transcribeOptions(timestamps: Bool, hotwords: [String], hotwordsScore: Double) -> [String: Any] {
+        var options: [String: Any] = ["timestamps": timestamps, "sample_rate": Int(SAMPLE_RATE)]
+        if !hotwords.isEmpty {
+            options["hotwords"] = hotwords
+            options["hotwords_score"] = hotwordsScore
+        }
+        return options
+    }
+
+    /// One log line per list change with what the host made of it.
+    private func reportHotwordsIfPending(_ result: [String: Any]) {
+        guard hotwordsReportPending else { return }
+        hotwordsReportPending = false
+        var parts: [String] = []
+        if let used = result["hotwords_used"] as? Int {
+            parts.append("used \(used)")
+        }
+        if let skipped = result["hotwords_skipped"] as? [String], !skipped.isEmpty {
+            let shown = skipped.prefix(10).map { "\"\($0)\"" }.joined(separator: ", ")
+            parts.append("skipped \(skipped.count): \(shown)\(skipped.count > 10 ? ", …" : "")")
+        }
+        if let reason = result["hotwords_disabled_reason"] as? String, !reason.isEmpty {
+            parts.append("disabled: \(reason)")
+        }
+        log("ASR hotwords (host): \(parts.isEmpty ? "no report (host predates hotwords?)" : parts.joined(separator: "; "))")
+    }
+
     func shutdown() {
         guard isAlive else { return }
         isAlive = false
@@ -268,11 +319,13 @@ actor OnnxAsrEngine {
 
     private func transcribeJSON(samples: [Float], timestamps: Bool) throws -> (dictionary: [String: Any], data: Data) {
         guard !samples.isEmpty else { throw ASREngineError.emptyAudio }
-        let options: [String: Any] = ["timestamps": timestamps, "sample_rate": Int(SAMPLE_RATE)]
-        return try roundTripRaw(type: .transcribe,
-                                json: try JSONSerialization.data(withJSONObject: options),
-                                pcm: samples,
-                                timeoutSeconds: Self.timeoutSeconds(sampleCount: samples.count))
+        let options = Self.transcribeOptions(timestamps: timestamps, hotwords: hotwords, hotwordsScore: hotwordsScore)
+        let result = try roundTripRaw(type: .transcribe,
+                                      json: try JSONSerialization.data(withJSONObject: options),
+                                      pcm: samples,
+                                      timeoutSeconds: Self.timeoutSeconds(sampleCount: samples.count))
+        reportHotwordsIfPending(result.dictionary)
+        return result
     }
 
     private func roundTrip(type: OnnxIPC.MessageType, json: Data, timeoutSeconds: Double) throws -> [String: Any] {

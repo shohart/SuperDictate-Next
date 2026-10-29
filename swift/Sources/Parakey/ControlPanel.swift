@@ -81,6 +81,8 @@ struct ControlPanelSettingsDraft: Equatable {
     var autoStopSilenceSeconds: Int
     var muteWhileRecording: Bool
     var autoLearnVocabularyEnabled: Bool
+    var asrHotwordsEnabled: Bool
+    var asrHotwordsStrength: AsrHotwordsStrength
     var textPostprocessingMode: TextPostprocessingMode
     var llmEngineBackend: LLMEngineBackend
     var llmCustomBaseURL: String
@@ -140,6 +142,8 @@ struct ControlPanelSettingsDraft: Equatable {
         autoStopSilenceSeconds = settings.autoStopSilenceSeconds
         muteWhileRecording = settings.muteWhileRecording
         autoLearnVocabularyEnabled = settings.autoLearnVocabularyEnabled
+        asrHotwordsEnabled = settings.asrHotwordsEnabled
+        asrHotwordsStrength = settings.asrHotwordsStrength
         textPostprocessingMode = settings.textPostprocessingMode
         llmEngineBackend = settings.llmEngineBackend
         llmCustomBaseURL = settings.llmCustomBaseURL
@@ -228,6 +232,18 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
     private lazy var vocabularyManagerWindowController = VocabularyManagerWindowController(store: Settings.shared.vocabularyStore)
+    /// Sign-in, sign-out and the manual sync button; the agent runs the
+    /// automatic triggers (VocabularySync.swift).
+    private lazy var vocabularySync = VocabularySyncCoordinator(settings: Settings.shared, role: .controlPanel)
+    /// Transient sign-in form state — never part of the settings draft
+    /// (signing in acts immediately, it is not a Save-able setting).
+    private var vocabularySyncEmailInput: String?
+    private var vocabularySyncPasswordInput = ""
+    private var vocabularySyncBusy = false
+    private var vocabularySyncMessage: String?
+    private weak var vocabularySyncStatusLabel: NSTextField?
+    static let vocabularySyncEmailFieldTag = 9007
+    static let vocabularySyncPasswordFieldTag = 9008
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
     private var updateTask: Task<Void, Never>?
@@ -315,6 +331,12 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         NSApp.setActivationPolicy(.regular)
         showWindow()
         startRefreshTimer()
+        vocabularySync.start()
+        DistributedNotificationCenter.default().addObserver(
+            forName: VOCABULARY_SYNC_STATUS_NOTIFICATION, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.vocabularySyncStatusChanged() }
+        }
         checkForUpdates()
         if settings.agentEnabled && !SuperDictateAgentService.isAgentLoadedOrRunning() {
             beginServiceOperation(.starting)
@@ -572,6 +594,10 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
         root.addArrangedSubview(launchAtLoginRow())
         root.addArrangedSubview(correctionsInfoRow())
         root.addArrangedSubview(autoLearnVocabularyRow(draft))
+        root.addArrangedSubview(asrHotwordsRow(draft))
+        if draft.asrHotwordsEnabled {
+            root.addArrangedSubview(asrHotwordsStrengthRow(draft))
+        }
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -760,6 +786,12 @@ case .text:
             content.addArrangedSubview(removeFinalPeriodRow(draft))
             content.addArrangedSubview(correctionsInfoRow())
             content.addArrangedSubview(autoLearnVocabularyRow(draft))
+            content.addArrangedSubview(asrHotwordsRow(draft))
+            if draft.asrHotwordsEnabled {
+                content.addArrangedSubview(asrHotwordsStrengthRow(draft))
+            }
+            content.addArrangedSubview(separator())
+            content.addArrangedSubview(vocabularySyncSection())
 
         case .correction:
             // Correction section (tier, engine, endpoint/model) — gated on
@@ -2041,6 +2073,62 @@ header.addArrangedSubview(panelLabel(
         return row
     }
 
+    private func asrHotwordsRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Подсказывать распознаванию термины из словаря", "Bias recognition toward vocabulary terms"),
+            size: 13,
+            weight: .semibold
+        ))
+        let detail = panelLabel(
+            t("Модель распознавания охотнее пишет названия, аббревиатуры и латиницу из словаря. Выученные обычные слова не подсказываются; отдельные записи включаются в окне словаря, колонка «Подсказка ASR».",
+              "The speech model prefers names, acronyms and Latin spellings from the vocabulary. Ordinary learned words are not boosted; switch single entries on or off in the vocabulary window, \"ASR hint\" column."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleAsrHotwordsSetting(_:))
+        toggle.state = draft.asrHotwordsEnabled ? .on : .off
+        toggle.toolTip = t("Подсказывать модели распознавания термины из словаря (hotwords).",
+                           "Bias the speech model toward vocabulary terms (hotwords).")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func asrHotwordsStrengthRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Сила подсказки", "Hint strength"),
+            detail: t("«Сильнее» исправляет больше терминов, но чаще заменяет похожие обычные слова термином из словаря.",
+                      "\"Strong\" fixes more terms but more often turns a similar ordinary word into a vocabulary term."),
+            selectedValue: draft.asrHotwordsStrength.rawValue,
+            options: AsrHotwordsStrength.allCases.map { strength in
+                switch strength {
+                case .normal: return (t("Обычно", "Normal"), strength.rawValue)
+                case .strong: return (t("Сильнее", "Strong"), strength.rawValue)
+                }
+            },
+            action: #selector(selectAsrHotwordsStrength(_:)),
+            toolTip: t("Насколько сильно подталкивать распознавание к терминам из словаря.",
+                       "How strongly recognition is pushed toward vocabulary terms.")
+        )
+    }
+
     private func correctionsInfoRow() -> NSView {
         let text = NSStackView()
         text.orientation = .vertical
@@ -2075,6 +2163,213 @@ header.addArrangedSubview(panelLabel(
 
     @objc private func openVocabularyManager() {
         vocabularyManagerWindowController.show()
+    }
+
+    // MARK: - Vocabulary account sync (spec vocabulary-hygiene-and-sync §4.3)
+
+    private func vocabularySyncSection() -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        container.addArrangedSubview(panelLabel(t("Синхронизация словаря", "Vocabulary sync"), size: 13, weight: .semibold))
+
+        let signedIn = vocabularySync.isSignedIn
+        if signedIn {
+            container.addArrangedSubview(panelLabel(settings.vocabularySyncEmail, size: 12, weight: .medium))
+            let status = panelLabel("", size: 12, color: .secondaryLabelColor)
+            status.preferredMaxLayoutWidth = 560
+            container.addArrangedSubview(status)
+            vocabularySyncStatusLabel = status
+            updateVocabularySyncStatusLabel()
+        } else {
+            vocabularySyncStatusLabel = nil
+            if settings.vocabularySyncEnabled,
+               settings.vocabularySyncLastError == VocabularySyncFailure.unauthorized.rawValue {
+                container.addArrangedSubview(panelLabel(t("Войдите снова.", "Sign in again."), size: 12,
+                                                        weight: .medium, color: .systemOrange))
+            }
+            func field(title: String, value: String, tag: Int, secure: Bool, placeholder: String) -> NSView {
+                let row = NSStackView()
+                row.orientation = .vertical
+                row.alignment = .leading
+                row.spacing = 3
+                row.addArrangedSubview(panelLabel(title, size: 12, weight: .medium, color: .secondaryLabelColor))
+                let input: NSTextField = secure ? NSSecureTextField() : NSTextField()
+                input.stringValue = value
+                input.placeholderString = placeholder
+                input.tag = tag
+                input.delegate = self
+                input.isEnabled = !vocabularySyncBusy
+                input.translatesAutoresizingMaskIntoConstraints = false
+                row.addArrangedSubview(input)
+                input.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+                return row
+            }
+            let fields = [
+                field(title: t("Эл. почта", "E-mail"),
+                      value: vocabularySyncEmailInput ?? settings.vocabularySyncEmail,
+                      tag: Self.vocabularySyncEmailFieldTag, secure: false, placeholder: "name@example.com"),
+                field(title: t("Пароль", "Password"), value: vocabularySyncPasswordInput,
+                      tag: Self.vocabularySyncPasswordFieldTag, secure: true,
+                      placeholder: t("не короче 8 символов", "at least 8 characters")),
+            ]
+            for row in fields {
+                container.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalToConstant: 320).isActive = true
+            }
+        }
+
+        let consent = panelLabel(
+            t("Словарь будет храниться на сервере SuperDictate и использоваться для улучшения распознавания речи.",
+              "Your vocabulary is stored on the SuperDictate server and used to improve speech recognition."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        consent.preferredMaxLayoutWidth = 560
+        container.addArrangedSubview(consent)
+
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        if signedIn {
+            buttons.addArrangedSubview(panelButton(
+                t("Синхронизировать сейчас", "Sync Now"),
+                action: #selector(vocabularySyncNowClicked),
+                enabled: !vocabularySyncBusy,
+                toolTip: t("Отправить изменения словаря на сервер и получить изменения с других компьютеров.",
+                           "Send vocabulary changes to the server and fetch changes from your other computers.")))
+            buttons.addArrangedSubview(panelButton(
+                t("Выйти", "Sign Out"),
+                action: #selector(vocabularySyncSignOutClicked),
+                enabled: !vocabularySyncBusy,
+                toolTip: t("Остановить синхронизацию на этом Mac. Словарь на компьютере остаётся.",
+                           "Stop syncing on this Mac. The local vocabulary stays.")))
+        } else {
+            buttons.addArrangedSubview(panelButton(
+                t("Войти", "Sign In"),
+                action: #selector(vocabularySyncSignInClicked),
+                enabled: !vocabularySyncBusy,
+                toolTip: t("Войти в аккаунт синхронизации. Если для этой почты аккаунта ещё нет, он будет создан.",
+                           "Sign in to the sync account. If this e-mail has no account yet, one is created.")))
+        }
+        if vocabularySyncBusy {
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.startAnimation(nil)
+            buttons.addArrangedSubview(spinner)
+        }
+        container.addArrangedSubview(buttons)
+
+        if let message = vocabularySyncMessage {
+            let label = panelLabel(message, size: 12, color: .systemRed)
+            label.preferredMaxLayoutWidth = 560
+            container.addArrangedSubview(label)
+        }
+        return container
+    }
+
+    /// A pass in either process finished, or the agent got a 401: refresh
+    /// the status line, or switch back to the sign-in form.
+    private func vocabularySyncStatusChanged() {
+        if vocabularySyncStatusLabel != nil, !vocabularySyncBusy, !vocabularySync.isSignedIn {
+            refreshSettingsWindow()
+        } else {
+            updateVocabularySyncStatusLabel()
+        }
+    }
+
+    private func updateVocabularySyncStatusLabel() {
+        guard let label = vocabularySyncStatusLabel else { return }
+        _ = settings.refreshFromDisk()
+        var parts: [String] = []
+        if let last = settings.vocabularySyncLastSyncAt {
+            let formatter = DateFormatter()
+            formatter.dateStyle = .short
+            formatter.timeStyle = .short
+            formatter.locale = Locale(identifier: language == .russian ? "ru_RU" : "en_US")
+            parts.append(t("Последняя синхронизация: \(formatter.string(from: last))",
+                           "Last sync: \(formatter.string(from: last))"))
+        } else {
+            parts.append(t("Ещё не синхронизировано", "Not synced yet"))
+        }
+        if vocabularySync.isSyncing || vocabularySyncBusy {
+            parts.append(t("синхронизация…", "syncing…"))
+        } else if let raw = settings.vocabularySyncLastError, let failure = VocabularySyncFailure(rawValue: raw) {
+            parts.append(vocabularySyncFailureText(failure))
+        } else if settings.vocabularySyncLastSyncAt != nil {
+            parts.append(t("всё синхронизировано", "up to date"))
+        }
+        label.stringValue = parts.joined(separator: " · ")
+    }
+
+    private func vocabularySyncFailureText(_ failure: VocabularySyncFailure) -> String {
+        switch failure {
+        case .wrongPassword: return t("Неверный пароль.", "Wrong password.")
+        case .tooManyAttempts: return t("Слишком много попыток входа. Попробуйте позже.",
+                                        "Too many sign-in attempts. Try again later.")
+        case .invalidCredentials: return t("Проверьте адрес почты; пароль должен быть не короче 8 символов.",
+                                           "Check the e-mail address; the password needs at least 8 characters.")
+        case .unauthorized, .notSignedIn: return t("Войдите снова.", "Sign in again.")
+        case .network: return t("Нет соединения с сервером синхронизации.", "No connection to the sync server.")
+        case .server: return t("Ошибка сервера синхронизации.", "Sync server error.")
+        case .busy: return t("Синхронизация занята, повторим позже.", "Sync is busy; will retry later.")
+        case .keychain: return t("Не удалось сохранить вход в связке ключей.", "Could not store the sign-in in the Keychain.")
+        }
+    }
+
+    @objc private func vocabularySyncSignInClicked() {
+        let email = (vocabularySyncEmailInput ?? settings.vocabularySyncEmail).trimmingCharacters(in: .whitespacesAndNewlines)
+        let password = vocabularySyncPasswordInput
+        guard !email.isEmpty, !password.isEmpty else {
+            vocabularySyncMessage = t("Введите почту и пароль.", "Enter the e-mail and password.")
+            refreshSettingsWindow()
+            return
+        }
+        vocabularySyncBusy = true
+        vocabularySyncMessage = nil
+        refreshSettingsWindow()
+        Task { @MainActor in
+            let result = await vocabularySync.signIn(email: email, password: password)
+            vocabularySyncBusy = false
+            switch result {
+            case .success:
+                vocabularySyncPasswordInput = ""
+                vocabularySyncEmailInput = nil
+                if let raw = settings.vocabularySyncLastError, let failure = VocabularySyncFailure(rawValue: raw) {
+                    vocabularySyncMessage = vocabularySyncFailureText(failure)
+                }
+            case .failure(let failure):
+                vocabularySyncMessage = vocabularySyncFailureText(failure)
+            }
+            refreshSettingsWindow()
+        }
+    }
+
+    @objc private func vocabularySyncNowClicked() {
+        vocabularySyncBusy = true
+        vocabularySyncMessage = nil
+        refreshSettingsWindow()
+        Task { @MainActor in
+            let failure = await vocabularySync.sync(trigger: "manual", manual: true)
+            vocabularySyncBusy = false
+            vocabularySyncMessage = failure.map(vocabularySyncFailureText)
+            refreshSettingsWindow()
+        }
+    }
+
+    @objc private func vocabularySyncSignOutClicked() {
+        vocabularySyncBusy = true
+        vocabularySyncMessage = nil
+        refreshSettingsWindow()
+        Task { @MainActor in
+            await vocabularySync.signOut()
+            vocabularySyncBusy = false
+            vocabularySyncPasswordInput = ""
+            refreshSettingsWindow()
+        }
     }
 
     // MARK: - LLM correction (Correction tab)
@@ -4362,6 +4657,22 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
+    @objc private func toggleAsrHotwordsSetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.asrHotwordsEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectAsrHotwordsStrength(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let strength = AsrHotwordsStrength(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.asrHotwordsStrength = strength
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func toggleLaunchAtLoginSetting(_ sender: NSSwitch) {
         do {
             switch SMAppService.mainApp.status {
@@ -4491,6 +4802,16 @@ header.addArrangedSubview(panelLabel(
 
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField else { return }
+        switch field.tag {
+        case Self.vocabularySyncEmailFieldTag:
+            vocabularySyncEmailInput = field.stringValue
+            return
+        case Self.vocabularySyncPasswordFieldTag:
+            vocabularySyncPasswordInput = field.stringValue
+            return
+        default:
+            break
+        }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         switch field.tag {
         case Self.llmCustomBaseURLFieldTag:
@@ -4544,6 +4865,8 @@ header.addArrangedSubview(panelLabel(
         settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
         settings.muteWhileRecording = draft.muteWhileRecording
         settings.autoLearnVocabularyEnabled = draft.autoLearnVocabularyEnabled
+        settings.asrHotwordsEnabled = draft.asrHotwordsEnabled
+        settings.asrHotwordsStrength = draft.asrHotwordsStrength
         settings.textPostprocessingMode = draft.textPostprocessingMode
         settings.llmEngineBackend = draft.llmEngineBackend
         settings.llmCustomBaseURL = draft.llmCustomBaseURL

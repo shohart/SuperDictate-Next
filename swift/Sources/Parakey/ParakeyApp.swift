@@ -170,6 +170,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     )
     private let vocabularyLearnedToastController = VocabularyLearnedToastController()
+    // Account sync of the vocabulary (VocabularySync.swift): the agent owns
+    // the automatic triggers (launch, 5 s after a local edit, every 15 min).
+    private lazy var vocabularySync = VocabularySyncCoordinator(settings: settings, role: .agent)
     private let stateToastController = StateToastController()
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
@@ -377,6 +380,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         concealMenuBarIcon()
         setMenuBarState(.loading)
         startCorrectionSyncIfConfigured()
+        vocabularySync.start()
         rebuildMenu()
 
         audio.onConfigurationChange = { [weak self] in
@@ -765,6 +769,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 let duration = Double(samples.count) / SAMPLE_RATE
                 let requestedAt = ProcessInfo.processInfo.systemUptime
+                await asr.setHotwords(settings.asrHotwordsConfiguration)
                 let transcription = try await transcribeSegmented(
                     samples: samples,
                     worker: asr,
@@ -2355,7 +2360,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
+        let hotwordSettings = settings
         let transcriptionTask = Task.detached(priority: .userInitiated) {
+            // Off the main actor: the vocabulary read is one small SELECT.
+            await transcriptionWorker.setHotwords(hotwordSettings.asrHotwordsConfiguration)
             // Stops recording-time work and awaits its in-flight window
             // before the full buffer goes through the normal path; the LLM
             // (finalizedText, below) only ever sees the assembled result.
@@ -2667,6 +2675,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await speculative?.value.cancel()
             do {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
+                await asr.setHotwords(settings.asrHotwordsConfiguration)
                 let transcription = try await transcribeSegmented(
                     samples: captured.samples,
                     worker: asr,
@@ -2750,8 +2759,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func startSpeculativeTranscription() {
         discardSpeculativeTranscription(takeSpeculativeTranscription())
         guard let generation = audio.activeRecordingGeneration else { return }
-        speculativeTranscription = Task { [audio, asr] in
-            await IncrementalOverlapTranscriber.forRecording(audio: audio, generation: generation, worker: asr)
+        speculativeTranscription = Task { [audio, asr, settings] in
+            await asr.setHotwords(settings.asrHotwordsConfiguration)
+            return await IncrementalOverlapTranscriber.forRecording(audio: audio, generation: generation, worker: asr)
         }
     }
 

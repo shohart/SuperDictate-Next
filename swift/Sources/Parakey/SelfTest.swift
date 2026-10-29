@@ -29,6 +29,7 @@ import AudioToolbox
 import Foundation
 import CoreGraphics
 import silero_vad
+import SQLite3
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -74,6 +75,18 @@ enum ParakeySelfTest {
             return runSuite("corrections", testTranscriptCorrections)
         case "vocabulary-store":
             return runSuite("vocabulary-store", testVocabularyStore)
+        case "asr-hotwords":
+            return runSuite("asr-hotwords", testAsrHotwords)
+        case "vocabulary-hygiene":
+            return runSuite("vocabulary-hygiene", testVocabularyHygiene)
+        case "vocabulary-cleanup-dry-run":
+            // Prints the cleanup plan for a COPY of a corrections.sqlite
+            // at SD_VOCAB_CLEANUP_DB; never applies it. Not part of `all`.
+            return runSuite("vocabulary-cleanup-dry-run", testVocabularyCleanupDryRun)
+        case "vocabulary-sync":
+            // Needs a local server-side instance (server/vocab-sync) at
+            // SD_VOCAB_SYNC_TEST_URL; not part of `all`.
+            return runSuite("vocabulary-sync", testVocabularySync)
         case "vocabulary-learning":
             return runSuite("vocabulary-learning", testLearnCandidateDetector)
         case "insertion-anchor":
@@ -247,6 +260,8 @@ enum ParakeySelfTest {
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testVocabularyStore()
+        try testAsrHotwords()
+        try testVocabularyHygiene()
         try testLearnCandidateDetector()
         try testFillerWordRemoval()
         try testFillerWordRemoverPresetsAndCustomWords()
@@ -3914,6 +3929,623 @@ enum ParakeySelfTest {
         }
         guard capStore.recordLearned(source: "one-too-many", replacement: "nope") == nil else {
             throw VocabularyLearningTestFailure("recordLearned must not exceed MAX_TRANSCRIPT_CORRECTIONS")
+        }
+    }
+
+    /// ASR hotwords (docs/specs/asr-hotwords-spec.md §6–§8), unit level:
+    /// the selection rule, the `asr_hint` migration on a temp store, the
+    /// settings and the TRANSCRIBE options. The real host is exercised by
+    /// `onnx-asr-real`.
+    // MARK: - Vocabulary hygiene (spec vocabulary-hygiene-and-sync §2–§3, §5)
+
+    private static func hygieneRecord(_ id: Int64, _ source: String, _ replacement: String,
+                                      _ origin: VocabularyOrigin = .learned,
+                                      updated: String = "2026-10-01T00:00:00Z") -> VocabularyRecord {
+        VocabularyRecord(id: id, source: source, replacement: replacement, origin: origin,
+                         createdAt: updated, updatedAt: updated)
+    }
+
+    private static func testVocabularyHygiene() throws {
+        typealias Verdict = VocabularyHygiene.Verdict
+        func accept(_ source: String, _ replacement: String,
+                    _ rewrites: [VocabularyHygiene.Rewrite] = []) -> Verdict {
+            .accept(source: source, replacement: replacement, rewrites: rewrites)
+        }
+
+        // --- Table: every §1 example and the §2 keep-cases -------------
+        // (source, replacement, existing entries, expected verdict)
+        let manualGitHub = hygieneRecord(44, "гитхаб", "GitHub", .manual)
+        let cases: [(String, String, [VocabularyRecord], Verdict)] = [
+            // §1 punctuation-only edits
+            ("оплатил", "оплатил.", [], .reject(.punctuation)),
+            ("соусом.", "соусом!!", [], .reject(.punctuation)),
+            ("инструменты.", "инструменты?", [], .reject(.punctuation)),
+            ("ознакомления", "ознакомления.", [], .reject(.punctuation)),
+            // §1 replacement without letters
+            ("интернейшнл.", ".", [], .reject(.noLetters)),
+            ("S.", "1", [], .reject(.noLetters)),
+            // §1 grammar / inflection edits (+ §2 «черноиск»)
+            ("Запомню", "Запомни", [], .reject(.inflection)),
+            ("дополню,", "дополни,", [], .reject(.inflection)),
+            ("пробиваю.", "пробивает.", [], .reject(.inflection)),
+            ("капюшонном,", "капюшоном,", [], .reject(.inflection)),
+            ("погонял", "погоняло", [], .reject(.inflection)),
+            ("сторониной", "стороной", [], .reject(.inflection)),
+            ("черноиск", "черновик", [], .reject(.inflection)),
+            // §1 content rewrites
+            ("Смотри.", "Задайте вопрос ChatGPT", [], .reject(.rewrite)),
+            ("тридцать семь. А", "37А", [], .reject(.rewrite)),
+            // §1 chain: a typo of a typo collapses onto the final target
+            ("Pypline.", "Pipline.", [hygieneRecord(143, "Pipline.", "Pipeline.")], accept("Pypline", "Pipeline")),
+            // §1 case conflicts: manual casing wins, else the newest entry
+            ("Гетхаб.", "Github.", [manualGitHub], accept("Гетхаб", "GitHub")),
+            ("Зип,", "Zip,", [hygieneRecord(140, "ЗИП", "ZIP", updated: "2026-10-28T10:55:18Z")], accept("Зип", "ZIP")),
+            ("Интернейшн", "international",
+             [hygieneRecord(12, "Интернейшнал.", "International.", updated: "2026-08-13T09:19:28Z")],
+             accept("Интернейшн", "International")),
+            // §1 edge punctuation baked into the source
+            ("Гетхаб.", "Github.", [], accept("Гетхаб", "Github")),
+            // §1 several sources for one target stay
+            ("докx", "docx", [hygieneRecord(112, "DogX", "docx"), hygieneRecord(102, "док икс", "docx")], accept("докx", "docx")),
+            // §2 rule 1: shared edge punctuation
+            ("Pipline.", "Pipeline.", [], accept("Pipline", "Pipeline")),
+            // §2 rule 2 keep-cases: formatting fixes of terms
+            ("IS60", "IS-60", [], accept("IS60", "IS-60")),
+            ("Metal Fish", "MetalFish", [], accept("Metal Fish", "MetalFish")),
+            ("NH C14S", "NH-C14S", [], accept("NH C14S", "NH-C14S")),
+            ("Амирханян Ц", "АмирханянЦ", [], accept("Амирханян Ц", "АмирханянЦ")),
+            ("Х 99", "Х99", [], accept("Х 99", "Х99")),
+            // §2 rule 4 keep-cases
+            ("Егр", "ЕГРЮЛ", [], accept("Егр", "ЕГРЮЛ")),
+            ("Нечепуренко", "Ничипуренко", [], accept("Нечепуренко", "Ничипуренко")),
+            ("красненькову", "Красникову", [], accept("красненькову", "Красникову")),
+            ("паникший", "поникший", [], accept("паникший", "поникший")),
+            ("снуху", "слуху", [], accept("снуху", "слуху")),
+            // §2 rule 5 keep-cases
+            ("Эмсипи", "MCP", [], accept("Эмсипи", "MCP")),
+            ("Эс эйч", "ssh", [], accept("Эс эйч", "ssh")),
+            ("Comment", "Command", [], accept("Comment", "Command")),
+            ("Юзу ВМ", "УВМ", [], accept("Юзу ВМ", "УВМ")),
+            ("Кад Сендер", "kad sender", [], accept("Кад Сендер", "kad sender")),
+            // §2 rule 6: undo of an earlier correction (checked before the
+            // rejection rules: this revert is itself an inflection edit)
+            ("Запомни", "Запомню", [hygieneRecord(117, "Запомню", "Запомни")], .undo(existingId: 117)),
+            ("Github", "Гетхаб", [hygieneRecord(90, "Гетхаб.", "Github.")], .undo(existingId: 90)),
+            // §2 rule 7b: entries pointing at the new source follow it
+            ("Pipline", "Pipeline", [hygieneRecord(142, "Pypline.", "Pipline.")],
+             accept("Pipline", "Pipeline", [VocabularyHygiene.Rewrite(id: 142, replacement: "Pipeline")])),
+        ]
+        for (source, replacement, existing, expected) in cases {
+            try expect(VocabularyHygiene.review(source: source, replacement: replacement, existing: existing),
+                       equals: expected, "review «\(source) → \(replacement)»")
+        }
+
+        // Manual editor: rules 1 and 3 only.
+        let manualTrim = VocabularyHygiene.reviewManual(source: "Pipline.", replacement: "Pipeline.")
+        try expect(manualTrim.map { "\($0.source)→\($0.replacement)" }, equals: "Pipline→Pipeline", "manual: rule 1 trims")
+        try expect(VocabularyHygiene.reviewManual(source: "S.", replacement: "1") == nil, equals: true, "manual: rule 3 rejects")
+        try expect(VocabularyHygiene.reviewManual(source: "Запомню", replacement: "Запомни") != nil, equals: true,
+                   "manual: no inflection rule")
+        try expect(VocabularyHygiene.reviewManual(source: "Смотри", replacement: "Задайте вопрос ChatGPT") != nil, equals: true,
+                   "manual: no rewrite rule")
+
+        // --- Store: learn path with hygiene, undo and tombstones ---------
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vocabulary-hygiene-selftest-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: tempURL.path + suffix) }
+        }
+        let store = try VocabularyStore(fileURL: tempURL)
+        try expect(store.commitLearned(source: "оплатил", replacement: "оплатил."), equals: .rejected(.punctuation),
+                   "commitLearned rejects a punctuation edit")
+        try expect(store.count(), equals: 0, "a rejected candidate writes nothing")
+        guard case .learned(let pipline) = store.commitLearned(source: "Pypline.", replacement: "Pipline.") else {
+            throw SelfTestFailure.failed("commitLearned should store a new term")
+        }
+        try expect("\(pipline.source)→\(pipline.replacement)", equals: "Pypline→Pipline", "stored trimmed")
+        guard case .learned = store.commitLearned(source: "Pipline", replacement: "Pipeline") else {
+            throw SelfTestFailure.failed("commitLearned should store the chain head")
+        }
+        try expect(store.all().first { $0.id == pipline.id }?.replacement, equals: "Pipeline",
+                   "chain collapsed onto the newest target in the same transaction")
+        _ = try store.upsert(source: "гитхаб", replacement: "GitHub", origin: .manual)
+        guard case .learned(let github) = store.commitLearned(source: "Гетхаб.", replacement: "Github.") else {
+            throw SelfTestFailure.failed("commitLearned should store Гетхаб")
+        }
+        try expect(github.replacement, equals: "GitHub", "case unified with the manual entry")
+        guard case .undone(let undone) = store.commitLearned(source: "GitHub", replacement: "Гетхаб") else {
+            throw SelfTestFailure.failed("reverting a correction should undo it")
+        }
+        try expect(undone.id, equals: github.id, "undo deletes the reverted entry")
+        try expect(store.all().contains { $0.id == github.id }, equals: false, "reverted entry is gone")
+        try expect(store.tombstones().map(\.key), equals: ["гетхаб"], "undo writes a tombstone")
+        guard case .learned = store.commitLearned(source: "Гетхаб", replacement: "GitHub") else {
+            throw SelfTestFailure.failed("re-learning a deleted key should work")
+        }
+        try expect(store.tombstones().isEmpty, equals: true, "re-adding a key removes its tombstone")
+        try expect(store.commitLearned(source: "гитхаб", replacement: "GitHab"), equals: .declined("source already known"),
+                   "a known source is never overwritten by learning")
+        // Every delete path writes a tombstone.
+        let doomed = try store.upsert(source: "удалить", replacement: "Delete", origin: .manual)
+        store.delete(id: doomed.id)
+        _ = try store.upsert(source: "второй", replacement: "Second", origin: .manual)
+        store.deleteWhere(sourceCaseInsensitive: "ВТОРОЙ")
+        store.replaceAllPreservingOrigin(store.all().filter { $0.source != "гитхаб" }
+            .map { TranscriptCorrection(source: $0.source, replacement: $0.replacement) })
+        try expect(Set(store.tombstones().map(\.key)), equals: ["удалить", "второй", "гитхаб"],
+                   "delete(id:), deleteWhere and replaceAll write tombstones")
+
+        // --- Cleanup plan on a store mimicking the real dictionary --------
+        let realURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vocabulary-cleanup-selftest-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: realURL.path + suffix) }
+        }
+        let real = try VocabularyStore(fileURL: realURL)
+        // (source, replacement, origin, updated_at) — rows from the user's
+        // dictionary (spec §1), written with their real stamps.
+        let rows: [(String, String, VocabularyOrigin, String)] = [
+            ("гитхаб", "GitHub", .manual, "2026-08-20T12:37:28Z"),
+            ("докер", "Docker", .manual, "2026-08-20T12:37:28Z"),
+            ("Гетхаб.", "Github.", .learned, "2026-08-27T23:48:23Z"),
+            ("ЗИП", "ZIP", .learned, "2026-10-28T10:55:18Z"),
+            ("Зип,", "Zip,", .learned, "2026-10-28T01:04:11Z"),
+            ("Интернейшн", "international", .learned, "2026-08-13T09:18:50Z"),
+            ("Интернейшнал.", "International.", .learned, "2026-08-13T09:19:28Z"),
+            ("Pipline.", "Pipeline.", .learned, "2026-10-28T13:22:16Z"),
+            ("Pypline.", "Pipline.", .learned, "2026-10-28T13:22:11Z"),
+            ("Нечепуренко", "Ничипуренко", .learned, "2026-09-28T18:55:42Z"),
+            ("Не Чепуренко.", "Ничипуренко.", .learned, "2026-09-28T18:55:33Z"),
+            ("DogX", "docx", .learned, "2026-10-06T19:30:28Z"),
+            ("докx", "docx", .learned, "2026-10-19T10:56:38Z"),
+            ("оплатил", "оплатил.", .learned, "2026-10-26T20:54:31Z"),
+            ("интернейшнл.", ".", .learned, "2026-08-17T11:05:30Z"),
+            ("Запомню", "Запомни", .learned, "2026-10-19T10:56:30Z"),
+            ("Смотри.", "Задайте вопрос ChatGPT", .learned, "2026-08-29T10:19:41Z"),
+            ("дривен", "driven", .learned, "2026-08-12T22:10:27Z"),
+            ("Дривен.", "Driven.", .learned, "2026-08-12T22:10:08Z"),
+            ("Эмсипи", "MCP", .learned, "2026-08-24T18:17:06Z"),
+        ]
+        try real.applyRemote(rows.map {
+            VocabularyStore.RemoteEntry(source: $0.0, replacement: $0.1, origin: $0.2, asrHint: nil,
+                                        deleted: false, updatedAt: $0.3)
+        })
+        let plan = real.cleanupPlan()
+        func describe(_ deletion: VocabularyHygiene.CleanupDeletion) -> String {
+            switch deletion.reason {
+            case .rejected(let reason): return "\(deletion.record.source)|\(reason.rawValue)"
+            case .duplicate: return "\(deletion.record.source)|duplicate"
+            }
+        }
+        try expect(Set(plan.deletions.map(describe)), equals: [
+            "оплатил|punctuation", "интернейшнл.|no-letters", "Запомню|inflection", "Смотри.|rewrite",
+            "Дривен.|duplicate", "Зип,|duplicate",
+        ], "cleanup deletions (ЗИП and Зип, share one source key)")
+        let rewrites = Dictionary(uniqueKeysWithValues: plan.rewrites.map {
+            ($0.record.source, "\($0.source)→\($0.replacement) [\($0.kinds.map(\.rawValue).joined(separator: ","))]")
+        })
+        try expect(rewrites, equals: [
+            "Гетхаб.": "Гетхаб→GitHub [trimmed,case]",
+            "Интернейшн": "Интернейшн→International [case]",
+            "Интернейшнал.": "Интернейшнал→International [trimmed]",
+            "Pipline.": "Pipline→Pipeline [trimmed]",
+            "Pypline.": "Pypline→Pipeline [trimmed,chain]",
+            "Не Чепуренко.": "Не Чепуренко→Ничипуренко [trimmed]",
+        ], "cleanup rewrites")
+        try expect(Set(plan.merges.map { "\($0.keptSource)<-\($0.removed.map(\.source).joined(separator: ","))" }),
+                   equals: ["ЗИП<-Зип,", "дривен<-Дривен."], "duplicates merge onto the newest entry")
+        let manualBefore = real.all().filter { $0.origin == .manual }
+        try real.applyCleanup(plan)
+        let after = real.all()
+        try expect(after.filter { $0.origin == .manual }, equals: manualBefore, "manual entries are never touched")
+        try expect(after.count, equals: rows.count - plan.deletions.count, "deletions applied")
+        try expect(after.first { $0.source == "Pypline" }?.replacement, equals: "Pipeline", "rewrites applied")
+        try expect(real.cleanupPlan().isEmpty, equals: true, "a second cleanup finds nothing")
+        let tombstoneKeys = Set(real.tombstones().map(\.key))
+        try expect(tombstoneKeys.isSuperset(of: ["оплатил", "запомню", "дривен.", "гетхаб.", "pypline."]), equals: true,
+                   "cleanup deletions and re-keyed rewrites leave tombstones")
+        // A plan built before an edit is refused.
+        _ = try real.upsert(source: "Мусор", replacement: "мусор.", origin: .learned)
+        let stalePlan = real.cleanupPlan()
+        _ = try real.upsert(source: "Мусор", replacement: "мусор!", origin: .learned)
+        do {
+            try real.applyCleanup(stalePlan)
+            throw SelfTestFailure.failed("a stale cleanup plan must be refused")
+        } catch VocabularyStore.CleanupError.storeChanged {
+        }
+    }
+
+    private static func testVocabularyCleanupDryRun() throws {
+        guard let path = ProcessInfo.processInfo.environment["SD_VOCAB_CLEANUP_DB"], !path.isEmpty else {
+            print("SKIP vocabulary-cleanup-dry-run: SD_VOCAB_CLEANUP_DB is not set (point it at a copy of corrections.sqlite)")
+            return
+        }
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        let live = try superDictateApplicationSupportDirectory()
+            .appendingPathComponent("corrections.sqlite").standardizedFileURL.resolvingSymlinksInPath()
+        guard url.path != live.path else {
+            throw SelfTestFailure.failed("refusing to open the live dictionary; pass a copy")
+        }
+        let store = try VocabularyStore(fileURL: url)
+        let plan = store.cleanupPlan()
+        print("CLEANUP PLAN for \(store.count()) entries: \(plan.deletions.count) deletions, \(plan.rewrites.count) rewrites, \(plan.merges.count) merges")
+        for deletion in plan.deletions {
+            let reason: String
+            switch deletion.reason {
+            case .rejected(let rejected): reason = rejected.rawValue
+            case .duplicate(let keptId): reason = "duplicate of id \(keptId)"
+            }
+            print("DELETE  id=\(deletion.record.id) «\(deletion.record.source)» → «\(deletion.record.replacement)»  [\(reason)]")
+        }
+        for rewrite in plan.rewrites {
+            print("REWRITE id=\(rewrite.record.id) «\(rewrite.record.source)» → «\(rewrite.record.replacement)»  ⇒  «\(rewrite.source)» → «\(rewrite.replacement)»  [\(rewrite.kinds.map(\.rawValue).joined(separator: ","))]")
+        }
+        for merge in plan.merges {
+            print("MERGE   keep id=\(merge.keptId) «\(merge.keptSource)» ← \(merge.removed.map { "id=\($0.id) «\($0.source)»" }.joined(separator: ", "))")
+        }
+    }
+
+    // MARK: - Vocabulary account sync (spec vocabulary-hygiene-and-sync §4, §5)
+
+    private static func testVocabularySync() throws {
+        guard let rawURL = ProcessInfo.processInfo.environment["SD_VOCAB_SYNC_TEST_URL"],
+              let serverURL = URL(string: rawURL) else {
+            print("SKIP vocabulary-sync: SD_VOCAB_SYNC_TEST_URL is not set (start server/vocab-sync locally)")
+            return
+        }
+        final class Device {
+            let settings: Settings
+            let store: VocabularyStore
+            let tokens = InMemoryVocabularySyncTokenStore()
+            let engine: VocabularySyncEngine
+            let url: URL
+            let suite: String
+
+            init(name: String, serverURL: URL) throws {
+                suite = "com.local.superdictate.selftest.vocabulary-sync-\(name)-\(UUID().uuidString)"
+                url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("vocabulary-sync-\(name)-\(UUID().uuidString).sqlite")
+                store = try VocabularyStore(fileURL: url)
+                settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: store)
+                settings.setVocabularySyncServerURLOverride(serverURL.absoluteString)
+                engine = VocabularySyncEngine(settings: settings, tokenStore: tokens, lockFileURL: nil)
+            }
+
+            func cleanUp() {
+                UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+                for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+            }
+
+            func row(_ source: String) -> VocabularyRecord? {
+                store.all().first { normalizedTranscriptCorrectionSource($0.source) == normalizedTranscriptCorrectionSource(source) }
+            }
+        }
+        let a = try Device(name: "a", serverURL: serverURL)
+        let b = try Device(name: "b", serverURL: serverURL)
+        defer { a.cleanUp(); b.cleanUp() }
+        let email = "selftest-\(UUID().uuidString.prefix(8).lowercased())@example.com"
+        let password = "correct horse battery"
+
+        func pass(_ device: Device) throws -> VocabularySyncPassSummary {
+            let engine = device.engine
+            return try runParakeetEngineSynchronously { try await engine.runPass() }
+        }
+
+        // Wrong-length password → invalid credentials, nothing stored.
+        do {
+            let engine = a.engine
+            _ = try runParakeetEngineSynchronously { try await engine.signIn(email: email, password: "short") }
+            throw SelfTestFailure.failed("a 7-character password must be refused")
+        } catch VocabularySyncFailure.invalidCredentials {
+        }
+        try expect(a.engine.isSignedIn, equals: false, "a refused sign-in stores no token")
+
+        // Device A has entries before the account exists; a hint travels.
+        _ = try a.store.upsert(source: "докер", replacement: "Docker", origin: .manual)
+        let ddr = try a.store.upsert(source: "DR4 DM", replacement: "DDR4 DIMM", origin: .learned)
+        try a.store.setAsrHint(id: ddr.id, hint: false)
+        let created = try runParakeetEngineSynchronously { [engine = a.engine] in
+            try await engine.signIn(email: email, password: password)
+        }
+        try expect(created, equals: true, "the first sign-in creates the account")
+        let first = try pass(a)
+        try expect(first.pushed, equals: 2, "the first pass pushes every local entry")
+
+        // Device B joins the same account and gets A's dictionary.
+        let joined = try runParakeetEngineSynchronously { [engine = b.engine] in
+            try await engine.signIn(email: email.uppercased(), password: password)
+        }
+        try expect(joined, equals: false, "a second device signs in to the existing account")
+        do {
+            let engine = b.engine
+            _ = try runParakeetEngineSynchronously { try await engine.signIn(email: email, password: "wrong password") }
+            throw SelfTestFailure.failed("a wrong password must be refused")
+        } catch VocabularySyncFailure.wrongPassword {
+        }
+        try expect(b.engine.isSignedIn, equals: true, "a failed re-sign-in keeps the existing token")
+        let localChanges = LockedCounter()
+        b.store.onLocalChange = { localChanges.increment() }
+        _ = try pass(b)
+        try expect(b.row("докер")?.replacement, equals: "Docker", "A's entry reaches B")
+        try expect(b.row("DR4 DM")?.asrHint, equals: false, "asr_hint travels with the entry")
+        try expect(b.row("DR4 DM")?.origin, equals: .learned, "origin travels with the entry")
+        try expect(b.row("DR4 DM")?.updatedAt, equals: a.row("DR4 DM")?.updatedAt,
+                   "an applied remote entry keeps the remote updated_at")
+        try expect(localChanges.value, equals: 0, "applying remote entries is not a local change")
+        b.store.onLocalChange = nil
+
+        // An add on A appears on B.
+        _ = try a.store.upsert(source: "гитхаб", replacement: "GitHub", origin: .manual)
+        _ = try pass(a)
+        _ = try pass(b)
+        try expect(b.row("гитхаб")?.replacement, equals: "GitHub", "an add on A appears on B")
+
+        // A delete on B removes the entry on A. Stamps have one-second
+        // resolution and a tie keeps the server copy, so the delete must
+        // land in a later second than the add.
+        Thread.sleep(forTimeInterval: 1.1)
+        b.store.deleteWhere(sourceCaseInsensitive: "гитхаб")
+        _ = try pass(b)
+        _ = try pass(a)
+        try expect(a.row("гитхаб") == nil, equals: true, "a delete on B removes the entry on A")
+        try expect(a.store.tombstones().map(\.key).contains("гитхаб"), equals: true, "the remote delete leaves a tombstone on A")
+
+        // Conflict: the newer updated_at wins, whichever device pushes last.
+        _ = try a.store.upsert(source: "дебиан", replacement: "Debian", origin: .manual)
+        _ = try pass(a)
+        _ = try pass(b)
+        _ = try a.store.upsert(source: "дебиан", replacement: "Debian (A, older)", origin: .manual)
+        Thread.sleep(forTimeInterval: 1.2)
+        _ = try b.store.upsert(source: "дебиан", replacement: "Debian (B, newer)", origin: .manual)
+        _ = try pass(b)
+        _ = try pass(a)
+        try expect(a.row("дебиан")?.replacement, equals: "Debian (B, newer)", "the newer edit wins on A")
+        _ = try pass(b)
+        try expect(b.row("дебиан")?.replacement, equals: "Debian (B, newer)", "the older edit does not overwrite B")
+
+        // 401: a revoked token is dropped locally.
+        guard let token = b.tokens.token(for: b.settings.vocabularySyncEmail) else {
+            throw SelfTestFailure.failed("B should hold a token")
+        }
+        try runParakeetEngineSynchronously { await VocabularySyncClient(baseURL: serverURL).signOut(token: token) }
+        do {
+            _ = try pass(b)
+            throw SelfTestFailure.failed("a revoked token must fail the pass")
+        } catch VocabularySyncFailure.unauthorized {
+        }
+        try expect(b.tokens.token(for: b.settings.vocabularySyncEmail) == nil, equals: true, "a 401 clears the token")
+        try expect(b.engine.isSignedIn, equals: false, "B is signed out after the 401")
+        try expect(b.settings.vocabularySyncLastError, equals: VocabularySyncFailure.unauthorized.rawValue,
+                   "the UI is told to ask for a new sign-in")
+        do {
+            _ = try pass(b)
+            throw SelfTestFailure.failed("a signed-out device must not sync")
+        } catch VocabularySyncFailure.notSignedIn {
+        }
+
+        // Sign-out on A revokes its token and resets the cursors.
+        try runParakeetEngineSynchronously { [engine = a.engine] in await engine.signOut() }
+        try expect(a.engine.isSignedIn, equals: false, "sign-out drops the token")
+        try expect(a.settings.vocabularySyncLastServerRevision, equals: 0, "sign-out resets the cursor")
+    }
+
+    private static func testAsrHotwords() throws {
+        // --- Selection rule (§6) -------------------------------------
+        // (source, replacement, origin, hint, expected effective phrase or nil)
+        let cases: [(String, String, VocabularyOrigin, Bool?, String?)] = [
+            // From the user's real vocabulary: included…
+            ("DR4 DM", "DDR4 DIMM", .learned, nil, "DDR4 DIMM"),
+            ("ЕСА", "ЕСИА", .learned, nil, "ЕСИА"),
+            ("Gm, вотчер,", "Gmail watcher,", .learned, nil, "Gmail watcher"),
+            ("Пони Чепуренко", "По Ничипуренко", .learned, nil, "По Ничипуренко"),
+            ("Егр", "ЕГРЮЛ", .learned, nil, "ЕГРЮЛ"),
+            ("TicTic,", "TickTick,", .learned, nil, "TickTick"),
+            ("тридцать семь. А", "37А", .learned, nil, "37А"),
+            ("1.", "1mm.", .learned, nil, "1mm"),
+            ("Аллес Скарш—", "Alien_skaarj —", .learned, nil, "Alien_skaarj"),
+            ("хаггинг фейс", "Hugging Face", .manual, nil, "Hugging Face"),
+            ("Смотри.", "Задайте вопрос ChatGPT", .learned, nil, "Задайте вопрос ChatGPT"),
+            // …and excluded: ordinary learned words.
+            ("Запомню", "Запомни", .learned, nil, nil),
+            ("сторониной", "стороной", .learned, nil, nil),
+            ("красненькову", "Красникову", .learned, nil, nil),
+            ("Нечепуренко", "Ничипуренко", .learned, nil, nil),
+            // Explicit hints win over the automatic rule.
+            ("Нечепуренко", "Ничипуренко", .learned, true, "Ничипуренко"),
+            ("красненькову", "Красникову", .learned, true, "Красникову"),
+            ("докер", "Docker", .manual, false, nil),
+            ("Эмсипи", "MCP", .learned, false, nil),
+            // Manual entries are on even when not term-like.
+            ("сторониной", "стороной", .manual, nil, "стороной"),
+            // Skip rules hold even against an explicit hint.
+            ("оплатил", "оплатил.", .learned, true, nil),        // punctuation-only edit
+            ("ознакомления", "ознакомления.", .manual, nil, nil),
+            ("Амирханян Ц", "АмирханянЦ", .learned, true, nil),  // whitespace-only edit
+            ("Х 99", "Х99", .manual, nil, nil),
+            ("Инструменты.", "инструменты?", .manual, nil, nil),  // case + punctuation only
+            ("интернейшнл.", ".", .learned, true, nil),          // empty after trimming
+            ("S.", "1", .manual, nil, nil),                     // no letter
+            ("икс", "X", .manual, true, nil),                    // < 2 characters
+            ("12", "42!", .manual, true, nil),                   // no letter
+            ("длинно", "раз два три четыре пять", .manual, true, nil), // > 4 words
+            ("коротко", "раз два три QQ", .learned, nil, "раз два три QQ"), // exactly 4 words
+            ("кавычки", "«Ответ налоговая»", .manual, nil, "Ответ налоговая"),
+            ("тире", "— TDT –", .learned, nil, "TDT"),
+            ("ssh", "Ssh", .manual, nil, nil),                   // case-only edit
+        ]
+        for (index, testCase) in cases.enumerated() {
+            let (source, replacement, origin, hint, expected) = testCase
+            let record = VocabularyRecord(id: Int64(index), source: source, replacement: replacement,
+                                          origin: origin, createdAt: "", updatedAt: "", asrHint: hint)
+            try expect(AsrHotwordSelection.isEffective(record), equals: expected != nil,
+                       "effective state of \(source) → \(replacement) (\(origin.rawValue), hint \(String(describing: hint)))")
+            try expect(AsrHotwordSelection.phrases(from: [record]), equals: expected.map { [$0] } ?? [],
+                       "phrase for \(source) → \(replacement)")
+        }
+        try expect(AsrHotwordSelection.isTermLike("Ёлка"), equals: false, "one uppercase Cyrillic letter is not term-like")
+        try expect(AsrHotwordSelection.isTermLike("ЁЖ"), equals: true, "two uppercase letters are term-like")
+        try expect(AsrHotwordSelection.isTermLike("café"), equals: true, "Latin-1 letters count as Latin")
+
+        // Exact-duplicate merge (case variants stay distinct), order kept, cap.
+        let duplicates = [("гитхаб", "GitHub"), ("гит хаб", "GitHub"), ("Гетхаб.", "Github."), ("зип", "ZIP"), ("Зип,", "Zip,")]
+            .enumerated().map { VocabularyRecord(id: Int64($0.offset), source: $0.element.0, replacement: $0.element.1,
+                                                 origin: .manual, createdAt: "", updatedAt: "") }
+        try expect(AsrHotwordSelection.phrases(from: duplicates), equals: ["GitHub", "Github", "ZIP", "Zip"],
+                   "exact duplicates merged, case variants kept, input order preserved")
+        let many = (0..<1200).map { VocabularyRecord(id: Int64($0), source: "s\($0)", replacement: "Term\($0)",
+                                                     origin: .manual, createdAt: "", updatedAt: "") }
+        let capped = AsrHotwordSelection.phrases(from: many)
+        try expect(capped.count, equals: AsrHotwordSelection.maxPhrases, "the list is capped at 1000 phrases")
+        try expect(capped.last, equals: "Term999", "the cap keeps the first 1000 in order")
+
+        // --- asr_hint migration on a pre-hotwords database -----------
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("asr-hotwords-selftest-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: tempURL.path + suffix)
+            }
+        }
+        do {
+            var legacy: OpaquePointer?
+            guard sqlite3_open(tempURL.path, &legacy) == SQLITE_OK, let legacy else {
+                throw SelfTestFailure.failed("could not create the legacy test database")
+            }
+            defer { sqlite3_close(legacy) }
+            let legacySQL = """
+            CREATE TABLE corrections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL COLLATE NOCASE,
+                replacement TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_corrections_source_nocase ON corrections (source);
+            INSERT INTO corrections (source, replacement, origin, created_at, updated_at) VALUES
+                ('Нечепуренко', 'Ничипуренко', 'learned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('DR4 DM', 'DDR4 DIMM', 'learned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('докер', 'Docker', 'manual', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+            """
+            guard sqlite3_exec(legacy, legacySQL, nil, nil, nil) == SQLITE_OK else {
+                throw SelfTestFailure.failed("could not fill the legacy test database")
+            }
+        }
+
+        let store = try VocabularyStore(fileURL: tempURL)
+        let migrated = store.all()
+        try expect(migrated.count, equals: 3, "pre-migration rows survive the migration")
+        try expect(migrated.allSatisfy { $0.asrHint == nil }, equals: true, "migrated rows start automatic")
+        try expect(store.asrHotwordPhrases(), equals: ["DDR4 DIMM", "Docker"], "automatic phrases after migration")
+
+        guard let surname = migrated.first(where: { $0.replacement == "Ничипуренко" }),
+              let docker = migrated.first(where: { $0.replacement == "Docker" }) else {
+            throw SelfTestFailure.failed("migrated rows missing")
+        }
+        try store.setAsrHint(id: surname.id, hint: true)
+        try store.setAsrHint(id: docker.id, hint: false)
+        try expect(store.asrHotwordPhrases(), equals: ["DDR4 DIMM", "Ничипуренко"], "explicit hints applied")
+        // The hint travels with the entry in the account sync, whose
+        // last-writer-wins merge keys off updated_at, so setting it bumps
+        // the stamp (spec vocabulary-hygiene-and-sync §4).
+        try expect((store.all().first { $0.id == surname.id }?.updatedAt ?? "") > surname.updatedAt, equals: true,
+                   "setting a hint bumps updated_at for the sync")
+
+        // Idempotent: a second connection (the other process) re-runs the
+        // migration and sees the stored hints.
+        let reopened = try VocabularyStore(fileURL: tempURL)
+        try expect(reopened.all().first { $0.id == surname.id }?.asrHint, equals: true, "hint persists across connections")
+        try expect(reopened.all().first { $0.id == docker.id }?.asrHint, equals: false, "explicit off persists")
+
+        // Every write path keeps the hint: upsert of a known source…
+        _ = try store.upsert(source: "нечепуренко", replacement: "Ничипуренко", origin: .manual)
+        try expect(store.all().first { $0.id == surname.id }?.asrHint, equals: true, "upsert keeps the hint")
+        // …recordLearned of a known source is a no-op…
+        try expect(store.recordLearned(source: "Нечепуренко", replacement: "x") == nil, equals: true,
+                   "recordLearned no-ops for a known source")
+        // …and the full-array replace used by import/sync.
+        store.replaceAllPreservingOrigin([
+            TranscriptCorrection(source: "Нечепуренко", replacement: "Ничипуренко"),
+            TranscriptCorrection(source: "докер", replacement: "Docker"),
+            TranscriptCorrection(source: "ЕСА", replacement: "ЕСИА"),
+        ])
+        let afterReplace = store.all()
+        try expect(afterReplace.first { $0.id == surname.id }?.asrHint, equals: true, "replaceAll keeps the hint")
+        try expect(afterReplace.first { $0.id == docker.id }?.asrHint, equals: false, "replaceAll keeps explicit off")
+        try expect(afterReplace.first { $0.replacement == "ЕСИА" }?.asrHint, equals: nil, "new rows start automatic")
+        try expect(store.asrHotwordPhrases(), equals: ["ЕСИА", "Ничипуренко"], "phrases after replaceAll (manual ЕСИА is on)")
+        // nil resets to automatic.
+        try store.setAsrHint(id: surname.id, hint: nil)
+        try expect(store.all().first { $0.id == surname.id }?.asrHint, equals: nil, "nil resets the hint")
+        guard let learned = store.recordLearned(source: "Клод", replacement: "Claude") else {
+            throw SelfTestFailure.failed("recordLearned should insert a new source")
+        }
+        try expect(learned.asrHint, equals: nil, "a learned row starts automatic")
+
+        // A brand-new database and the in-memory fallback get the column too.
+        let memory = VocabularyStore.inMemoryFallback()
+        let row = try memory.upsert(source: "кью 8", replacement: "Q8", origin: .learned)
+        try memory.setAsrHint(id: row.id, hint: false)
+        try expect(memory.all().first?.asrHint, equals: false, "in-memory store supports hints")
+
+        // --- Settings (§8) --------------------------------------------
+        let suiteName = "com.local.superdictate.selftest.asr-hotwords-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw SelfTestFailure.failed("could not create a test defaults suite")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = VocabularyStore.inMemoryFallback()
+        _ = try settingsStore.upsert(source: "DR4 DM", replacement: "DDR4 DIMM", origin: .learned)
+        _ = try settingsStore.upsert(source: "сторониной", replacement: "стороной", origin: .learned)
+        let settings = Settings(defaults: defaults, vocabularyStore: settingsStore)
+        try expect(settings.asrHotwordsEnabled, equals: true, "hotwords are on by default")
+        try expect(settings.asrHotwordsStrength, equals: .normal, "normal strength by default")
+        try expect(settings.asrHotwordsConfiguration,
+                   equals: AsrHotwordsConfiguration(phrases: ["DDR4 DIMM"], score: 2.0), "default configuration")
+        settings.asrHotwordsStrength = .strong
+        try expect(settings.asrHotwordsConfiguration.score, equals: 3.0, "strong = 3.0")
+        settings.asrHotwordsEnabled = false
+        try expect(settings.asrHotwordsConfiguration, equals: .disabled, "disabled → empty list")
+        try expect(AsrHotwordsConfiguration.disabled.phrases.isEmpty, equals: true, "disabled carries no phrases")
+
+        // --- TRANSCRIBE options (§7) ----------------------------------
+        // An empty list must produce exactly the pre-hotwords request.
+        let legacyOptions: [String: Any] = ["timestamps": true, "sample_rate": Int(SAMPLE_RATE)]
+        for timestamps in [false, true] {
+            let empty = OnnxAsrEngine.transcribeOptions(timestamps: timestamps, hotwords: [], hotwordsScore: 3.0)
+            try expect(empty.keys.sorted(), equals: ["sample_rate", "timestamps"], "empty list adds no keys (timestamps \(timestamps))")
+            try expect(empty["timestamps"] as? Bool, equals: timestamps, "timestamps flag")
+        }
+        let emptyJSON = try JSONSerialization.data(
+            withJSONObject: OnnxAsrEngine.transcribeOptions(timestamps: true, hotwords: [], hotwordsScore: 2.0),
+            options: .sortedKeys)
+        try expect(emptyJSON, equals: try JSONSerialization.data(withJSONObject: legacyOptions, options: .sortedKeys),
+                   "empty list: request JSON identical to the unbiased one")
+        let biased = OnnxAsrEngine.transcribeOptions(timestamps: false, hotwords: ["DDR4 DIMM", "ЕСИА"], hotwordsScore: 3.0)
+        try expect(biased["hotwords"] as? [String], equals: ["DDR4 DIMM", "ЕСИА"], "hotwords sent as given")
+        try expect(biased["hotwords_score"] as? Double, equals: 3.0, "hotwords_score sent")
+        try expect(biased.keys.sorted(), equals: ["hotwords", "hotwords_score", "sample_rate", "timestamps"], "biased keys")
+
+        // --- Benchmark flag parsing ------------------------------------
+        let phraseFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("asr-hotwords-selftest-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: phraseFile) }
+        try "DDR4 DIMM\n\n  ЕСИА  \r\nGmail watcher\n".write(to: phraseFile, atomically: true, encoding: .utf8)
+        var arguments = ["gigaam", "--hotwords", phraseFile.path, "--hotwords-score", "3", "cpu", "8", "a.wav"]
+        guard case .success(let parsed) = benchmarkExtractHotwords(&arguments) else {
+            throw SelfTestFailure.failed("--hotwords parsing failed")
+        }
+        try expect(parsed, equals: AsrHotwordsConfiguration(phrases: ["DDR4 DIMM", "ЕСИА", "Gmail watcher"], score: 3.0),
+                   "--hotwords file: one phrase per line, blanks dropped")
+        try expect(arguments, equals: ["gigaam", "cpu", "8", "a.wav"], "hotword flags removed from the positional list")
+        var plain = ["cpu", "8", "a.wav"]
+        guard case .success(let none) = benchmarkExtractHotwords(&plain) else {
+            throw SelfTestFailure.failed("parsing without --hotwords failed")
+        }
+        try expect(none, equals: .disabled, "no --hotwords → no hotwords")
+        var bad = ["--hotwords-score", "abc", "cpu"]
+        if case .success = benchmarkExtractHotwords(&bad) {
+            throw SelfTestFailure.failed("an invalid --hotwords-score must be rejected")
         }
     }
 
@@ -9298,6 +9930,15 @@ enum ParakeySelfTest {
             throw SelfTestFailure.failed("\(message): got \(actual), expected \(expected)")
         }
     }
+}
+
+
+/// A thread-safe counter for callbacks that may fire on any thread.
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }
 
 #endif

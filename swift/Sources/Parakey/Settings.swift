@@ -73,6 +73,16 @@ final class Settings: @unchecked Sendable {
     private static let keyTranscriptCorrectionsSyncFile = "transcript_corrections_sync_file"
     private static let keyDidMigrateTranscriptCorrectionsToSQLite = "did_migrate_transcript_corrections_to_sqlite_v1"
     private static let keyAutoLearnVocabularyEnabled = "auto_learn_vocabulary_enabled_v1"
+    private static let keyAsrHotwordsEnabled = "asr_hotwords_enabled_v1"
+    private static let keyAsrHotwordsStrength = "asr_hotwords_strength_v1"
+    // Account sync of the vocabulary (spec vocabulary-hygiene-and-sync §4.1).
+    private static let keyVocabularySyncEnabled = "vocabulary_sync_enabled_v1"
+    private static let keyVocabularySyncServerURL = "vocabulary_sync_server_url_v1"
+    private static let keyVocabularySyncEmail = "vocabulary_sync_email_v1"
+    private static let keyVocabularySyncLastServerRevision = "vocabulary_sync_last_server_revision_v1"
+    private static let keyVocabularySyncLastPushedLocalStamp = "vocabulary_sync_last_pushed_local_stamp_v1"
+    private static let keyVocabularySyncLastSyncAt = "vocabulary_sync_last_sync_at_v1"
+    private static let keyVocabularySyncLastError = "vocabulary_sync_last_error_v1"
     private static let keyDictationLanguage = "dictation_language"
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
@@ -883,6 +893,97 @@ final class Settings: @unchecked Sendable {
             defaults.object(forKey: Self.keyAutoLearnVocabularyEnabled) as? Bool ?? true
         }
         set { defaults.set(newValue, forKey: Self.keyAutoLearnVocabularyEnabled) }
+    }
+
+    /// Bias the speech model toward vocabulary terms (spec asr-hotwords §8).
+    var asrHotwordsEnabled: Bool {
+        get {
+            defaults.object(forKey: Self.keyAsrHotwordsEnabled) as? Bool ?? true
+        }
+        set { defaults.set(newValue, forKey: Self.keyAsrHotwordsEnabled) }
+    }
+
+    var asrHotwordsStrength: AsrHotwordsStrength {
+        get {
+            defaults.string(forKey: Self.keyAsrHotwordsStrength).flatMap(AsrHotwordsStrength.init(rawValue:)) ?? .normal
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyAsrHotwordsStrength) }
+    }
+
+    /// The list and weight for the next dictation: the store read is a
+    /// single small SELECT, cheap enough to repeat per dictation. Disabled
+    /// → the empty (unbiased) configuration.
+    var asrHotwordsConfiguration: AsrHotwordsConfiguration {
+        guard asrHotwordsEnabled else { return .disabled }
+        return AsrHotwordsConfiguration(phrases: vocabularyStore.asrHotwordPhrases(),
+                                        score: asrHotwordsStrength.score)
+    }
+
+    /// On while signed in to the vocabulary sync account (the token itself
+    /// lives in the Keychain, never here).
+    var vocabularySyncEnabled: Bool {
+        get { defaults.object(forKey: Self.keyVocabularySyncEnabled) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Self.keyVocabularySyncEnabled) }
+    }
+
+    /// Hidden: overridable only through the defaults key.
+    var vocabularySyncServerURL: URL {
+        if let raw = defaults.string(forKey: Self.keyVocabularySyncServerURL)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+           scheme == "https" || scheme == "http", url.host != nil {
+            return url
+        }
+        return URL(string: VOCABULARY_SYNC_DEFAULT_SERVER_URL)!
+    }
+
+    func setVocabularySyncServerURLOverride(_ value: String?) {
+        if let value, !value.isEmpty {
+            defaults.set(value, forKey: Self.keyVocabularySyncServerURL)
+        } else {
+            defaults.removeObject(forKey: Self.keyVocabularySyncServerURL)
+        }
+    }
+
+    var vocabularySyncEmail: String {
+        get { defaults.string(forKey: Self.keyVocabularySyncEmail) ?? "" }
+        set { defaults.set(newValue, forKey: Self.keyVocabularySyncEmail) }
+    }
+
+    var vocabularySyncLastServerRevision: Int {
+        get { defaults.integer(forKey: Self.keyVocabularySyncLastServerRevision) }
+        set { defaults.set(newValue, forKey: Self.keyVocabularySyncLastServerRevision) }
+    }
+
+    /// The newest local `updated_at`/`deleted_at` already pushed; empty =
+    /// nothing pushed yet (the next pass pushes everything).
+    var vocabularySyncLastPushedLocalStamp: String {
+        get { defaults.string(forKey: Self.keyVocabularySyncLastPushedLocalStamp) ?? "" }
+        set { defaults.set(newValue, forKey: Self.keyVocabularySyncLastPushedLocalStamp) }
+    }
+
+    var vocabularySyncLastSyncAt: Date? {
+        get { defaults.object(forKey: Self.keyVocabularySyncLastSyncAt) as? Date }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: Self.keyVocabularySyncLastSyncAt)
+            } else {
+                defaults.removeObject(forKey: Self.keyVocabularySyncLastSyncAt)
+            }
+        }
+    }
+
+    /// Raw value of the last pass's VocabularySyncFailure, nil after a
+    /// successful pass.
+    var vocabularySyncLastError: String? {
+        get { defaults.string(forKey: Self.keyVocabularySyncLastError) }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: Self.keyVocabularySyncLastError)
+            } else {
+                defaults.removeObject(forKey: Self.keyVocabularySyncLastError)
+            }
+        }
     }
 
     var transcriptCorrections: [TranscriptCorrection] {

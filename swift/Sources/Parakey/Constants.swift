@@ -121,6 +121,16 @@ let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.
 // (LLM model/stage choices apply live), so the agent re-reads its settings
 // and stops LLM hosts the new choices no longer use.
 let SETTINGS_LIVE_CHANGED_NOTIFICATION = Notification.Name("com.local.superdictate.settings-live-changed")
+// Posted (distributed, between the agent and the Control Panel) after the
+// vocabulary store changed: userInfo["reason"] is "local" for an edit made
+// on this Mac (the agent schedules a sync push) or "sync" after a sync pass
+// applied server changes. Open vocabulary windows reload on either.
+let VOCABULARY_CHANGED_NOTIFICATION = Notification.Name("com.local.superdictate.vocabulary-changed")
+// Posted (distributed) after a vocabulary sync pass, sign-in or sign-out
+// changed the stored sync status, so the settings window refreshes it.
+let VOCABULARY_SYNC_STATUS_NOTIFICATION = Notification.Name("com.local.superdictate.vocabulary-sync-status")
+let VOCABULARY_SYNC_DEFAULT_SERVER_URL = "https://superdictate.bykovlegal.ru"
+let VOCABULARY_SYNC_KEYCHAIN_SERVICE = "com.local.superdictate.vocab-sync"
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]

@@ -18,6 +18,9 @@ struct VocabularyRecord: Equatable {
     let origin: VocabularyOrigin
     let createdAt: String
     let updatedAt: String
+    /// Per-entry ASR hotword decision (spec asr-hotwords §6): nil =
+    /// automatic (AsrHotwordSelection), true = always, false = never.
+    var asrHint: Bool? = nil
 }
 
 enum VocabularyStoreError: Error, LocalizedError {
@@ -46,6 +49,34 @@ final class VocabularyStore: @unchecked Sendable {
     /// use this to avoid ever treating data written into an ephemeral
     /// store as durably migrated — see C2 in the final-review fix report.
     let isEphemeral: Bool
+
+    /// False only when the `asr_hint` migration could not run (e.g. the
+    /// other process held the write lock past the busy timeout). Reads
+    /// then select NULL in its place, so the store keeps working with
+    /// automatic hints, and `setAsrHint` reports the failure.
+    private var hasAsrHintColumn = false
+
+    /// Called (on the writing thread, after the write committed) whenever
+    /// a local edit changed the store: manual edits, learning, cleanup,
+    /// replace-all, hints. Never for `applyRemote` — a synced change must
+    /// not look locally changed (spec vocabulary-sync §4.2). The app wires
+    /// this to the vocabulary-changed notification and the sync debounce.
+    var onLocalChange: (@Sendable () -> Void)? {
+        get { changeHandlerLock.withLock { changeHandler } }
+        set { changeHandlerLock.withLock { changeHandler = newValue } }
+    }
+    private var changeHandler: (@Sendable () -> Void)?
+    private let changeHandlerLock = NSLock()
+
+    private func notifyLocalChange() {
+        onLocalChange?()
+    }
+
+    /// `updated_at` / `deleted_at` format: ISO-8601 UTC with seconds,
+    /// `YYYY-MM-DDTHH:MM:SSZ`, compared as a string by the sync merge.
+    static func timestamp(_ date: Date = Date()) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
 
     convenience init(fileURL: URL) throws {
         try self.init(sqlitePath: fileURL.path, isEphemeral: false)
@@ -139,8 +170,53 @@ final class VocabularyStore: @unchecked Sendable {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_source_nocase
             ON corrections (source);
+        CREATE TABLE IF NOT EXISTS deleted_corrections (
+            key TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            deleted_at TEXT NOT NULL
+        );
         """
         try execute(sql)
+        migrateAsrHintColumnIfNeeded()
+    }
+
+    /// Idempotent: adds `asr_hint INTEGER` (NULL auto / 1 on / 0 off) once.
+    /// Both the agent and the Control Panel open this file, so a
+    /// "duplicate column" failure from a concurrent ALTER is re-checked
+    /// rather than treated as an error.
+    private func migrateAsrHintColumnIfNeeded() {
+        guard let db else { return }
+        if columnExistsLocked(db: db, table: "corrections", column: "asr_hint") {
+            hasAsrHintColumn = true
+            return
+        }
+        do {
+            try execute("ALTER TABLE corrections ADD COLUMN asr_hint INTEGER;")
+        } catch {
+            if !columnExistsLocked(db: db, table: "corrections", column: "asr_hint") {
+                log("VocabularyStore: asr_hint migration failed (ASR hints stay automatic this session): \(error)")
+                return
+            }
+        }
+        hasAsrHintColumn = true
+    }
+
+    private func columnExistsLocked(db: OpaquePointer, table: String, column: String) -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1), String(cString: name) == column {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The column list every read and RETURNING clause uses; `record(from:)`
+    /// decodes it by position.
+    private var recordColumns: String {
+        "id, source, replacement, origin, created_at, updated_at, " + (hasAsrHintColumn ? "asr_hint" : "NULL")
     }
 
     private func execute(_ sql: String) throws {
@@ -161,7 +237,7 @@ final class VocabularyStore: @unchecked Sendable {
     }
 
     private func allLocked(db: OpaquePointer) -> [VocabularyRecord] {
-        let sql = "SELECT id, source, replacement, origin, created_at, updated_at FROM corrections ORDER BY source COLLATE NOCASE ASC;"
+        let sql = "SELECT \(recordColumns) FROM corrections ORDER BY source COLLATE NOCASE ASC;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -193,10 +269,12 @@ final class VocabularyStore: @unchecked Sendable {
 
     @discardableResult
     func upsert(source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
-        try queue.sync {
+        let record = try queue.sync {
             guard let db else { throw VocabularyStoreError.sqlError("database closed") }
             return try upsertLocked(db: db, source: source, replacement: replacement, origin: origin)
         }
+        notifyLocalChange()
+        return record
     }
 
     /// Dedup lookup is done here in Swift (via
@@ -213,12 +291,16 @@ final class VocabularyStore: @unchecked Sendable {
     /// let whitespace-variant duplicates slip into the store that those
     /// call sites then choke on. See C1 in the final-review fix report.
     private func upsertLocked(db: OpaquePointer, source: String, replacement: String, origin: VocabularyOrigin) throws -> VocabularyRecord {
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = Self.timestamp()
         if let existing = findRowLocked(db: db, sourceCaseInsensitive: source) {
+            // An unchanged replacement is not an edit: keeping updated_at
+            // stops a replace-all (import, folder sync) from marking every
+            // row as changed for the account sync.
+            if existing.replacement == replacement { return existing }
             let sql = """
             UPDATE corrections SET replacement = ?, updated_at = ?
             WHERE id = ?
-            RETURNING id, source, replacement, origin, created_at, updated_at;
+            RETURNING \(recordColumns);
             """
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -239,7 +321,7 @@ final class VocabularyStore: @unchecked Sendable {
         let sql = """
         INSERT INTO corrections (source, replacement, origin, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
-        RETURNING id, source, replacement, origin, created_at, updated_at;
+        RETURNING \(recordColumns);
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -256,6 +338,8 @@ final class VocabularyStore: @unchecked Sendable {
         guard sqlite3_step(statement) == SQLITE_ROW, let record = record(from: statement) else {
             throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
         }
+        // Re-adding a key clears its tombstone (spec §4.1).
+        removeTombstoneLocked(db: db, source: source)
         return record
     }
 
@@ -277,7 +361,9 @@ final class VocabularyStore: @unchecked Sendable {
             if findRowLocked(db: db, sourceCaseInsensitive: source) != nil { return nil }
             guard countLocked(db: db) < MAX_TRANSCRIPT_CORRECTIONS else { return nil }
             do {
-                return try insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+                let record = try insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+                notifyLocalChange()
+                return record
             } catch {
                 // Never mask an actual SQLite failure (busy, disk, ...)
                 // behind "already known / cap reached": a silently
@@ -329,7 +415,7 @@ final class VocabularyStore: @unchecked Sendable {
                 let wantedSources = Set(corrections.map { normalizedTranscriptCorrectionSource($0.source) })
                 let existing = allLocked(db: db)
                 for row in existing where !wantedSources.contains(normalizedTranscriptCorrectionSource(row.source)) {
-                    guard deleteLocked(db: db, id: row.id) else {
+                    guard deleteLocked(db: db, record: row) else {
                         throw VocabularyStoreError.sqlError("failed to delete row \(row.id) during replaceAllPreservingOrigin")
                     }
                 }
@@ -342,6 +428,7 @@ final class VocabularyStore: @unchecked Sendable {
                     _ = try upsertLocked(db: db, source: correction.source, replacement: correction.replacement, origin: origin)
                 }
                 try execute("COMMIT;")
+                notifyLocalChange()
             } catch {
                 try? execute("ROLLBACK;")
                 log("vocabulary: replaceAllPreservingOrigin failed, rolled back to the pre-call state: \(error)")
@@ -349,34 +436,401 @@ final class VocabularyStore: @unchecked Sendable {
         }
     }
 
+    /// Every local delete goes through here so it leaves a tombstone for
+    /// the account sync (spec §4.1). `deletedAt` is now for local deletes
+    /// and the remote stamp for a synced tombstone.
     @discardableResult
-    private func deleteLocked(db: OpaquePointer, id: Int64) -> Bool {
+    private func deleteLocked(db: OpaquePointer, record: VocabularyRecord, deletedAt: String? = nil) -> Bool {
         let sql = "DELETE FROM corrections WHERE id = ?;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(statement) }
-        sqlite3_bind_int64(statement, 1, id)
-        return sqlite3_step(statement) == SQLITE_DONE
+        sqlite3_bind_int64(statement, 1, record.id)
+        guard sqlite3_step(statement) == SQLITE_DONE else { return false }
+        return writeTombstoneLocked(db: db, source: record.source, deletedAt: deletedAt ?? Self.timestamp())
     }
 
     func delete(id: Int64) {
-        queue.sync {
-            guard let db else { return }
-            let sql = "DELETE FROM corrections WHERE id = ?;"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-            defer { sqlite3_finalize(statement) }
-            sqlite3_bind_int64(statement, 1, id)
-            _ = sqlite3_step(statement)
+        let deleted: Bool = queue.sync {
+            guard let db else { return false }
+            guard let existing = allLocked(db: db).first(where: { $0.id == id }) else { return false }
+            return deleteLocked(db: db, record: existing)
         }
+        if deleted { notifyLocalChange() }
     }
 
     func deleteWhere(sourceCaseInsensitive source: String) {
-        queue.sync {
-            guard let db else { return }
-            guard let existing = findRowLocked(db: db, sourceCaseInsensitive: source) else { return }
-            deleteLocked(db: db, id: existing.id)
+        let deleted: Bool = queue.sync {
+            guard let db else { return false }
+            guard let existing = findRowLocked(db: db, sourceCaseInsensitive: source) else { return false }
+            return deleteLocked(db: db, record: existing)
         }
+        if deleted { notifyLocalChange() }
+    }
+
+    /// Sets the per-entry ASR hint: nil = automatic, true/false = explicit.
+    /// Bumps `updated_at`: the hint travels with the entry in the account
+    /// sync, whose last-writer-wins merge and push selection both key off
+    /// `updated_at` (spec vocabulary-sync §4).
+    func setAsrHint(id: Int64, hint: Bool?) throws {
+        try queue.sync {
+            guard let db else { throw VocabularyStoreError.sqlError("database closed") }
+            guard hasAsrHintColumn else {
+                throw VocabularyStoreError.sqlError("the asr_hint column is unavailable")
+            }
+            let sql = "UPDATE corrections SET asr_hint = ?, updated_at = ? WHERE id = ?;"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            if let hint {
+                sqlite3_bind_int64(statement, 1, hint ? 1 : 0)
+            } else {
+                sqlite3_bind_null(statement, 1)
+            }
+            bindText(statement, 2, Self.timestamp())
+            sqlite3_bind_int64(statement, 3, id)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+        notifyLocalChange()
+    }
+
+    // MARK: - Tombstones (spec vocabulary-sync §4.1)
+
+    struct Tombstone: Equatable, Sendable {
+        let key: String
+        let source: String
+        let deletedAt: String
+    }
+
+    /// Records (or advances) the tombstone for `source`'s key. An older
+    /// stamp never overwrites a newer one.
+    @discardableResult
+    private func writeTombstoneLocked(db: OpaquePointer, source: String, deletedAt: String) -> Bool {
+        let sql = """
+        INSERT INTO deleted_corrections (key, source, deleted_at) VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET source = excluded.source, deleted_at = excluded.deleted_at
+        WHERE excluded.deleted_at > deleted_corrections.deleted_at;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, normalizedTranscriptCorrectionSource(source))
+        bindText(statement, 2, source)
+        bindText(statement, 3, deletedAt)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func removeTombstoneLocked(db: OpaquePointer, source: String) {
+        let sql = "DELETE FROM deleted_corrections WHERE key = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, normalizedTranscriptCorrectionSource(source))
+        _ = sqlite3_step(statement)
+    }
+
+    func tombstones() -> [Tombstone] {
+        queue.sync {
+            guard let db else { return [] }
+            return tombstonesLocked(db: db)
+        }
+    }
+
+    private func tombstonesLocked(db: OpaquePointer) -> [Tombstone] {
+        let sql = "SELECT key, source, deleted_at FROM deleted_corrections ORDER BY deleted_at;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var result: [Tombstone] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let key = sqlite3_column_text(statement, 0),
+                  let source = sqlite3_column_text(statement, 1),
+                  let deletedAt = sqlite3_column_text(statement, 2) else { continue }
+            result.append(Tombstone(key: String(cString: key), source: String(cString: source),
+                                    deletedAt: String(cString: deletedAt)))
+        }
+        return result
+    }
+
+    // MARK: - Learning with hygiene (spec vocabulary-hygiene §2)
+
+    enum LearnCommitOutcome: Equatable {
+        case learned(VocabularyRecord)
+        case rejected(VocabularyHygiene.RejectReason)
+        /// The candidate reverted this entry, which is now deleted.
+        case undone(VocabularyRecord)
+        /// Already known, cap reached, or a SQLite failure (logged).
+        case declined(String)
+    }
+
+    /// The learn path used by PostInsertionEditWatcher: re-runs
+    /// VocabularyHygiene.review against the current rows and applies the
+    /// verdict (insert + chain rewrites + case unification, or the undo
+    /// delete) in one transaction. Like `recordLearned`, a source that is
+    /// already known is never overwritten.
+    func commitLearned(source: String, replacement: String) -> LearnCommitOutcome {
+        let outcome: LearnCommitOutcome = queue.sync {
+            guard let db else { return .declined("database connection is closed") }
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                return .declined("could not start a transaction (store busy)")
+            }
+            do {
+                let rows = allLocked(db: db)
+                switch VocabularyHygiene.review(source: source, replacement: replacement, existing: rows) {
+                case .reject(let reason):
+                    try execute("ROLLBACK;")
+                    return .rejected(reason)
+                case .undo(let id):
+                    guard let reverted = rows.first(where: { $0.id == id }),
+                          deleteLocked(db: db, record: reverted) else {
+                        throw VocabularyStoreError.sqlError("could not delete the reverted entry \(id)")
+                    }
+                    try execute("COMMIT;")
+                    return .undone(reverted)
+                case .accept(let source, let replacement, let rewrites):
+                    if findRowLocked(db: db, sourceCaseInsensitive: source) != nil {
+                        try execute("ROLLBACK;")
+                        return .declined("source already known")
+                    }
+                    guard rows.count < MAX_TRANSCRIPT_CORRECTIONS else {
+                        try execute("ROLLBACK;")
+                        return .declined("vocabulary cap reached")
+                    }
+                    let record = try insertLocked(db: db, source: source, replacement: replacement, origin: .learned)
+                    for rewrite in rewrites {
+                        try updateRowLocked(db: db, id: rewrite.id, source: nil, replacement: rewrite.replacement)
+                    }
+                    try execute("COMMIT;")
+                    return .learned(record)
+                }
+            } catch {
+                try? execute("ROLLBACK;")
+                return .declined("\(error)")
+            }
+        }
+        switch outcome {
+        case .learned, .undone: notifyLocalChange()
+        case .rejected, .declined: break
+        }
+        return outcome
+    }
+
+    /// In-place edit of an existing row (cleanup, chain rewrites): keeps
+    /// id, origin, created_at and asr_hint, bumps updated_at. A changed
+    /// key tombstones the old one and clears any tombstone of the new one.
+    private func updateRowLocked(db: OpaquePointer, id: Int64, source: String?, replacement: String) throws {
+        guard let existing = allLocked(db: db).first(where: { $0.id == id }) else {
+            throw VocabularyStoreError.sqlError("row \(id) disappeared")
+        }
+        let newSource = source ?? existing.source
+        let sql = "UPDATE corrections SET source = ?, replacement = ?, updated_at = ? WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        let now = Self.timestamp()
+        bindText(statement, 1, newSource)
+        bindText(statement, 2, replacement)
+        bindText(statement, 3, now)
+        sqlite3_bind_int64(statement, 4, id)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        if normalizedTranscriptCorrectionSource(newSource) != normalizedTranscriptCorrectionSource(existing.source) {
+            writeTombstoneLocked(db: db, source: existing.source, deletedAt: now)
+            removeTombstoneLocked(db: db, source: newSource)
+        }
+    }
+
+    // MARK: - Cleanup (spec vocabulary-hygiene §3)
+
+    func cleanupPlan() -> VocabularyHygiene.CleanupPlan {
+        VocabularyHygiene.cleanupPlan(for: all())
+    }
+
+    enum CleanupError: Error, LocalizedError {
+        case storeChanged
+        case failed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .storeChanged: return "The vocabulary changed since the preview was built."
+            case .failed(let message): return message
+            }
+        }
+    }
+
+    /// Applies a plan from `cleanupPlan()` in one transaction. Refuses
+    /// (`storeChanged`) when any planned row was edited since the plan was
+    /// computed, so a preview never applies to rows the user did not see.
+    func applyCleanup(_ plan: VocabularyHygiene.CleanupPlan) throws {
+        guard !plan.isEmpty else { return }
+        try queue.sync {
+            guard let db else { throw CleanupError.failed("database connection is closed") }
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                throw CleanupError.failed("could not start a transaction (store busy)")
+            }
+            do {
+                let current = Dictionary(allLocked(db: db).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                let planned = plan.deletions.map(\.record) + plan.rewrites.map(\.record)
+                for record in planned where current[record.id] != record {
+                    throw CleanupError.storeChanged
+                }
+                for deletion in plan.deletions {
+                    guard deleteLocked(db: db, record: deletion.record) else {
+                        throw CleanupError.failed("could not delete row \(deletion.record.id)")
+                    }
+                }
+                for rewrite in plan.rewrites {
+                    try updateRowLocked(db: db, id: rewrite.record.id, source: rewrite.source,
+                                        replacement: rewrite.replacement)
+                }
+                try execute("COMMIT;")
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
+            }
+        }
+        notifyLocalChange()
+    }
+
+    // MARK: - Account sync (spec vocabulary-sync §4)
+
+    /// One entry as the sync server sends it.
+    struct RemoteEntry: Equatable, Sendable {
+        let source: String
+        let replacement: String
+        let origin: VocabularyOrigin
+        let asrHint: Bool?
+        let deleted: Bool
+        let updatedAt: String
+    }
+
+    /// Local rows changed at or after `stamp` and tombstones written at or
+    /// after it (an empty stamp selects everything). `>=` rather than `>`:
+    /// stamps have one-second resolution, and re-pushing an entry from the
+    /// cursor's own second is harmless (a tie keeps the server copy).
+    func syncChanges(since stamp: String) -> (entries: [VocabularyRecord], tombstones: [Tombstone]) {
+        queue.sync {
+            guard let db else { return ([], []) }
+            let entries = allLocked(db: db).filter { $0.updatedAt >= stamp }
+            let tombstones = tombstonesLocked(db: db).filter { $0.deletedAt >= stamp }
+            return (entries, tombstones)
+        }
+    }
+
+    /// Applies server entries by last-writer-wins on `updated_at` (a tie
+    /// keeps the local copy, which equals the server's). Rows keep the
+    /// remote `updated_at`, origin and asr_hint, so an applied entry does
+    /// not look locally changed, and `onLocalChange` is not called.
+    /// Returns how many rows changed.
+    @discardableResult
+    func applyRemote(_ entries: [RemoteEntry]) throws -> Int {
+        guard !entries.isEmpty else { return 0 }
+        return try queue.sync {
+            guard let db else { throw VocabularyStoreError.sqlError("database closed") }
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                throw VocabularyStoreError.sqlError("could not start a transaction (store busy)")
+            }
+            do {
+                var rows: [String: VocabularyRecord] = [:]
+                for row in allLocked(db: db) { rows[normalizedTranscriptCorrectionSource(row.source)] = row }
+                var tombstones: [String: Tombstone] = [:]
+                for tombstone in tombstonesLocked(db: db) { tombstones[tombstone.key] = tombstone }
+                var changed = 0
+                for entry in entries {
+                    let key = normalizedTranscriptCorrectionSource(entry.source)
+                    guard !key.isEmpty else { continue }
+                    if entry.deleted {
+                        if let local = rows[key] {
+                            guard entry.updatedAt > local.updatedAt else { continue }
+                            guard deleteLocked(db: db, record: local, deletedAt: entry.updatedAt) else {
+                                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+                            }
+                            rows[key] = nil
+                            changed += 1
+                        } else {
+                            writeTombstoneLocked(db: db, source: entry.source, deletedAt: entry.updatedAt)
+                        }
+                        tombstones[key] = Tombstone(key: key, source: entry.source, deletedAt: entry.updatedAt)
+                        continue
+                    }
+                    if let local = rows[key] {
+                        guard entry.updatedAt > local.updatedAt else { continue }
+                        rows[key] = try writeRemoteRowLocked(db: db, entry: entry, existingId: local.id)
+                    } else {
+                        if let tombstone = tombstones[key], tombstone.deletedAt >= entry.updatedAt { continue }
+                        guard rows.count < MAX_TRANSCRIPT_CORRECTIONS else {
+                            log("vocabulary sync: local cap of \(MAX_TRANSCRIPT_CORRECTIONS) reached; remote entry not stored")
+                            continue
+                        }
+                        rows[key] = try writeRemoteRowLocked(db: db, entry: entry, existingId: nil)
+                    }
+                    removeTombstoneLocked(db: db, source: entry.source)
+                    tombstones[key] = nil
+                    changed += 1
+                }
+                try execute("COMMIT;")
+                return changed
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
+    private func writeRemoteRowLocked(db: OpaquePointer, entry: RemoteEntry, existingId: Int64?) throws -> VocabularyRecord {
+        let hintColumn = hasAsrHintColumn ? ", asr_hint" : ""
+        let sql: String
+        if existingId != nil {
+            sql = """
+            UPDATE corrections SET source = ?, replacement = ?, origin = ?, updated_at = ?\(hasAsrHintColumn ? ", asr_hint = ?" : "")
+            WHERE id = ? RETURNING \(recordColumns);
+            """
+        } else {
+            sql = """
+            INSERT INTO corrections (source, replacement, origin, updated_at\(hintColumn), created_at)
+            VALUES (?, ?, ?, ?\(hasAsrHintColumn ? ", ?" : ""), ?) RETURNING \(recordColumns);
+            """
+        }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, entry.source)
+        bindText(statement, 2, entry.replacement)
+        bindText(statement, 3, entry.origin.rawValue)
+        bindText(statement, 4, entry.updatedAt)
+        var index: Int32 = 5
+        if hasAsrHintColumn {
+            if let hint = entry.asrHint {
+                sqlite3_bind_int64(statement, index, hint ? 1 : 0)
+            } else {
+                sqlite3_bind_null(statement, index)
+            }
+            index += 1
+        }
+        if let existingId {
+            sqlite3_bind_int64(statement, index, existingId)
+        } else {
+            bindText(statement, index, Self.timestamp())
+        }
+        guard sqlite3_step(statement) == SQLITE_ROW, let record = record(from: statement) else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        return record
+    }
+
+    /// The ASR hotword list (spec asr-hotwords §6) for the current
+    /// contents of the store.
+    func asrHotwordPhrases() -> [String] {
+        AsrHotwordSelection.phrases(from: all())
     }
 
     private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {
@@ -394,13 +848,17 @@ final class VocabularyStore: @unchecked Sendable {
               let origin = VocabularyOrigin(rawValue: String(cString: originCString)) else {
             return nil
         }
+        let asrHint: Bool? = sqlite3_column_type(statement, 6) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_int64(statement, 6) != 0
         return VocabularyRecord(
             id: id,
             source: String(cString: sourceCString),
             replacement: String(cString: replacementCString),
             origin: origin,
             createdAt: String(cString: createdCString),
-            updatedAt: String(cString: updatedCString)
+            updatedAt: String(cString: updatedCString),
+            asrHint: asrHint
         )
     }
 }

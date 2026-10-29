@@ -534,13 +534,38 @@ final class PostInsertionEditWatcher {
             log("PostInsertionEditWatcher: evaluateEdit — inserted region is now \"\(currentInsertedRegion)\" (was \"\(insertedText)\"), no ≤3-word learn candidate; continuing to watch")
             return
         }
-        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"; showing pending toast, auto-save in \(Int(Self.confirmSeconds))s (Enter = now, Esc = cancel)")
+        // Learn-time hygiene (spec vocabulary-hygiene §2): a rejected
+        // candidate shows no toast and writes nothing; an undo is applied
+        // after the same confirm window, without a toast. The store
+        // re-runs the review inside its transaction at commit time.
+        let verdict = VocabularyHygiene.review(source: candidate.source, replacement: candidate.replacement,
+                                               existing: store.all())
+        let displayed: LearnCandidate?
+        switch verdict {
+        case .reject(let reason):
+            if pendingCandidate != nil {
+                confirmTask?.cancel()
+                confirmTask = nil
+                pendingCandidate = nil
+                onPendingCleared()
+            }
+            log("PostInsertionEditWatcher: evaluateEdit — candidate \"\(candidate.source)\" → \"\(candidate.replacement)\" rejected by hygiene (\(reason.rawValue)); continuing to watch")
+            return
+        case .undo(let existingId):
+            log("PostInsertionEditWatcher: evaluateEdit — candidate \"\(candidate.source)\" → \"\(candidate.replacement)\" reverts entry id=\(existingId); deleting it in \(Int(Self.confirmSeconds))s unless edited again")
+            displayed = nil
+        case .accept(let source, let replacement, let rewrites):
+            log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\" (stored as \"\(source)\" → \"\(replacement)\", \(rewrites.count) chain rewrite(s)); showing pending toast, auto-save in \(Int(Self.confirmSeconds))s (Enter = now, Esc = cancel)")
+            displayed = LearnCandidate(source: source, replacement: replacement)
+        }
         // A candidate was found. Show the pending toast and start (or
         // restart) the auto-save timer; only if it fires uninterrupted
         // (no further edits, which would cancel it via handleNotification)
         // do we actually save.
         pendingCandidate = candidate
-        onPendingCandidate(candidate, resolveElementFrame(observedElement))
+        if let displayed {
+            onPendingCandidate(displayed, resolveElementFrame(observedElement))
+        }
         let generation = watchGeneration
         confirmTask?.cancel()
         confirmTask = Task { [weak self] in
@@ -590,15 +615,21 @@ final class PostInsertionEditWatcher {
         // compared against the original full transcript (which would often
         // produce one oversized diff or no candidate at all).
         let regionAfterEdit = currentInsertedRegion()
-        if let record = store.recordLearned(source: candidate.source, replacement: candidate.replacement) {
+        switch store.commitLearned(source: candidate.source, replacement: candidate.replacement) {
+        case .learned(let record):
             log("PostInsertionEditWatcher: recorded new correction id=\(record.id)")
             let frame = observedElement.flatMap(resolveElementFrame)
             onLearned(record, frame)
-        } else {
-            // The store declined: already known, cap reached, or an
-            // actual SQLite failure — the store logs the real reason
-            // itself (see VocabularyStore.recordLearned).
-            log("PostInsertionEditWatcher: recordLearned declined (already known, cap reached, or insert failed — see store log)")
+        case .undone(let record):
+            log("PostInsertionEditWatcher: undo — deleted reverted entry id=\(record.id)")
+            onPendingCleared()
+        case .rejected(let reason):
+            // The store changed since evaluateEdit (e.g. a sync landed).
+            log("PostInsertionEditWatcher: candidate rejected by hygiene at commit (\(reason.rawValue))")
+            onPendingCleared()
+        case .declined(let why):
+            log("PostInsertionEditWatcher: commitLearned declined (\(why))")
+            onPendingCleared()
         }
 
         pendingCandidate = nil

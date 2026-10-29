@@ -124,6 +124,11 @@ actor TranscriptionWorker {
     /// the generation they were made with and are dropped at release if
     /// the engine was replaced in between.
     private(set) var engineGeneration: UInt64 = 0
+    /// ASR hotwords for the current dictation (spec asr-hotwords §8). Kept
+    /// here, not only on the engine, so a relaunched helper gets them too:
+    /// `liveEngine()` re-applies them before every request (a no-op on the
+    /// engine when unchanged).
+    private var hotwords = AsrHotwordsConfiguration.disabled
     #if DEBUG
     /// Self-test hook (`onnx-asr-real`): load this already-installed model
     /// directory instead of the profile's app cache. Never set in the app.
@@ -243,11 +248,21 @@ actor TranscriptionWorker {
     /// next request gets a fresh one (spec §8) instead of a dead engine.
     private func liveEngine() async throws -> OnnxAsrEngine {
         guard let engine, let loadedProfile else { throw NSError(domain: "Parakey", code: -2) }
-        if await engine.isAlive { return engine }
+        if await engine.isAlive {
+            await engine.setHotwords(hotwords.phrases, score: hotwords.score)
+            return engine
+        }
         log("ASR: ONNX helper is gone — relaunching")
         let fresh = try await loadOnnxEngine(profile: loadedProfile, progressHandler: nil)
         self.engine = fresh
+        await fresh.setHotwords(hotwords.phrases, score: hotwords.score)
         return fresh
+    }
+
+    /// Called when a dictation's transcription starts (recording-time
+    /// windows and the release path alike); applies from the next request.
+    func setHotwords(_ configuration: AsrHotwordsConfiguration) {
+        hotwords = configuration
     }
 
     func transcribe(samples: [Float],
