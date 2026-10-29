@@ -6,6 +6,33 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.3 — 2026-10-29
+
+macOS (`mac-v0.9.3`) and Windows (`win-v0.9.3`).
+
+### Added
+- **Speech recognition now prefers the terms in your vocabulary.** Product names, acronyms, Latin spellings and other terms from the vocabulary steer the speech model itself, not only the corrections applied after it. Both models are covered: GigaAM v3 and Parakeet Ultra. On test phrases, «Краснякову» became «Красникову», «ЕСИ» became «ЕСИА», «DDR4 DM» became «DDR4 DIMM» and «Джемейл Вочер» became «Gmail watcher».
+  - Which entries are used: manual entries, plus learned entries that look like a term (Latin letters, digits or several capitals). Ordinary Russian words learned from edits are left out.
+  - The new «Подсказка ASR» column in the vocabulary window turns any entry on or off, for example a surname.
+  - Settings → vocabulary: «Подсказывать распознаванию термины из словаря» (on by default) and the strength, «Обычно» or «Сильнее».
+  - If a hinted phrase starts to match but the speech goes elsewhere, the model takes it back and decodes that place as before. On ordinary speech the text does not change.
+- **Vocabulary sync between your computers.** Settings → «Синхронизация словаря». Sign in with an e-mail and a password; the first sign-in with a new address creates the account. The vocabulary syncs between macOS and Windows: additions, edits, deletions and «Подсказка ASR». The vocabulary is stored on the SuperDictate server and used to improve speech recognition, and the settings say so before you sign in. Sync is off until you sign in.
+
+### Changed
+- **Auto-learning no longer saves junk.** An edit is not learned if it:
+  - only changes punctuation or case of an ordinary word («оплатил → оплатил.»);
+  - changes the ending of an ordinary Russian word («Запомню → Запомни»);
+  - rewrites the meaning («Смотри → Задайте вопрос ChatGPT»);
+  - leaves no letters.
+
+  Punctuation at the edges is no longer stored with a rule. Reverting an earlier correction removes it. Chains such as «Pypline → Pipline → Pipeline» collapse onto the final target. One target keeps one casing.
+- **«Почистить словарь…»** in the vocabulary window applies the same rules to entries already learned. It shows what it will delete, fix and merge before it does anything. Manual entries are never touched.
+
+### Under the hood
+- The native ONNX core boosts the hotword phrases inside its greedy decoders (TDT and RNN-T). The phrases are tokenized into the model's own pieces: SentencePiece BPE from `tokens.txt` for Parakeet, and unigram with the bundled `gigaam_v3_spm.tsv` (MIT, from ai-sage/GigaAM-v3) for GigaAM. A match that does not complete is rolled back. With no hotwords the output is bit-identical to 0.9.2, and decoding speed is unchanged. Spec: `docs/specs/asr-hotwords-spec.md`.
+- sherpa-onnx v2.0.0 was evaluated and not adopted. On our models it is no faster and slightly less accurate. Its NeMo log-guard fix was already in our feature graph.
+- Sync server: `server/vocab-sync` (FastAPI + SQLite), at `https://superdictate.bykovlegal.ru`. Spec: `docs/specs/vocabulary-hygiene-and-sync-spec.md`.
+
 ## 0.9.2 — 2026-10-27
 
 macOS (`mac-v0.9.2`) and Windows (`win-v0.9.2`).
