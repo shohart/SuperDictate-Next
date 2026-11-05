@@ -708,6 +708,21 @@ class LearnCandidate:
     replacement: str
 
 
+def _spans_past_inflection(old: list[str], new: list[str]) -> tuple[list[str], list[str]]:
+    """Drops unchanged or merely re-inflected words from both ends."""
+    def same(a: str, b: str) -> bool:
+        return a == b or hygiene.is_same_word_inflected(a, b)
+
+    head = 0
+    while head < len(old) and head < len(new) and same(old[head], new[head]):
+        head += 1
+    tail = 0
+    while (tail < len(old) - head and tail < len(new) - head
+           and same(old[len(old) - 1 - tail], new[len(new) - 1 - tail])):
+        tail += 1
+    return old[head:len(old) - tail], new[head:len(new) - tail]
+
+
 def learn_candidate(inserted_text: str, edited_text: str) -> Optional[LearnCandidate]:
     """Whether a hand-edit looks like a vocabulary correction.
 
@@ -735,6 +750,17 @@ def learn_candidate(inserted_text: str, edited_text: str) -> Optional[LearnCandi
     new_span = edited[prefix:len(edited) - suffix]
     if not old_span or not new_span:
         return None
+
+    # A changed case ending is not vocabulary, so it must not widen the span
+    # of a real fix elsewhere in the region. An edit made only of such words
+    # stays whole: the hygiene review rejects it without a pill, or deletes
+    # an older rule it reverts.
+    narrow_old, narrow_new = _spans_past_inflection(old_span, new_span)
+    if narrow_old or narrow_new:
+        if not narrow_old or not narrow_new:
+            return None
+        old_span, new_span = narrow_old, narrow_new
+
     if len(old_span) > MAX_SPAN_WORDS or len(new_span) > MAX_SPAN_WORDS:
         return None
 

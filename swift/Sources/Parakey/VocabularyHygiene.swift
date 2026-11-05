@@ -140,21 +140,133 @@ enum VocabularyHygiene {
         replacement.count < 2 || !replacement.contains(where: { $0.isLetter })
     }
 
+    /// Rule 4. One word: the loose prefix test, which also catches
+    /// ordinary-word typos («сторониной → стороной»). Several words: every
+    /// changed word is another grammatical form by its ending
+    /// («финансовая управляющая → финансового управляющего»); the right case
+    /// belongs to one sentence, so it is never a rule for the next one. A
+    /// spelling fix in a phrase stays learnable («Бюллеттени Нилова →
+    /// Бюллетени Нилова»).
     static func isInflectionEdit(source: String, replacement: String) -> Bool {
+        let lhs = source.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let rhs = replacement.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !lhs.isEmpty, lhs.count == rhs.count else { return false }
+        if lhs.count == 1 {
+            return lhs != rhs && isInflectedByHyphenPart(lhs[0], rhs[0], test: isLooselyInflected)
+        }
+        var inflected = false
+        for (old, new) in zip(lhs, rhs) where old != new {
+            guard isSameWordInflected(old, new) else { return false }
+            inflected = true
+        }
+        return inflected
+    }
+
+    /// The strict word test: same stem, both tails are grammatical endings.
+    /// Also what the watcher's diff uses to drop re-inflected neighbours of
+    /// a real fix.
+    static func isSameWordInflected(_ old: String, _ new: String) -> Bool {
+        isInflectedByHyphenPart(old, new, test: isInflectedByEnding)
+    }
+
+    /// Edge punctuation ignored, hyphenated parts compared one by one
+    /// («Санкт-Петербурга → Санкт-Петербургу»).
+    private static func isInflectedByHyphenPart(_ old: String, _ new: String,
+                                                test: (String, String) -> Bool) -> Bool {
+        let lhs = trimEdges(old).components(separatedBy: "-")
+        let rhs = trimEdges(new).components(separatedBy: "-")
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { $0 == $1 || test($0, $1) }
+    }
+
+    private static func isInflectionComparable(_ source: String, _ replacement: String) -> Bool {
         guard isSingleCyrillicWord(source), isSingleCyrillicWord(replacement) else { return false }
-        let uppercase = replacement.unicodeScalars.filter { $0.properties.isUppercase }.count
-        guard uppercase < 2 else { return false }
-        let lhs = Array(source.lowercased())
-        let rhs = Array(replacement.lowercased())
+        return replacement.unicodeScalars.filter { $0.properties.isUppercase }.count < 2
+    }
+
+    private static func isLooselyInflected(_ source: String, _ replacement: String) -> Bool {
+        guard isInflectionComparable(source, replacement) else { return false }
+        let lhs = inflectionFolded(source)
+        let rhs = inflectionFolded(replacement)
         var prefix = 0
         while prefix < lhs.count, prefix < rhs.count, lhs[prefix] == rhs[prefix] {
             prefix += 1
         }
         let shorter = Double(min(lhs.count, rhs.count))
-        return prefix >= 3
-            && Double(prefix) >= 0.6 * shorter
-            && lhs.count - prefix <= 4
-            && rhs.count - prefix <= 4
+        if prefix >= 3, Double(prefix) >= 0.6 * shorter, lhs.count - prefix <= 4, rhs.count - prefix <= 4 {
+            return true
+        }
+        // Short stems the prefix test cannot see: «бой → боя», «день → дня».
+        return isInflectedByEnding(source, replacement)
+    }
+
+    private static func isInflectedByEnding(_ source: String, _ replacement: String) -> Bool {
+        guard isInflectionComparable(source, replacement) else { return false }
+        let lhs = inflectionFolded(source)
+        let rhs = inflectionFolded(replacement)
+        guard lhs.count >= 3, rhs.count >= 3 else { return false }
+        return endingsMatch(lhs, rhs)
+    }
+
+    private static func inflectionFolded(_ word: String) -> [Character] {
+        word.lowercased().map { $0 == "ё" ? "е" : $0 }
+    }
+
+    /// Noun and adjective endings.
+    private static let caseEndings: Set<String> = [
+        "", "а", "я", "о", "е", "и", "ы", "у", "ю", "й", "ь",
+        "ом", "ем", "ой", "ей", "ов", "ев", "ам", "ям", "ах", "ях", "ами", "ями",
+        "ие", "ия", "ию", "ии", "их", "им", "ым", "ых", "ая", "ое", "ую", "ые", "ый", "ий",
+        "ью", "ья", "ье", "ьи",
+        "яя", "ее", "юю", "ого", "его", "ому", "ему", "ыми", "ими", "ени", "ери",
+    ]
+    /// Verb endings count only with a stem of three letters or more:
+    /// «сделал → сделала», «делает → делают».
+    private static let verbEndings: Set<String> = [
+        "л", "ла", "ло", "ли", "ть", "ет", "ют", "ит", "ят", "ут", "ат",
+        "ешь", "ишь", "ете", "ите",
+    ]
+    /// Endings of the form that lost its fleeting vowel. No «о»: it would
+    /// turn «кто» into a form of «кот».
+    private static let fleetingLostEndings: Set<String> = [
+        "а", "я", "у", "ю", "е", "и", "ы", "ом", "ем", "ов", "ев", "ей",
+        "ам", "ям", "ах", "ях", "ами", "ями",
+    ]
+
+    private static func endingsMatch(_ lhs: [Character], _ rhs: [Character]) -> Bool {
+        func splits(_ word: [Character]) -> [(stem: [Character], ending: String)] {
+            (0...min(3, word.count - 2)).compactMap { length in
+                let ending = String(word.suffix(length))
+                let stem = Array(word.dropLast(length))
+                let known = caseEndings.contains(ending) || (stem.count >= 3 && verbEndings.contains(ending))
+                return known ? (stem, ending) : nil
+            }
+        }
+        let left = splits(lhs), right = splits(rhs)
+        for l in left {
+            for r in right {
+                if l.stem == r.stem { return true }
+                if hasFleetingVowel(l.stem, l.ending, lost: r.stem, r.ending)
+                    || hasFleetingVowel(r.stem, r.ending, lost: l.stem, l.ending) { return true }
+            }
+        }
+        return false
+    }
+
+    /// «отец/отца», «день/дня», «лев/льва»: the vowel before the last stem
+    /// consonant exists only with a zero ending (or «ь»).
+    private static func hasFleetingVowel(_ full: [Character], _ fullEnding: String,
+                                         lost: [Character], _ lostEnding: String) -> Bool {
+        guard fullEnding.isEmpty || fullEnding == "ь", fleetingLostEndings.contains(lostEnding),
+              full.count >= 3, full.last == lost.last,
+              full.prefix(full.count - 2).elementsEqual(lost.prefix(full.count - 2)) else { return false }
+        let vowel = full[full.count - 2]
+        if lost.count == full.count - 1 { return vowel == "о" || vowel == "е" }
+        if lost.count == full.count {
+            let soft = lost[lost.count - 2]
+            return vowel == "е" && (soft == "ь" || soft == "й")
+        }
+        return false
     }
 
     private static func isSingleCyrillicWord(_ text: String) -> Bool {

@@ -671,6 +671,16 @@ def test_learn_candidate() -> None:
            pair("а б в г д е", "а б X Y Z W д е"), None)
     _check("unchanged text is not learnable",
            pair("привет мир", "привет мир"), None)
+    _check("a re-inflected neighbour does not join the candidate",
+           pair("красная машина стоит", "красную Тойоту стоит"), ("машина", "Тойоту"))
+    _check("a distant case edit does not hide a real fix",
+           pair("договора один два три четыре на инглиш тут",
+                "договору один два три четыре на English тут"), ("инглиш", "English"))
+    _check("an inflection-only edit reaches the hygiene review whole",
+           pair("для финансовая управляющая тут", "для финансового управляющего тут"),
+           ("финансовая управляющая", "финансового управляющего"))
+    _check("a long inflection-only edit produces nothing",
+           pair("новый красный большой дом", "нового красного большого дома"), None)
 
 
 def test_vocabulary_store() -> None:

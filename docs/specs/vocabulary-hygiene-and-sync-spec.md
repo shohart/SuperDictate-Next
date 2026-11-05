@@ -65,6 +65,18 @@ The rules apply in this order:
    «черноиск → черновик» (an ordinary word, not vocabulary). It
    keeps «Нечепуренко → Ничипуренко», «красненькову → Красникову»,
    «паникший → поникший» and «снуху → слуху».
+   Since 0.9.4 «ё» counts as «е», and an edit of several words is covered too.
+   Each changed word must pass a stricter test: at least three letters, the
+   same stem, and both tails are noun, adjective or verb endings (a verb ending
+   needs a stem of three letters), or the stems differ only by a fleeting vowel
+   («отец → отца», «день → дня», «лёд → льда»). Edge punctuation is ignored and
+   hyphenated parts are compared separately. So «финансовая управляющая →
+   финансового управляющего» goes, while «Бюллеттени Нилова → Бюллетени Нилова»
+   stays. A single word also passes on the stricter test alone («бой → боя»).
+   The watcher's diff drops words that pass the stricter test from the edges of
+   an edit, so «красная машина → красную Тойоту» offers «машина → Тойоту». An
+   edit made only of such words still reaches the review whole, so rule 6 can
+   undo an older rule.
 5. **Reject content rewrites.** Transliterate both sides to Latin lowercase
    letters only (a simple GOST-like Cyrillic map; digits kept). Compute the
    similarity `1 - levenshtein / max(len)` and reject when it is below 0.3.

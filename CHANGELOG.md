@@ -6,6 +6,20 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.4 — 2026-11-05
+
+macOS (`mac-v0.9.4`) and Windows (`win-v0.9.4`).
+
+### Added
+- **macOS: your own list of terms for speech recognition.** The vocabulary window has a new «ASR Hotwords» tab. Add names, courts and terms before the model first gets them wrong, one at a time or from a text file (UTF-8, one phrase per line, `#` starts a comment). A phrase can be up to four words and can be turned off without deleting it. These phrases only guide recognition and never replace text. They come first when the list reaches its limit of 1000 phrases. Not on Windows yet.
+
+### Changed
+- **Auto-learning no longer reacts to changed case endings, on either platform.** Fixing «финансовая управляющая» to «финансового управляющего» or «актом» to «актами» shows no pill and saves nothing, however many words the edit touches. This also covers short words («бой → боя»), vowels that drop out («отец → отца», «день → дня») and hyphenated words («Санкт-Петербурга → Санкт-Петербургу»). A changed ending next to a real fix no longer gets in its way: «красная машина → красную Тойоту» offers only «машина → Тойоту». Reverting an older rule of this kind by hand still removes it.
+- **«Почистить словарь…»** now also offers to delete several-word entries that only change endings.
+
+### Fixed
+- **macOS: hotwords are not lost when the sync server is out of date.** The app keeps them and sends them again once the server stores them.
+
 ## 0.9.3 — 2026-10-29
 
 macOS (`mac-v0.9.3`) and Windows (`win-v0.9.3`).

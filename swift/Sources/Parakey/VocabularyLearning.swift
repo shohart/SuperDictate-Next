@@ -28,10 +28,21 @@ enum LearnCandidateDetector {
             skippingPrefix: commonPrefix
         )
 
-        let oldSpan = Array(insertedWords[commonPrefix..<(insertedWords.count - commonSuffix)])
-        let newSpan = Array(editedWords[commonPrefix..<(editedWords.count - commonSuffix)])
+        var oldSpan = Array(insertedWords[commonPrefix..<(insertedWords.count - commonSuffix)])
+        var newSpan = Array(editedWords[commonPrefix..<(editedWords.count - commonSuffix)])
 
         guard !oldSpan.isEmpty, !newSpan.isEmpty else { return nil }
+
+        // A changed case ending is not vocabulary, so it must not widen the
+        // span of a real fix elsewhere in the region. An edit made only of
+        // such words stays whole: the hygiene review rejects it without a
+        // toast, or deletes an older rule it reverts.
+        let narrowed = spansPastInflection(oldSpan, newSpan)
+        if !narrowed.old.isEmpty || !narrowed.new.isEmpty {
+            guard !narrowed.old.isEmpty, !narrowed.new.isEmpty else { return nil }
+            oldSpan = narrowed.old
+            newSpan = narrowed.new
+        }
         guard oldSpan.count <= maxSpanWords, newSpan.count <= maxSpanWords else { return nil }
 
         let source = oldSpan.joined(separator: " ")
@@ -54,6 +65,19 @@ enum LearnCandidateDetector {
         guard !normalizedSpan(source).contains(normalizedSpan(replacement)) else { return nil }
 
         return LearnCandidate(source: source, replacement: replacement)
+    }
+
+    /// Drops unchanged or merely re-inflected words from both ends.
+    private static func spansPastInflection(_ old: [String], _ new: [String]) -> (old: [String], new: [String]) {
+        func same(_ lhs: String, _ rhs: String) -> Bool {
+            lhs == rhs || VocabularyHygiene.isSameWordInflected(lhs, rhs)
+        }
+        var head = 0
+        while head < old.count, head < new.count, same(old[head], new[head]) { head += 1 }
+        var tail = 0
+        while tail < old.count - head, tail < new.count - head,
+              same(old[old.count - 1 - tail], new[new.count - 1 - tail]) { tail += 1 }
+        return (Array(old[head..<(old.count - tail)]), Array(new[head..<(new.count - tail)]))
     }
 
     /// Canonical form used by the deletion check: lowercase, internal
@@ -181,6 +205,35 @@ func testLearnCandidateDetector() throws {
         editedText: "напиши на English пожалуйста"
     ) == LearnCandidate(source: "инглиш", replacement: "English") else {
         throw VocabularyLearningTestFailure("real replacement must still produce a candidate after the deletion guard")
+    }
+
+    // A changed case ending next to a real fix: only the fix is the
+    // candidate, however far apart the two edits are.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "красная машина стоит",
+        editedText: "красную Тойоту стоит"
+    ) == LearnCandidate(source: "машина", replacement: "Тойоту") else {
+        throw VocabularyLearningTestFailure("a re-inflected neighbour must not join the candidate")
+    }
+    guard LearnCandidateDetector.candidate(
+        insertedText: "договора один два три четыре на инглиш тут",
+        editedText: "договору один два три четыре на English тут"
+    ) == LearnCandidate(source: "инглиш", replacement: "English") else {
+        throw VocabularyLearningTestFailure("a distant case edit must not hide a real fix")
+    }
+    // An edit of case endings only stays whole for the hygiene review (it
+    // rejects it, or undoes an older rule), and is too long past three words.
+    guard LearnCandidateDetector.candidate(
+        insertedText: "для финансовая управляющая тут",
+        editedText: "для финансового управляющего тут"
+    ) == LearnCandidate(source: "финансовая управляющая", replacement: "финансового управляющего") else {
+        throw VocabularyLearningTestFailure("an inflection-only edit must reach the hygiene review whole")
+    }
+    guard LearnCandidateDetector.candidate(
+        insertedText: "новый красный большой дом",
+        editedText: "нового красного большого дома"
+    ) == nil else {
+        throw VocabularyLearningTestFailure("a long inflection-only edit must produce nothing")
     }
 
     // Rebasing after a committed correction must make a later correction in

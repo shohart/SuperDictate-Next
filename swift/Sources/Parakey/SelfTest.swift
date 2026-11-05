@@ -3975,6 +3975,22 @@ enum ParakeySelfTest {
             ("погонял", "погоняло", [], .reject(.inflection)),
             ("сторониной", "стороной", [], .reject(.inflection)),
             ("черноиск", "черновик", [], .reject(.inflection)),
+            // Several words, short stems, fleeting vowels, hyphens, «ё»
+            ("финансовая управляющая", "финансового управляющего", [], .reject(.inflection)),
+            ("обжалуемым судебным актом", "обжалуемыми судебными актами", [], .reject(.inflection)),
+            ("договор суда", "договор суду", [], .reject(.inflection)),
+            ("Санкт-Петербурга", "Санкт-Петербургу", [], .reject(.inflection)),
+            ("отец", "отца", [], .reject(.inflection)),
+            ("день", "дня", [], .reject(.inflection)),
+            ("лёд", "льда", [], .reject(.inflection)),
+            ("бой", "боя", [], .reject(.inflection)),
+            ("сделал работу", "сделала работы", [], .reject(.inflection)),
+            ("ёлка", "елки", [], .reject(.inflection)),
+            // Real fixes that only look like an ending
+            ("кто", "кот", [], accept("кто", "кот")),
+            ("Бюллеттени Нилова", "Бюллетени Нилова", [], accept("Бюллеттени Нилова", "Бюллетени Нилова")),
+            ("Биллюте Николашникова", "Биллютени Калашникова", [], accept("Биллюте Николашникова", "Биллютени Калашникова")),
+            ("докс-документа", "DOCX-документа", [], accept("докс-документа", "DOCX-документа")),
             // §1 content rewrites
             ("Смотри.", "Задайте вопрос ChatGPT", [], .reject(.rewrite)),
             ("тридцать семь. А", "37А", [], .reject(.rewrite)),
@@ -4311,6 +4327,50 @@ enum ParakeySelfTest {
         try expect(a.row("дебиан")?.replacement, equals: "Debian (B, newer)", "the newer edit wins on A")
         _ = try pass(b)
         try expect(b.row("дебиан")?.replacement, equals: "Debian (B, newer)", "the older edit does not overwrite B")
+
+        // Custom hotwords travel between devices through the real server.
+        Thread.sleep(forTimeInterval: 1.1)
+        let hotword = try a.store.addHotwordPhrase("Дунималова Анаида Георгиевна")
+        _ = try pass(a)
+        _ = try pass(b)
+        try expect(b.store.hotwordPhrases().map(\.phrase), equals: ["Дунималова Анаида Георгиевна"], "A's hotword reaches B")
+        try expect(b.store.asrHotwordPhrases().contains("Дунималова Анаида Георгиевна"), equals: true,
+                   "a synced hotword reaches the ASR list")
+        try expect(b.store.all().contains { $0.replacement.contains("Дунималова") }, equals: false,
+                   "a synced hotword creates no replacement rule")
+        Thread.sleep(forTimeInterval: 1.1)
+        try a.store.setHotwordPhraseEnabled(id: hotword.id, enabled: false)
+        _ = try pass(a)
+        _ = try pass(b)
+        try expect(b.store.hotwordPhrases().first?.enabled, equals: false, "disabling travels")
+        try expect(b.store.asrHotwordPhrases().contains("Дунималова Анаида Георгиевна"), equals: false,
+                   "a disabled hotword leaves B's ASR list")
+        Thread.sleep(forTimeInterval: 1.1)
+        guard let onB = b.store.hotwordPhrases().first else { throw SelfTestFailure.failed("B should hold the hotword") }
+        try b.store.deleteHotwordPhrase(id: onB.id)
+        _ = try pass(b)
+        _ = try pass(a)
+        try expect(a.store.hotwordPhrases().isEmpty, equals: true, "a hotword delete on B removes it on A")
+
+        try expect(a.settings.vocabularySyncLastPushedLocalStamp.isEmpty, equals: false, "a current server advances the push cursor")
+
+        // A server that predates hotwords drops them: the cursor must stay
+        // so they go out again after its upgrade.
+        if let oldRaw = ProcessInfo.processInfo.environment["SD_VOCAB_SYNC_TEST_OLD_URL"], let oldURL = URL(string: oldRaw) {
+            let old = try Device(name: "old", serverURL: oldURL)
+            defer { old.cleanUp() }
+            _ = try runParakeetEngineSynchronously { [engine = old.engine] in
+                try await engine.signIn(email: "old-\(email)", password: password)
+            }
+            _ = try old.store.addHotwordPhrase("Старый Сервер")
+            let firstOld = try pass(old)
+            try expect(firstOld.pushed, equals: 1, "the hotword is sent to the old server")
+            try expect(old.settings.vocabularySyncLastPushedLocalStamp, equals: "", "an old server does not advance the push cursor")
+            let secondOld = try pass(old)
+            try expect(secondOld.pushed, equals: 1, "an old server's dropped hotword is pushed again")
+        } else {
+            print("SKIP vocabulary-sync old-server step: SD_VOCAB_SYNC_TEST_OLD_URL is not set")
+        }
 
         // 401: a revoked token is dropped locally.
         guard let token = b.tokens.token(for: b.settings.vocabularySyncEmail) else {

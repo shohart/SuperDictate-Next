@@ -138,18 +138,24 @@ struct VocabularySyncResponse: Codable, Sendable {
     let entries: [VocabularySyncWireEntry]
     /// Absent in answers from a server that predates custom hotwords.
     let hotwords: [VocabularySyncHotwordEntry]
+    /// False when the answer has no `hotwords` field: that server dropped
+    /// the hotwords it was sent, so they must be pushed again later.
+    let serverStoresHotwords: Bool
 
     init(revision: Int, entries: [VocabularySyncWireEntry], hotwords: [VocabularySyncHotwordEntry] = []) {
         self.revision = revision
         self.entries = entries
         self.hotwords = hotwords
+        serverStoresHotwords = true
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         revision = try container.decode(Int.self, forKey: .revision)
         entries = try container.decode([VocabularySyncWireEntry].self, forKey: .entries)
-        hotwords = try container.decodeIfPresent([VocabularySyncHotwordEntry].self, forKey: .hotwords) ?? []
+        let decoded = try container.decodeIfPresent([VocabularySyncHotwordEntry].self, forKey: .hotwords)
+        hotwords = decoded ?? []
+        serverStoresHotwords = decoded != nil
     }
 
     enum CodingKeys: String, CodingKey { case revision, entries, hotwords }
@@ -478,6 +484,7 @@ actor VocabularySyncEngine {
         } else {
             var start = 0
             var hotwordStart = 0
+            var hotwordsDropped = false
             while start < changes.count || hotwordStart < hotwordChanges.count {
                 let batch = Array(changes[start..<min(start + Self.maxChangesPerPush, changes.count)])
                 let hotwordBatch = Array(hotwordChanges[hotwordStart..<min(hotwordStart + Self.maxChangesPerPush,
@@ -486,6 +493,7 @@ actor VocabularySyncEngine {
                                                      hotwords: hotwordBatch)
                 summary.applied += try apply(response)
                 summary.pushed += batch.count + hotwordBatch.count
+                if !hotwordBatch.isEmpty && !response.serverStoresHotwords { hotwordsDropped = true }
                 since = response.revision
                 settings.vocabularySyncLastServerRevision = since
                 start += batch.count
@@ -493,7 +501,14 @@ actor VocabularySyncEngine {
             }
             // Never ahead of this device's own clock: a remote stamp from a
             // device whose clock runs fast must not hide later local edits.
-            settings.vocabularySyncLastPushedLocalStamp = min(newestPushed, passStart)
+            // An old server ignored the hotwords: keep the cursor so they go
+            // out again once it is upgraded (re-pushed corrections tie and
+            // change nothing there).
+            if hotwordsDropped {
+                log("vocabulary sync: the server does not store hotwords yet; will push them again")
+            } else {
+                settings.vocabularySyncLastPushedLocalStamp = min(newestPushed, passStart)
+            }
         }
         log("vocabulary sync: pass done — pushed \(summary.pushed), applied \(summary.applied), revision \(since)")
         return summary

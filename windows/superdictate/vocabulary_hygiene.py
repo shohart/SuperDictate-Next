@@ -16,7 +16,8 @@ Rules, in order (§2):
 1. trim edge punctuation on both sides;
 2. reject punctuation/case-only edits of ordinary (not term-like) words;
 3. reject replacements without letters or shorter than two characters;
-4. reject Russian inflection edits («Запомню → Запомни»);
+4. reject Russian inflection edits, word by word («Запомню → Запомни»,
+   «финансовая управляющая → финансового управляющего»);
 5. reject content rewrites (transliterated similarity below 0.3);
 6. undo: ``replacement → source`` already exists, so the user reverted it;
 7. chains: ``replacement → Z`` gives ``source → Z``; ``X → source`` entries
@@ -180,19 +181,120 @@ def _is_acronym(replacement: str) -> bool:
         "a" <= ch <= "z" for ch in replacement)
 
 
-def _is_inflection(source: str, replacement: str) -> bool:
-    if not (_is_cyrillic_word(source) and _is_cyrillic_word(replacement)):
+#: Noun and adjective endings.
+_CASE_ENDINGS = frozenset((
+    "", "а", "я", "о", "е", "и", "ы", "у", "ю", "й", "ь",
+    "ом", "ем", "ой", "ей", "ов", "ев", "ам", "ям", "ах", "ях", "ами", "ями",
+    "ие", "ия", "ию", "ии", "их", "им", "ым", "ых", "ая", "ое", "ую", "ые", "ый", "ий",
+    "ью", "ья", "ье", "ьи",
+    "яя", "ее", "юю", "ого", "его", "ому", "ему", "ыми", "ими", "ени", "ери",
+))
+#: Verb endings count only with a stem of three letters or more:
+#: «сделал → сделала», «делает → делают».
+_VERB_ENDINGS = frozenset((
+    "л", "ла", "ло", "ли", "ть", "ет", "ют", "ит", "ят", "ут", "ат",
+    "ешь", "ишь", "ете", "ите",
+))
+#: Endings of the form that lost its fleeting vowel. No «о»: it would turn
+#: «кто» into a form of «кот».
+_FLEETING_LOST_ENDINGS = frozenset((
+    "а", "я", "у", "ю", "е", "и", "ы", "ом", "ем", "ов", "ев", "ей",
+    "ам", "ям", "ах", "ях", "ами", "ями",
+))
+
+
+def _inflection_folded(word: str) -> str:
+    return word.lower().replace("ё", "е")
+
+
+def _has_fleeting_vowel(full: str, full_ending: str, lost: str, lost_ending: str) -> bool:
+    """«отец/отца», «день/дня», «лев/льва»: the vowel before the last stem
+    consonant exists only with a zero ending (or «ь»)."""
+    if full_ending not in ("", "ь") or lost_ending not in _FLEETING_LOST_ENDINGS:
         return False
-    if _uppercase_count(replacement) >= 2:
+    if len(full) < 3 or not lost or full[-1] != lost[-1] or full[:-2] != lost[:len(full) - 2]:
         return False
-    a, b = source.lower(), replacement.lower()
+    vowel = full[-2]
+    if len(lost) == len(full) - 1:
+        return vowel in "ое"
+    if len(lost) == len(full):
+        return vowel == "е" and lost[-2] in "ьй"
+    return False
+
+
+def _endings_match(a: str, b: str) -> bool:
+    def splits(word: str):
+        for length in range(0, min(3, len(word) - 2) + 1):
+            stem, ending = word[:len(word) - length], word[len(word) - length:]
+            if ending in _CASE_ENDINGS or (len(stem) >= 3 and ending in _VERB_ENDINGS):
+                yield stem, ending
+
+    for left, left_ending in splits(a):
+        for right, right_ending in splits(b):
+            if (left == right
+                    or _has_fleeting_vowel(left, left_ending, right, right_ending)
+                    or _has_fleeting_vowel(right, right_ending, left, left_ending)):
+                return True
+    return False
+
+
+def _inflection_comparable(source: str, replacement: str) -> bool:
+    return (_is_cyrillic_word(source) and _is_cyrillic_word(replacement)
+            and _uppercase_count(replacement) < 2)
+
+
+def _is_inflected_by_ending(source: str, replacement: str) -> bool:
+    if not _inflection_comparable(source, replacement):
+        return False
+    a, b = _inflection_folded(source), _inflection_folded(replacement)
+    return len(a) >= 3 and len(b) >= 3 and _endings_match(a, b)
+
+
+def _is_loosely_inflected(source: str, replacement: str) -> bool:
+    if not _inflection_comparable(source, replacement):
+        return False
+    a, b = _inflection_folded(source), _inflection_folded(replacement)
     prefix = 0
     while prefix < min(len(a), len(b)) and a[prefix] == b[prefix]:
         prefix += 1
-    return (prefix >= _INFLECTION_MIN_PREFIX
+    if (prefix >= _INFLECTION_MIN_PREFIX
             and prefix >= _INFLECTION_PREFIX_SHARE * min(len(a), len(b))
             and len(a) - prefix <= _INFLECTION_MAX_TAIL
-            and len(b) - prefix <= _INFLECTION_MAX_TAIL)
+            and len(b) - prefix <= _INFLECTION_MAX_TAIL):
+        return True
+    # Short stems the prefix test cannot see: «бой → боя», «день → дня».
+    return _is_inflected_by_ending(source, replacement)
+
+
+def _by_hyphen_part(old: str, new: str, test) -> bool:
+    """Edge punctuation ignored, hyphenated parts compared one by one
+    («Санкт-Петербурга → Санкт-Петербургу»)."""
+    left, right = trim_edges(old).split("-"), trim_edges(new).split("-")
+    return len(left) == len(right) and all(
+        a == b or test(a, b) for a, b in zip(left, right))
+
+
+def is_same_word_inflected(old: str, new: str) -> bool:
+    """The strict word test: same stem, both tails are grammatical endings.
+    Also what the watcher's diff uses to drop re-inflected neighbours of a
+    real fix."""
+    return _by_hyphen_part(old, new, _is_inflected_by_ending)
+
+
+def _is_inflection(source: str, replacement: str) -> bool:
+    """Rule 4. One word: the loose prefix test, which also catches
+    ordinary-word typos («сторониной → стороной»). Several words: every
+    changed word is another grammatical form by its ending («финансовая
+    управляющая → финансового управляющего»); the right case belongs to one
+    sentence, so it is never a rule for the next one. A spelling fix in a
+    phrase stays learnable («Бюллеттени Нилова → Бюллетени Нилова»)."""
+    left, right = source.split(), replacement.split()
+    if not left or len(left) != len(right):
+        return False
+    if len(left) == 1:
+        return left != right and _by_hyphen_part(left[0], right[0], _is_loosely_inflected)
+    changed = [(a, b) for a, b in zip(left, right) if a != b]
+    return bool(changed) and all(is_same_word_inflected(a, b) for a, b in changed)
 
 
 # -- the rules -------------------------------------------------------------
