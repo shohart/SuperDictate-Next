@@ -5,6 +5,7 @@
 // exactly as VocabularyStore tracks them).
 
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
@@ -12,6 +13,11 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     private var window: NSWindow?
     private var tableView: NSTableView?
     private var records: [VocabularyRecord] = []
+    // ASR Hotwords tab (docs/specs/user-hotword-vocabulary-spec.md §7):
+    // a separate list, independent from the corrections table above.
+    private var hotwordTableView: NSTableView?
+    private var hotwordPhraseField: NSTextField?
+    private var hotwords: [HotwordPhraseRecord] = []
     private var changeObserver: NSObjectProtocol?
 
     init(store: VocabularyStore) {
@@ -26,7 +32,7 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 470),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -34,7 +40,7 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         window.title = "Словарь / Text Corrections"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = buildContentView()
+        window.contentView = buildTabbedContentView()
         window.center()
         self.window = window
         // Learning in the agent, the account sync and other windows change
@@ -55,6 +61,113 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         changeObserver = nil
         window = nil
         tableView = nil
+        hotwordTableView = nil
+        hotwordPhraseField = nil
+    }
+
+    /// Corrections editor and ASR hotwords as two tabs; the corrections
+    /// view is embedded unchanged.
+    private func buildTabbedContentView() -> NSView {
+        let corrections = NSView()
+        let correctionsContent = buildContentView()
+        corrections.addSubview(correctionsContent)
+        NSLayoutConstraint.activate([
+            correctionsContent.topAnchor.constraint(equalTo: corrections.topAnchor),
+            correctionsContent.leadingAnchor.constraint(equalTo: corrections.leadingAnchor),
+            correctionsContent.trailingAnchor.constraint(equalTo: corrections.trailingAnchor),
+            correctionsContent.bottomAnchor.constraint(equalTo: corrections.bottomAnchor),
+        ])
+
+        let tabView = NSTabView()
+        let correctionsItem = NSTabViewItem(identifier: "corrections")
+        correctionsItem.label = t("Исправления", "Corrections")
+        correctionsItem.view = corrections
+        let hotwordsItem = NSTabViewItem(identifier: "hotwords")
+        hotwordsItem.label = t("ASR-термины", "ASR Hotwords")
+        hotwordsItem.view = buildHotwordsView()
+        tabView.addTabViewItem(correctionsItem)
+        tabView.addTabViewItem(hotwordsItem)
+        return tabView
+    }
+
+    private func buildHotwordsView() -> NSView {
+        let container = NSView()
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 8
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        let explanation = NSTextField(wrappingLabelWithString: t(
+            "Фразы, которые распознавание должно понимать лучше (имена, термины). Они лишь подсказывают распознаванию и сами ничего не заменяют в тексте.",
+            "Phrases recognition should understand better (names, terms). They only guide recognition and never replace text on their own."
+        ))
+        explanation.setAccessibilityLabel(t("Пояснение к ASR-терминам", "ASR hotwords explanation"))
+
+        let formatNote = NSTextField(wrappingLabelWithString: t(
+            "Импорт: текстовый файл UTF-8, одна фраза на строку. Пустые строки и строки, начинающиеся с «#», пропускаются; дубликаты игнорируются. Одна фраза — не более четырёх слов.",
+            "Import: a UTF-8 text file, one phrase per line. Blank lines and lines starting with # are skipped; duplicates are ignored. A phrase is at most four words."
+        ))
+        formatNote.font = .systemFont(ofSize: 11)
+        formatNote.textColor = .secondaryLabelColor
+        formatNote.setAccessibilityLabel(t("Формат файла импорта ASR-терминов", "ASR hotword import file format"))
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        let table = NSTableView()
+        table.dataSource = self
+        table.delegate = self
+        table.usesAlternatingRowBackgroundColors = true
+        table.setAccessibilityLabel(t("Список ASR-терминов", "ASR hotwords list"))
+        let enabledColumn = NSTableColumn(identifier: .init("hotwordEnabled"))
+        enabledColumn.title = t("Включено", "Enabled")
+        enabledColumn.width = 80
+        let phraseColumn = NSTableColumn(identifier: .init("hotwordPhrase"))
+        phraseColumn.title = t("Фраза", "Phrase")
+        phraseColumn.width = 440
+        table.addTableColumn(enabledColumn)
+        table.addTableColumn(phraseColumn)
+        scrollView.documentView = table
+        hotwordTableView = table
+
+        let field = NSTextField()
+        field.placeholderString = t("Новая фраза…", "New phrase…")
+        field.target = self
+        field.action = #selector(addHotwordTapped)
+        field.setAccessibilityLabel(t("Новая ASR-фраза", "New ASR hotword phrase"))
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+        hotwordPhraseField = field
+        let addButton = makeButton(title: t("Добавить", "Add"), action: #selector(addHotwordTapped))
+        addButton.setAccessibilityLabel(t("Добавить ASR-фразу", "Add ASR hotword"))
+        let deleteButton = makeButton(title: t("Удалить", "Delete"), action: #selector(deleteHotwordTapped))
+        deleteButton.setAccessibilityLabel(t("Удалить выбранную ASR-фразу", "Delete selected ASR hotword"))
+        let importButton = makeButton(title: t("Импорт…", "Import…"), action: #selector(importHotwordsTapped))
+        importButton.setAccessibilityLabel(t("Импортировать ASR-фразы из файла", "Import ASR hotwords from a file"))
+        let buttonRow = NSStackView(views: [field, addButton, deleteButton, importButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 8
+
+        root.addArrangedSubview(explanation)
+        root.addArrangedSubview(formatNote)
+        root.addArrangedSubview(scrollView)
+        root.addArrangedSubview(buttonRow)
+        NSLayoutConstraint.activate([
+            explanation.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            formatNote.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            scrollView.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
+        ])
+        return container
     }
 
     private func buildContentView() -> NSView {
@@ -140,13 +253,18 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
     private func reload() {
         records = store.all()
         tableView?.reloadData()
+        hotwords = store.hotwordPhrases()
+        hotwordTableView?.reloadData()
     }
 
     // MARK: - NSTableViewDataSource / NSTableViewDelegate
 
-    func numberOfRows(in tableView: NSTableView) -> Int { records.count }
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tableView === hotwordTableView ? hotwords.count : records.count
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === hotwordTableView { return hotwordCell(column: tableColumn, row: row) }
         guard records.indices.contains(row), let identifier = tableColumn?.identifier else { return nil }
         let record = records[row]
         if identifier.rawValue == "asrHint" {
@@ -194,6 +312,100 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
                            "Could not save the ASR hint: \(error.localizedDescription)"))
         }
         reload()
+    }
+
+    // MARK: - ASR hotwords
+
+    private func hotwordCell(column: NSTableColumn?, row: Int) -> NSView? {
+        guard hotwords.indices.contains(row), let identifier = column?.identifier else { return nil }
+        let hotword = hotwords[row]
+        if identifier.rawValue == "hotwordEnabled" {
+            let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(hotwordToggled(_:)))
+            checkbox.state = hotword.enabled ? .on : .off
+            checkbox.setAccessibilityLabel(t("Включить «\(hotword.phrase)»", "Enable “\(hotword.phrase)”"))
+            return checkbox
+        }
+        return NSTextField(labelWithString: hotword.phrase)
+    }
+
+    @objc private func hotwordToggled(_ sender: NSButton) {
+        guard let hotwordTableView else { return }
+        let row = hotwordTableView.row(for: sender)
+        guard hotwords.indices.contains(row) else { return }
+        do {
+            try store.setHotwordPhraseEnabled(id: hotwords[row].id, enabled: sender.state == .on)
+        } catch {
+            presentError(t("Не удалось сохранить ASR-фразу: \(error.localizedDescription)",
+                           "Could not save the ASR hotword: \(error.localizedDescription)"))
+        }
+        reload()
+    }
+
+    @objc private func addHotwordTapped() {
+        guard let hotwordPhraseField else { return }
+        let phrase = hotwordPhraseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !phrase.isEmpty else { return }
+        do {
+            try store.addHotwordPhrase(phrase)
+            hotwordPhraseField.stringValue = ""
+        } catch {
+            presentError(t("Не удалось добавить ASR-фразу: \(error.localizedDescription)",
+                           "Could not add the ASR hotword: \(error.localizedDescription)"))
+        }
+        reload()
+    }
+
+    @objc private func deleteHotwordTapped() {
+        guard let hotwordTableView, hotwords.indices.contains(hotwordTableView.selectedRow) else { return }
+        do {
+            try store.deleteHotwordPhrase(id: hotwords[hotwordTableView.selectedRow].id)
+        } catch {
+            presentError(t("Не удалось удалить ASR-фразу: \(error.localizedDescription)",
+                           "Could not delete the ASR hotword: \(error.localizedDescription)"))
+        }
+        reload()
+    }
+
+    @objc private func importHotwordsTapped() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .utf8PlainText, .commaSeparatedText]
+        panel.allowsMultipleSelection = false
+        panel.message = t("Выберите текстовый файл со списком фраз — по одной на строку.",
+                          "Choose a text file with one phrase per line.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            presentError(t("Не удалось прочитать файл. Используйте кодировку UTF-8.",
+                           "Could not read the file. Use UTF-8 encoding."))
+            return
+        }
+        var added = 0
+        var failed = 0
+        var firstFailure = ""
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            do {
+                _ = try store.addHotwordPhrase(line)
+                added += 1
+            } catch VocabularyStoreError.duplicatePhrase {
+                // Expected on import: an existing or repeated phrase is skipped.
+            } catch {
+                failed += 1
+                if firstFailure.isEmpty { firstFailure = error.localizedDescription }
+            }
+        }
+        reload()
+        if failed > 0 {
+            presentError(t("Импортировано фраз: \(added), пропущено с ошибкой: \(failed) (первая ошибка: \(firstFailure)).",
+                           "Imported phrases: \(added), skipped with error: \(failed) (first error: \(firstFailure))."))
+        } else {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = t("Импорт завершён", "Import complete")
+            alert.informativeText = t("Добавлено фраз: \(added). Дубликаты, пустые строки и комментарии пропущены.",
+                                      "Added phrases: \(added). Duplicates, blank lines and comments were skipped.")
+            alert.runModal()
+        }
     }
 
     // MARK: - Actions

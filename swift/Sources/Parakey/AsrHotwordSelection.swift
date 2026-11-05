@@ -97,6 +97,10 @@ enum AsrHotwordSelection {
     /// The hotword list for `records`, in their order: exact duplicates
     /// merged, at most `maxPhrases`.
     static func phrases(from records: [VocabularyRecord]) -> [String] {
+        Array(uncappedPhrases(from: records).prefix(maxPhrases))
+    }
+
+    private static func uncappedPhrases(from records: [VocabularyRecord]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
         for record in records {
@@ -104,8 +108,46 @@ enum AsrHotwordSelection {
                   record.asrHint ?? automaticDecision(phrase: phrase, origin: record.origin),
                   seen.insert(phrase).inserted else { continue }
             result.append(phrase)
-            if result.count == maxPhrases { break }
         }
+        return result
+    }
+
+    // MARK: - User hotword vocabulary (docs/specs/user-hotword-vocabulary-spec.md §4–§5)
+
+    /// Dedup key of a user phrase: trimmed, whitespace collapsed,
+    /// case-insensitive. Punctuation is significant here (unlike
+    /// `comparisonKey`).
+    static func customPhraseKey(_ phrase: String) -> String {
+        phrase.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").lowercased()
+    }
+
+    /// The phrase to store/send for user input, or nil when it is
+    /// unusable: empty, punctuation-only (no letter or digit) or more than
+    /// `maxWords` words. Casing and inner spacing are kept as entered.
+    /// (The decoder token limit is checked at the ASR boundary.)
+    static func normalizedCustomPhrase(_ input: String) -> String? {
+        let phrase = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard phrase.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+        guard phrase.split(whereSeparator: { $0.isWhitespace }).count <= maxWords else { return nil }
+        return phrase
+    }
+
+    /// The single funnel for the ASR list: enabled custom phrases first (in
+    /// record order), then correction-derived phrases, deduplicated by
+    /// `customPhraseKey` (first spelling wins), at most `maxPhrases` — so
+    /// the cap evicts learned data before user phrases.
+    static func combinedPhrases(corrections: [VocabularyRecord],
+                                custom: [HotwordPhraseRecord]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        func append(_ phrase: String) {
+            guard result.count < maxPhrases, seen.insert(customPhraseKey(phrase)).inserted else { return }
+            result.append(phrase)
+        }
+        for record in custom where record.enabled {
+            if let phrase = normalizedCustomPhrase(record.phrase) { append(phrase) }
+        }
+        for phrase in uncappedPhrases(from: corrections) { append(phrase) }
         return result
     }
 
