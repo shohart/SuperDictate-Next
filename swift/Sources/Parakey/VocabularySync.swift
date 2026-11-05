@@ -310,8 +310,12 @@ actor VocabularySyncEngine {
     private var store: VocabularyStore { settings.vocabularyStore }
     private var client: VocabularySyncClient { VocabularySyncClient(baseURL: settings.vocabularySyncServerURL) }
 
+    /// Read on the main thread, so it must never touch the Keychain: after an
+    /// update macOS may hold a Keychain read behind a dialog, and the app would
+    /// freeze until somebody answers it. The token is read inside a pass.
     nonisolated var isSignedIn: Bool {
-        settings.vocabularySyncEnabled && tokenStore.token(for: settings.vocabularySyncEmail) != nil
+        settings.vocabularySyncEnabled && !settings.vocabularySyncEmail.isEmpty
+            && settings.vocabularySyncLastError != VocabularySyncFailure.unauthorized.rawValue
     }
 
     // MARK: Serialization
@@ -403,8 +407,12 @@ actor VocabularySyncEngine {
         settings.refreshFromDisk()
 
         let email = settings.vocabularySyncEmail
-        guard settings.vocabularySyncEnabled, !email.isEmpty,
-              let token = tokenStore.token(for: email) else {
+        guard settings.vocabularySyncEnabled, !email.isEmpty else {
+            throw VocabularySyncFailure.notSignedIn
+        }
+        guard let token = tokenStore.token(for: email) else {
+            // Gone from the Keychain, or the user refused access: ask to sign in.
+            settings.vocabularySyncLastError = VocabularySyncFailure.unauthorized.rawValue
             throw VocabularySyncFailure.notSignedIn
         }
         do {

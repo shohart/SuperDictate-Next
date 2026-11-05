@@ -4445,6 +4445,39 @@ enum ParakeySelfTest {
     }
 
     private static func testHotwordSync() throws {
+        // The sign-in state is read on the main thread: it must not reach the
+        // Keychain, which can block behind a dialog after an update.
+        do {
+            final class SpyTokens: VocabularySyncTokenStore, @unchecked Sendable {
+                private let lock = NSLock()
+                private var value = 0
+                var reads: Int { lock.withLock { value } }
+                func token(for account: String) -> String? { lock.withLock { value += 1 }; return nil }
+                func setToken(_ token: String, for account: String) throws {}
+                func removeToken(for account: String) {}
+            }
+            let suite = "com.local.superdictate.selftest.signed-in-\(UUID().uuidString)"
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("signed-in-\(UUID().uuidString).sqlite")
+            defer {
+                UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+                for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+            }
+            let settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: try VocabularyStore(fileURL: url))
+            let spy = SpyTokens()
+            let engine = VocabularySyncEngine(settings: settings, tokenStore: spy, lockFileURL: nil)
+            settings.vocabularySyncEmail = "user@example.com"
+            settings.vocabularySyncEnabled = true
+            try expect(engine.isSignedIn, equals: true, "enabled with an account means signed in")
+            try expect(spy.reads, equals: 0, "isSignedIn does not read the Keychain")
+            do {
+                _ = try runParakeetEngineSynchronously { try await engine.runPass() }
+                throw SelfTestFailure.failed("a pass without a token must fail")
+            } catch VocabularySyncFailure.notSignedIn {
+            }
+            try expect(spy.reads, equals: 1, "a pass reads the token")
+            try expect(engine.isSignedIn, equals: false, "a missing token asks to sign in again")
+        }
+
         final class ChangeCounter: @unchecked Sendable {
             private let lock = NSLock()
             private var value = 0

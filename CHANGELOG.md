@@ -6,6 +6,13 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.6 — 2026-11-06
+
+macOS only (`mac-v0.9.6`).
+
+### Fixed
+- **The app no longer freezes behind a Keychain dialog.** With vocabulary sync on, macOS can ask for permission to read the sync token after an update. Until that dialog was answered, the app stayed in «Запуск» and dictation did not work. Now dictation starts at once and only the sync waits for your answer.
+
 ## 0.9.5 — 2026-11-06
 
 macOS (`mac-v0.9.5`) and Windows (`win-v0.9.5`).
