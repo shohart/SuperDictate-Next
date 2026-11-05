@@ -89,6 +89,10 @@ enum ParakeySelfTest {
             // Needs a local server-side instance (server/vocab-sync) at
             // SD_VOCAB_SYNC_TEST_URL; not part of `all`.
             return runSuite("vocabulary-sync", testVocabularySync)
+        case "hotword-sync-cross":
+            // Against a real server and account from the environment, for a
+            // check with the Windows client; not part of `all`.
+            return runSuite("hotword-sync-cross", testHotwordSyncCross)
         case "vocabulary-learning":
             return runSuite("vocabulary-learning", testLearnCandidateDetector)
         case "insertion-anchor":
@@ -4400,6 +4404,30 @@ enum ParakeySelfTest {
 
     /// Custom ASR hotword sync, store level (user-hotword-vocabulary spec §8):
     /// tombstones, the change filter and applyRemoteHotwords. No server needed.
+    /// SD_CROSS_URL, SD_CROSS_EMAIL, SD_CROSS_PASSWORD; adds SD_CROSS_ADD if
+    /// set, runs a pass from an empty store and prints every term it holds.
+    private static func testHotwordSyncCross() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let raw = env["SD_CROSS_URL"], let email = env["SD_CROSS_EMAIL"], let password = env["SD_CROSS_PASSWORD"] else {
+            print("SKIP hotword-sync-cross: SD_CROSS_URL, SD_CROSS_EMAIL and SD_CROSS_PASSWORD are not set")
+            return
+        }
+        let suite = "com.local.superdictate.selftest.hotword-cross-\(UUID().uuidString)"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hotword-cross-\(UUID().uuidString).sqlite")
+        defer {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+        }
+        let store = try VocabularyStore(fileURL: url)
+        let settings = Settings(defaults: UserDefaults(suiteName: suite)!, vocabularyStore: store)
+        settings.setVocabularySyncServerURLOverride(raw)
+        let engine = VocabularySyncEngine(settings: settings, tokenStore: InMemoryVocabularySyncTokenStore(), lockFileURL: nil)
+        _ = try runParakeetEngineSynchronously { try await engine.signIn(email: email, password: password) }
+        if let phrase = env["SD_CROSS_ADD"] { _ = try store.addHotwordPhrase(phrase) }
+        _ = try runParakeetEngineSynchronously { try await engine.runPass() }
+        for record in store.hotwordPhrases() { print("TERM \(record.phrase) enabled=\(record.enabled)") }
+    }
+
     private static func testHotwordSync() throws {
         final class ChangeCounter: @unchecked Sendable {
             private let lock = NSLock()

@@ -1,6 +1,6 @@
 # User hotword vocabulary - specification
 
-**Status:** Wave 0 done; Waves 1–3 implemented and verified (2026-11-05; §9.1, §9.2, §9.3)
+**Status:** Waves 0–4 implemented and verified (§9.1–§9.4); the sync server is deployed (2026-11-06)
 **Working branch:** `feat/user-hotword-vocabulary`  
 **Base:** `origin/feat/asr-hotwords` at `4b69556` (v0.9.3)  
 **Scope:** SuperDictate Next first. The later ASR-server transfer is explicitly out of scope for this branch.
@@ -208,6 +208,10 @@ Verification (2026-11-05): server tests passed on Linux from a throwaway venv (`
 - equivalent SQLite table/store/migration;
 - equivalent `combined_phrases` selector;
 - settings UI and sync parity tests.
+
+#### 9.4 Wave 4 status (2026-11-06)
+
+Implemented in `windows/superdictate/`: `asr_hotwords.py` (`custom_phrase_key`, `normalized_custom_phrase`, `phrases_from_text`, `combined_phrases`), `vocabulary.py` (the same two tables, CRUD, `import_hotword_phrases`, `hotword_changes_since`, `apply_remote_hotwords`), `vocabulary_sync.py` (the `hotwords` collection, the same cursor rule for a server without it), `ui/settings_window.py` (an «ASR-термины» section in the corrections tab; changes are saved at once). Unlike macOS, Windows stamps go through `_after`, so an add and a toggle in one second still order correctly.
 
 ### Wave 5 - ASR-server migration
 

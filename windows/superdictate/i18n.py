@@ -492,6 +492,31 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "settings_asr_hotwords_strength": ("Сила подсказки", "Hint strength"),
     "settings_asr_hotwords_normal": ("Обычно", "Normal"),
     "settings_asr_hotwords_strong": ("Сильнее", "Stronger"),
+    "custom_hotwords": ("ASR-термины", "ASR Hotwords"),
+    "custom_hotwords_hint": (
+        "Фразы, которые распознавание должно понимать лучше (имена, термины). Они лишь "
+        "подсказывают распознаванию и сами ничего не заменяют в тексте. Изменения в этом "
+        "списке сохраняются сразу. Импорт: текстовый файл UTF-8, одна фраза на строку. "
+        "Пустые строки и строки, начинающиеся с «#», пропускаются; дубликаты игнорируются. "
+        "Одна фраза — не более четырёх слов.",
+        "Phrases recognition should understand better (names, terms). They only guide "
+        "recognition and never replace text on their own. Changes to this list are saved "
+        "at once. Import: a UTF-8 text file, one phrase per line. Blank lines and lines "
+        "starting with # are skipped; duplicates are ignored. A phrase is at most four words."),
+    "custom_hotwords_new": ("Новая фраза…", "New phrase…"),
+    "custom_hotwords_import": ("Импорт…", "Import…"),
+    "custom_hotwords_import_filter": ("Текстовые файлы (*.txt *.csv);;Все файлы (*)",
+                                      "Text files (*.txt *.csv);;All files (*)"),
+    "custom_hotwords_invalid": ("В фразе должна быть буква или цифра, и не более четырёх слов.",
+                                "A phrase needs a letter or digit and at most four words."),
+    "custom_hotwords_duplicate": ("Эта фраза уже есть в списке.", "This phrase is already in the list."),
+    "custom_hotwords_read_failed": ("Не удалось прочитать файл. Используйте кодировку UTF-8.",
+                                    "Could not read the file. Use UTF-8 encoding."),
+    "custom_hotwords_imported": (
+        "Добавлено фраз: {added}, пропущено с ошибкой: {invalid}. Дубликаты, пустые строки и "
+        "комментарии пропущены.",
+        "Added phrases: {added}, skipped with error: {invalid}. Duplicates, blank lines and "
+        "comments were skipped."),
 
     # -- vocabulary cleanup (hygiene spec §3) --------------------------
     "corrections_cleanup": ("Почистить словарь…", "Clean up…"),

@@ -598,7 +598,7 @@ class SettingsWindow(QDialog):
         self._asr_hotwords_strength.setEnabled(self._asr_hotwords.isChecked())
         self._asr_hotwords.toggled.connect(self._asr_hotwords_strength.setEnabled)
 
-        sections = [section, hotwords]
+        sections = [section, hotwords, self._custom_hotwords_section()]
         sync = self._sync_section()
         if sync is not None:
             sections.append(sync)
@@ -606,6 +606,103 @@ class SettingsWindow(QDialog):
         if changed is not None:
             changed.connect(self._on_vocabulary_changed)
         return _page(*sections)
+
+    # -- the user's recognition terms (user-hotword-vocabulary spec §7) ---
+
+    def _custom_hotwords_section(self) -> Section:
+        section = Section(i18n.tr("custom_hotwords"), i18n.tr("custom_hotwords_hint"))
+        self._custom_hotwords_list = QListWidget()
+        self._custom_hotwords_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._custom_hotwords_list.setMinimumHeight(180)
+        self._custom_hotwords_list.setAccessibleName(i18n.tr("custom_hotwords"))
+        self._custom_hotwords_list.itemChanged.connect(self._custom_hotword_toggled)
+        self._load_custom_hotwords()
+        section.add_row(None, self._custom_hotwords_list)
+
+        editor = QWidget()
+        editor.setObjectName("Plain")
+        row = QHBoxLayout(editor)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self._custom_hotword_field = QLineEdit()
+        self._custom_hotword_field.setPlaceholderText(i18n.tr("custom_hotwords_new"))
+        self._custom_hotword_field.returnPressed.connect(self._add_custom_hotword)
+        add = QPushButton(i18n.tr("corrections_add"))
+        add.setIcon(icons.icon("plus", self._palette.text_muted, 15))
+        add.setAutoDefault(False)
+        add.clicked.connect(self._add_custom_hotword)
+        remove = QPushButton(i18n.tr("corrections_remove"))
+        remove.setIcon(icons.icon("trash", self._palette.text_muted, 15))
+        remove.setAutoDefault(False)
+        remove.clicked.connect(self._remove_custom_hotword)
+        import_file = QPushButton(i18n.tr("custom_hotwords_import"))
+        import_file.setAutoDefault(False)
+        import_file.clicked.connect(self._import_custom_hotwords)
+        row.addWidget(self._custom_hotword_field, 1)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addWidget(import_file)
+        section.add_row(None, editor)
+        return section
+
+    def _load_custom_hotwords(self) -> None:
+        listing = self._custom_hotwords_list
+        selected = listing.currentItem().data(Qt.ItemDataRole.UserRole) if listing.currentItem() else None
+        listing.blockSignals(True)
+        listing.clear()
+        for record in self._corrections.hotword_phrases():
+            item = QListWidgetItem(record.phrase)
+            item.setData(Qt.ItemDataRole.UserRole, record.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if record.enabled else Qt.CheckState.Unchecked)
+            listing.addItem(item)
+            if record.id == selected:
+                listing.setCurrentItem(item)
+        listing.blockSignals(False)
+
+    def _add_custom_hotword(self) -> None:
+        from ..vocabulary import DuplicateHotwordPhrase, InvalidHotwordPhrase
+
+        try:
+            self._corrections.add_hotword_phrase(self._custom_hotword_field.text())
+        except InvalidHotwordPhrase:
+            self._warn(i18n.tr("custom_hotwords_invalid"))
+            return
+        except DuplicateHotwordPhrase:
+            self._warn(i18n.tr("custom_hotwords_duplicate"))
+            return
+        self._custom_hotword_field.clear()
+        self._load_custom_hotwords()
+
+    def _remove_custom_hotword(self) -> None:
+        item = self._custom_hotwords_list.currentItem()
+        if item is not None:
+            self._corrections.delete_hotword_phrase(item.data(Qt.ItemDataRole.UserRole))
+            self._load_custom_hotwords()
+
+    def _custom_hotword_toggled(self, item) -> None:
+        self._corrections.set_hotword_phrase_enabled(
+            item.data(Qt.ItemDataRole.UserRole), item.checkState() == Qt.CheckState.Checked)
+
+    def _import_custom_hotwords(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, i18n.tr("custom_hotwords_import"), "", i18n.tr("custom_hotwords_import_filter"))
+        if path:
+            self._import_custom_hotwords_file(path)
+
+    def _import_custom_hotwords_file(self, path: str) -> None:
+        try:
+            with open(path, encoding="utf-8-sig") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError):
+            self._warn(i18n.tr("custom_hotwords_read_failed"))
+            return
+        added, invalid = self._corrections.import_hotword_phrases(text)
+        self._load_custom_hotwords()
+        self._warn(i18n.tr("custom_hotwords_imported", added=added, invalid=invalid))
 
     # -- the vocabulary list -------------------------------------------
 
@@ -631,6 +728,7 @@ class SettingsWindow(QDialog):
         """A learn or a sync changed the store: show it, unless the user is
         in the middle of editing the list (their save diffs against the
         baseline, so nothing of the sync's is lost either way)."""
+        self._load_custom_hotwords()
         if not self._corrections_dirty():
             self._load_corrections()
 

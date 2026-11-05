@@ -183,6 +183,15 @@ def _change_from_record(record) -> dict:
     }
 
 
+def _hotword_changes(records, tombstones) -> list[dict]:
+    """The ``hotwords`` collection of a push (user-hotword-vocabulary spec §8)."""
+    changes = [{"phrase": r.phrase, "enabled": r.enabled, "deleted": False, "updated_at": r.updated_at}
+               for r in records if _sendable(r.phrase)]
+    changes += [{"phrase": t.phrase, "enabled": True, "deleted": True, "updated_at": t.deleted_at}
+                for t in tombstones if _sendable(t.phrase)]
+    return changes
+
+
 def _change_from_tombstone(tombstone) -> dict:
     return {
         "source": tombstone.source,
@@ -390,20 +399,39 @@ class VocabularySync:
                          record.source[:40])
         changes += [_change_from_tombstone(t) for t in tombstones if _sendable(t.source)]
 
-        batches = [changes[i:i + BATCH_SIZE] for i in range(0, len(changes), BATCH_SIZE)] or [[]]
+        hotwords = _hotword_changes(*self._store.hotword_changes_since(stamp))
+
         applied = 0
-        for batch in batches:
+        hotwords_dropped = False
+        start = 0
+        while True:
+            batch = changes[start:start + BATCH_SIZE]
+            hotword_batch = hotwords[start:start + BATCH_SIZE]
             response = self._request("POST", "/v1/vocabulary", {
-                "since": since, "changes": batch, "client": self._client}, token=token)
+                "since": since, "changes": batch, "hotwords": hotword_batch,
+                "client": self._client}, token=token)
             entries = response.get("entries")
             applied += self._store.apply_remote(entries if isinstance(entries, list) else [])
+            remote_hotwords = response.get("hotwords")
+            if isinstance(remote_hotwords, list):
+                applied += self._store.apply_remote_hotwords(remote_hotwords)
+            elif hotword_batch:
+                # A server that predates hotwords dropped them: keep the
+                # cursor so they go out again once it is upgraded.
+                hotwords_dropped = True
             try:
                 since = max(since, int(response.get("revision", since)))
             except (TypeError, ValueError):
                 raise SyncError(ERROR_SERVER, "bad revision in the response")
             self._settings.update_runtime({"vocabulary_sync_last_server_revision": since})
-        self._settings.update_runtime({"vocabulary_sync_last_pushed_local_stamp": started})
-        return applied, len(changes)
+            start += BATCH_SIZE
+            if start >= len(changes) and start >= len(hotwords):
+                break
+        if hotwords_dropped:
+            log.info("Vocabulary sync: the server does not store hotwords yet; will push them again")
+        else:
+            self._settings.update_runtime({"vocabulary_sync_last_pushed_local_stamp": started})
+        return applied, len(changes) + len(hotwords)
 
     # -- triggers ------------------------------------------------------------
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -758,6 +759,34 @@ def test_vocabulary_sync_server() -> None:
         _check("sync: and makes it a hotword there",
                "Ничипуренко" in b_store.asr_hotword_phrases(), True)
 
+        # The user's own terms travel through the real server.
+        term = a_store.add_hotword_phrase("Дунималова Анаида Георгиевна")
+        a.sync_now()
+        b.sync_now()
+        _check("sync: A's term reaches B",
+               [r.phrase for r in b_store.hotword_phrases()], ["Дунималова Анаида Георгиевна"])
+        _check("sync: a synced term reaches the ASR list",
+               "Дунималова Анаида Георгиевна" in b_store.asr_hotword_phrases(), True)
+        _check("sync: a synced term creates no replacement rule",
+               any("Дунималова" in r.replacement for r in b_store.all()), False)
+        a_store.set_hotword_phrase_enabled(term.id, False)
+        a.sync_now()
+        b.sync_now()
+        _check("sync: disabling a term travels", b_store.hotword_phrases()[0].enabled, False)
+        _check("sync: a disabled term leaves the ASR list",
+               "Дунималова Анаида Георгиевна" in b_store.asr_hotword_phrases(), False)
+        b_store.delete_hotword_phrase(b_store.hotword_phrases()[0].id)
+        b.sync_now()
+        a.sync_now()
+        _check("sync: deleting a term travels", a_store.hotword_phrases(), [])
+        _check("sync: and leaves a tombstone",
+               [t.key for t in a_store.hotword_tombstones()], ["дунималова анаида георгиевна"])
+        readded = a_store.add_hotword_phrase("Дунималова Анаида Георгиевна")
+        a.sync_now()
+        b.sync_now()
+        _check("sync: a re-added term comes back", [r.phrase for r in b_store.hotword_phrases()],
+               [readded.phrase])
+
         # A pass with nothing new changes nothing.
         _check("sync: an idle pass applies nothing", (a.sync_now(), b.sync_now()), (0, 0))
 
@@ -782,6 +811,108 @@ def test_vocabulary_sync_server() -> None:
             server.wait(timeout=10)
         except subprocess.TimeoutExpired:
             server.kill()
+
+
+def test_custom_hotwords_store() -> None:
+    """user-hotword-vocabulary spec: the same answers as the macOS suites
+    ``asr-hotwords`` and ``hotword-sync``."""
+    from . import asr_hotwords
+    from .vocabulary import DuplicateHotwordPhrase, InvalidHotwordPhrase, Origin, VocabularyStore
+
+    work = Path(tempfile.mkdtemp(prefix="sd-hotwords-selftest-"))
+    path = work / "corrections.sqlite"
+    # A database from before this table: the store creates it on open.
+    old = sqlite3.connect(path)
+    old.executescript("CREATE TABLE corrections (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                      "source TEXT NOT NULL COLLATE NOCASE, replacement TEXT NOT NULL, "
+                      "origin TEXT NOT NULL DEFAULT 'manual', created_at TEXT NOT NULL, "
+                      "updated_at TEXT NOT NULL);")
+    old.commit()
+    old.close()
+    store = VocabularyStore(str(path))
+    events = []
+    store.add_listener(events.append)
+    try:
+        _check("terms: an old database opens empty", store.hotword_phrases(), [])
+        _check("terms: nothing to send means the unbiased path", store.asr_hotword_phrases(), [])
+
+        record = store.add_hotword_phrase("  Дунималова Анаида Георгиевна ")
+        _check("terms: edges trimmed", record.phrase, "Дунималова Анаида Георгиевна")
+        _check("terms: an add is a local change", events, ["local"])
+        _check("terms: the phrase reaches the ASR list unchanged",
+               store.asr_hotword_phrases(), ["Дунималова Анаида Георгиевна"])
+        _check("terms: no replacement rule", store.count(), 0)
+        for bad in ("", "  ", "...", "один два три четыре пять"):
+            try:
+                store.add_hotword_phrase(bad)
+                _check(f"terms: {bad!r} refused", False, True)
+            except InvalidHotwordPhrase:
+                pass
+        try:
+            store.add_hotword_phrase("дунималова   анаида ГЕОРГИЕВНА")
+            _check("terms: a case and spacing variant is a duplicate", False, True)
+        except DuplicateHotwordPhrase:
+            pass
+
+        store.set_hotword_phrase_enabled(record.id, False)
+        _check("terms: a disabled phrase is kept", len(store.hotword_phrases()), 1)
+        _check("terms: and leaves the ASR list", store.asr_hotword_phrases(), [])
+        _check("terms: a toggle moves the stamp",
+               store.hotword_phrases()[0].updated_at > record.updated_at, True)
+        store.set_hotword_phrase_enabled(record.id, True)
+
+        renamed = store.update_hotword_phrase(record.id, "Дунималова Анаида", True)
+        _check("terms: a rename tombstones the old key",
+               [t.key for t in store.hotword_tombstones()], ["дунималова анаида георгиевна"])
+        _check("terms: a rename keeps the row", renamed.id, record.id)
+
+        # Priority and dedup against corrections; custom spelling wins.
+        store.upsert("сервак", "Дунималова анаида", Origin.MANUAL)
+        store.upsert("гитхаб", "GitHub", Origin.MANUAL)
+        _check("terms: the user's spelling wins, then corrections",
+               store.asr_hotword_phrases(), ["Дунималова Анаида", "GitHub"])
+        many = [type("R", (), {"phrase": f"термин {i}", "enabled": True})() for i in range(1200)]
+        capped = asr_hotwords.combined_phrases(store.all(), many)
+        _check("terms: at most 1000 phrases", len(capped), asr_hotwords.MAX_PHRASES)
+        _check("terms: the cap evicts learned data first", capped[-1], "термин 999")
+
+        # Import.
+        events.clear()
+        added, invalid = store.import_hotword_phrases(
+            "\ufeff# комментарий\r\nАрбитражный суд\r\n\r\nарбитражный СУД\r\n"
+            "один два три четыре пять\r\nДунималова Анаида\r\nЕФРСБ\r\n")
+        _check("terms: import counts", (added, invalid), (2, 1))
+        _check("terms: import notifies once", events, ["local"])
+        _check("terms: imported in file order",
+               [r.phrase for r in store.hotword_phrases()][-2:], ["Арбитражный суд", "ЕФРСБ"])
+
+        # Delete, then remote changes.
+        events.clear()
+        efrsb = store.hotword_phrases()[-1]
+        store.delete_hotword_phrase(efrsb.id)
+        _check("terms: a delete leaves a tombstone",
+               "ефрсб" in {t.key for t in store.hotword_tombstones()}, True)
+        stale = {"phrase": "ЕФРСБ", "enabled": True, "deleted": False, "updated_at": "2020-01-01T00:00:00Z"}
+        _check("terms: a tombstone blocks an older live entry", store.apply_remote_hotwords([stale]), 0)
+        fresh = dict(stale, updated_at="2099-01-01T00:00:00Z", enabled=False)
+        events.clear()
+        _check("terms: a newer entry beats the tombstone", store.apply_remote_hotwords([fresh]), 1)
+        _check("terms: a remote change is not a local one", events, ["sync"])
+        row = next(r for r in store.hotword_phrases() if r.phrase == "ЕФРСБ")
+        _check("terms: the remote stamp and state are kept",
+               (row.updated_at, row.enabled), ("2099-01-01T00:00:00Z", False))
+        _check("terms: a tie keeps the local copy", store.apply_remote_hotwords([fresh]), 0)
+        gone = dict(fresh, deleted=True, updated_at="2099-02-01T00:00:00Z")
+        _check("terms: a newer delete removes it", store.apply_remote_hotwords([gone]), 1)
+        _check("terms: and is gone",
+               "ЕФРСБ" in [r.phrase for r in store.hotword_phrases()], False)
+        _check("terms: a malformed remote entry is skipped",
+               store.apply_remote_hotwords([{"phrase": "...", "updated_at": "2099-03-01T00:00:00Z"}, "x"]), 0)
+
+        changes, tombstones = store.hotword_changes_since("2099-01-15T00:00:00Z")
+        _check("terms: changes since a stamp", (changes, [t.key for t in tombstones]), ([], ["ефрсб"]))
+    finally:
+        store.close()
 
 
 def _sync_error(call) -> str:
@@ -824,6 +955,7 @@ def test_sync_settings_and_token() -> None:
 
 
 TESTS = [
+    test_custom_hotwords_store,
     test_asr_hotword_selection,
     test_asr_hint_store,
     test_asr_hotwords_settings_and_ipc,

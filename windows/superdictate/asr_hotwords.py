@@ -134,10 +134,7 @@ def is_effective(source: str, replacement: str, origin: str,
     return hint if hint is not None else automatic_decision(phrase, origin)
 
 
-def phrases(records: Iterable) -> list[str]:
-    """The hotword list for ``records`` (anything with ``source``,
-    ``replacement``, ``origin`` and ``asr_hint``), in their order: exact
-    duplicates merged, at most :data:`MAX_PHRASES`."""
+def _uncapped_phrases(records: Iterable) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for record in records:
@@ -149,6 +146,62 @@ def phrases(records: Iterable) -> list[str]:
             continue
         seen.add(phrase)
         result.append(phrase)
-        if len(result) == MAX_PHRASES:
-            break
+    return result
+
+
+def phrases(records: Iterable) -> list[str]:
+    """The hotword list for ``records`` (anything with ``source``,
+    ``replacement``, ``origin`` and ``asr_hint``), in their order: exact
+    duplicates merged, at most :data:`MAX_PHRASES`."""
+    return _uncapped_phrases(records)[:MAX_PHRASES]
+
+
+# -- the user's own terms (docs/specs/user-hotword-vocabulary-spec.md §4-§5) --
+
+def custom_phrase_key(phrase: str) -> str:
+    """Dedup and sync key of a user phrase: whitespace collapsed,
+    case-insensitive. Punctuation is significant here, unlike
+    :func:`comparison_key`."""
+    return " ".join(phrase.split()).lower()
+
+
+def normalized_custom_phrase(text: str) -> Optional[str]:
+    """The phrase to store and send for user input, or ``None`` when it is
+    unusable: no letter or digit, or more than :data:`MAX_WORDS` words.
+    Casing and inner spacing stay as entered."""
+    phrase = text.strip()
+    if not any(ch.isalnum() for ch in phrase):
+        return None
+    if len(phrase.split()) > MAX_WORDS:
+        return None
+    return phrase
+
+
+def phrases_from_text(text: str) -> list[str]:
+    """The lines of an import file: blank lines and ``#`` comments skipped."""
+    lines = (line.strip() for line in text.lstrip("\ufeff").splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def combined_phrases(corrections: Iterable, custom: Iterable) -> list[str]:
+    """The single funnel for the ASR list: enabled user phrases first (in
+    record order), then the correction-derived ones, deduplicated by
+    :func:`custom_phrase_key` (first spelling wins), at most
+    :data:`MAX_PHRASES`, so the cap evicts learned data before user phrases."""
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def append(phrase: str) -> None:
+        key = custom_phrase_key(phrase)
+        if len(result) < MAX_PHRASES and key not in seen:
+            seen.add(key)
+            result.append(phrase)
+
+    for record in custom:
+        if record.enabled:
+            phrase = normalized_custom_phrase(record.phrase)
+            if phrase is not None:
+                append(phrase)
+    for phrase in _uncapped_phrases(corrections):
+        append(phrase)
     return result

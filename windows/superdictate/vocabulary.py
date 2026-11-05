@@ -19,6 +19,10 @@ become ASR hotwords, docs/specs/asr-hotwords-spec.md §6) and the
 ``deleted_corrections`` tombstones the account sync needs to carry a
 deletion to the other machines (docs/specs/vocabulary-hygiene-and-sync-spec.md
 §4.1). Every delete writes one; adding the key again removes it.
+
+The user's own recognition terms live in ``hotword_phrases``, with
+``deleted_hotwords`` tombstones (docs/specs/user-hotword-vocabulary-spec.md
+§4). They guide the speech model and never replace text.
 """
 
 from __future__ import annotations
@@ -102,6 +106,36 @@ class LearnOutcome:
     undone_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class HotwordPhrase:
+    """A term the user wants recognized (table ``hotword_phrases``)."""
+
+    id: int
+    phrase: str
+    enabled: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class HotwordTombstone:
+    key: str
+    phrase: str
+    deleted_at: str
+
+
+class HotwordError(ValueError):
+    """A phrase the hotword list cannot take."""
+
+
+class InvalidHotwordPhrase(HotwordError):
+    pass
+
+
+class DuplicateHotwordPhrase(HotwordError):
+    pass
+
+
 # `source` declares COLLATE NOCASE and there is a unique index to match, but
 # that index only catches ASCII-case duplicates — SQLite's built-in NOCASE
 # collation does not fold non-ASCII scripts, Cyrillic included. It is kept
@@ -124,9 +158,24 @@ CREATE TABLE IF NOT EXISTS deleted_corrections (
     source TEXT NOT NULL,
     deleted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hotword_phrases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    phrase     TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS hotword_phrases_phrase_unique
+    ON hotword_phrases(phrase);
+CREATE TABLE IF NOT EXISTS deleted_hotwords (
+    key        TEXT PRIMARY KEY,
+    phrase     TEXT NOT NULL,
+    deleted_at TEXT NOT NULL
+);
 """
 
 _COLUMNS = "id, source, replacement, origin, created_at, updated_at, asr_hint"
+_HOTWORD_COLUMNS = "id, phrase, enabled, created_at, updated_at"
 
 
 def _normalized(text: str) -> str:
@@ -275,8 +324,174 @@ class VocabularyStore:
         return [Tombstone(str(r["key"]), str(r["source"]), str(r["deleted_at"])) for r in rows]
 
     def asr_hotword_phrases(self) -> list[str]:
-        """The hotword list for the speech model (spec §6)."""
-        return asr_hotwords.phrases(self.all())
+        """The hotword list for the speech model: the user's enabled terms,
+        then the correction-derived ones, read in one snapshot."""
+        with self._lock:
+            return asr_hotwords.combined_phrases(self.all(), self.hotword_phrases())
+
+    # -- the user's recognition terms --------------------------------
+
+    def hotword_phrases(self) -> list[HotwordPhrase]:
+        with self._lock:
+            rows = self._db.execute(f"SELECT {_HOTWORD_COLUMNS} FROM hotword_phrases ORDER BY id;").fetchall()
+        return [_hotword(row) for row in rows]
+
+    def hotword_tombstones(self) -> list[HotwordTombstone]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key, phrase, deleted_at FROM deleted_hotwords ORDER BY deleted_at;").fetchall()
+        return [HotwordTombstone(str(r["key"]), str(r["phrase"]), str(r["deleted_at"])) for r in rows]
+
+    def _hotword_tombstone_stamp(self, key: str) -> str:
+        row = self._db.execute("SELECT deleted_at FROM deleted_hotwords WHERE key = ?;", (key,)).fetchone()
+        return str(row[0]) if row else ""
+
+    def _write_hotword_tombstone(self, phrase: str, when: str) -> None:
+        """An older stamp never overwrites a newer one."""
+        self._db.execute(
+            "INSERT INTO deleted_hotwords (key, phrase, deleted_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET phrase = excluded.phrase, deleted_at = excluded.deleted_at "
+            "WHERE excluded.deleted_at > deleted_hotwords.deleted_at;",
+            (asr_hotwords.custom_phrase_key(phrase), phrase, when))
+
+    def _insert_hotword(self, phrase: str, key: str) -> HotwordPhrase:
+        # Newer than a tombstone of this key, so the re-add wins everywhere.
+        when = _after(self._hotword_tombstone_stamp(key))
+        cursor = self._db.execute(
+            "INSERT INTO hotword_phrases (phrase, enabled, created_at, updated_at) VALUES (?, 1, ?, ?);",
+            (phrase, when, when))
+        self._db.execute("DELETE FROM deleted_hotwords WHERE key = ?;", (key,))
+        return HotwordPhrase(int(cursor.lastrowid), phrase, True, when, when)
+
+    def add_hotword_phrase(self, text: str) -> HotwordPhrase:
+        """Raises :class:`InvalidHotwordPhrase` or :class:`DuplicateHotwordPhrase`."""
+        phrase = asr_hotwords.normalized_custom_phrase(text)
+        if phrase is None:
+            raise InvalidHotwordPhrase(text)
+        key = asr_hotwords.custom_phrase_key(phrase)
+        with self._transaction():
+            if any(asr_hotwords.custom_phrase_key(r.phrase) == key for r in self.hotword_phrases()):
+                raise DuplicateHotwordPhrase(phrase)
+            record = self._insert_hotword(phrase, key)
+        self._notify()
+        return record
+
+    def import_hotword_phrases(self, text: str) -> tuple[int, int]:
+        """An import file in one transaction and one notification. Returns
+        ``(added, invalid)``; duplicates are skipped silently."""
+        added = invalid = 0
+        with self._transaction():
+            keys = {asr_hotwords.custom_phrase_key(r.phrase) for r in self.hotword_phrases()}
+            for line in asr_hotwords.phrases_from_text(text):
+                phrase = asr_hotwords.normalized_custom_phrase(line)
+                if phrase is None:
+                    invalid += 1
+                    continue
+                key = asr_hotwords.custom_phrase_key(phrase)
+                if key not in keys:
+                    keys.add(key)
+                    self._insert_hotword(phrase, key)
+                    added += 1
+        if added:
+            self._notify()
+        return added, invalid
+
+    def update_hotword_phrase(self, record_id: int, text: str, enabled: bool) -> HotwordPhrase:
+        """A rename tombstones the old key so other machines drop it."""
+        phrase = asr_hotwords.normalized_custom_phrase(text)
+        if phrase is None:
+            raise InvalidHotwordPhrase(text)
+        key = asr_hotwords.custom_phrase_key(phrase)
+        with self._transaction():
+            rows = self.hotword_phrases()
+            previous = next((r for r in rows if r.id == record_id), None)
+            if previous is None:
+                raise KeyError(record_id)
+            if any(r.id != record_id and asr_hotwords.custom_phrase_key(r.phrase) == key for r in rows):
+                raise DuplicateHotwordPhrase(phrase)
+            when = _after(max(previous.updated_at, self._hotword_tombstone_stamp(key)))
+            self._db.execute("UPDATE hotword_phrases SET phrase = ?, enabled = ?, updated_at = ? WHERE id = ?;",
+                             (phrase, int(enabled), when, record_id))
+            if asr_hotwords.custom_phrase_key(previous.phrase) != key:
+                self._write_hotword_tombstone(previous.phrase, when)
+                self._db.execute("DELETE FROM deleted_hotwords WHERE key = ?;", (key,))
+            record = HotwordPhrase(record_id, phrase, enabled, previous.created_at, when)
+        self._notify()
+        return record
+
+    def set_hotword_phrase_enabled(self, record_id: int, enabled: bool) -> bool:
+        with self._transaction():
+            previous = next((r for r in self.hotword_phrases() if r.id == record_id), None)
+            if previous is None:
+                return False
+            self._db.execute("UPDATE hotword_phrases SET enabled = ?, updated_at = ? WHERE id = ?;",
+                             (int(enabled), _after(previous.updated_at), record_id))
+        self._notify()
+        return True
+
+    def delete_hotword_phrase(self, record_id: int) -> bool:
+        with self._transaction():
+            previous = next((r for r in self.hotword_phrases() if r.id == record_id), None)
+            if previous is None:
+                return False
+            self._db.execute("DELETE FROM hotword_phrases WHERE id = ?;", (record_id,))
+            self._write_hotword_tombstone(previous.phrase, _after(previous.updated_at))
+        self._notify()
+        return True
+
+    def hotword_changes_since(self, stamp: str) -> tuple[list[HotwordPhrase], list[HotwordTombstone]]:
+        """At or after ``stamp``, for the same reason as :meth:`local_changes_since`."""
+        return ([r for r in self.hotword_phrases() if r.updated_at >= stamp],
+                [t for t in self.hotword_tombstones() if t.deleted_at >= stamp])
+
+    def apply_remote_hotwords(self, entries: Iterable[dict]) -> int:
+        """Merge the server's terms: last writer wins on ``updated_at`` (a tie
+        keeps the local copy), tombstones respected, the remote stamp kept.
+        Returns how many rows changed."""
+        changed = 0
+        with self._transaction():
+            rows = {asr_hotwords.custom_phrase_key(r.phrase): r for r in self.hotword_phrases()}
+            tombs = {t.key: t.deleted_at for t in self.hotword_tombstones()}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                phrase = asr_hotwords.normalized_custom_phrase(str(entry.get("phrase") or ""))
+                stamp = str(entry.get("updated_at") or "")
+                if phrase is None or not stamp:
+                    continue
+                key = asr_hotwords.custom_phrase_key(phrase)
+                local = rows.get(key)
+                if entry.get("deleted"):
+                    if local is not None:
+                        if stamp <= local.updated_at:
+                            continue
+                        self._db.execute("DELETE FROM hotword_phrases WHERE id = ?;", (local.id,))
+                        del rows[key]
+                        changed += 1
+                    self._write_hotword_tombstone(phrase, stamp)
+                    tombs[key] = max(tombs.get(key, ""), stamp)
+                    continue
+                enabled = bool(entry.get("enabled", True))
+                if local is not None:
+                    if stamp <= local.updated_at:
+                        continue
+                    self._db.execute(
+                        "UPDATE hotword_phrases SET phrase = ?, enabled = ?, updated_at = ? WHERE id = ?;",
+                        (phrase, int(enabled), stamp, local.id))
+                    rows[key] = HotwordPhrase(local.id, phrase, enabled, local.created_at, stamp)
+                else:
+                    if tombs.get(key, "") >= stamp:
+                        continue
+                    cursor = self._db.execute(
+                        "INSERT INTO hotword_phrases (phrase, enabled, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?);", (phrase, int(enabled), stamp, stamp))
+                    rows[key] = HotwordPhrase(int(cursor.lastrowid), phrase, enabled, stamp, stamp)
+                self._db.execute("DELETE FROM deleted_hotwords WHERE key = ?;", (key,))
+                tombs.pop(key, None)
+                changed += 1
+        if changed:
+            self._notify(CHANGE_SYNC)
+        return changed
 
     # -- low-level writes (caller holds the lock and commits) ----------
 
@@ -659,6 +874,11 @@ def _pairs(records: Iterable) -> list[tuple[str, str]]:
             if source is not None and replacement is not None:
                 pairs.append((str(source), str(replacement)))
     return pairs
+
+
+def _hotword(row: sqlite3.Row) -> HotwordPhrase:
+    return HotwordPhrase(int(row["id"]), str(row["phrase"]), bool(row["enabled"]),
+                         str(row["created_at"]), str(row["updated_at"]))
 
 
 def _record(row: sqlite3.Row) -> Record:

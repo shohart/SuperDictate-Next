@@ -6,6 +6,14 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.5 — 2026-11-06
+
+macOS (`mac-v0.9.5`) and Windows (`win-v0.9.5`).
+
+### Added
+- **Windows: your own list of terms for speech recognition, as on macOS.** Settings → the corrections tab → «ASR-термины». Add names, courts and terms one at a time or from a text file (UTF-8, one phrase per line, `#` starts a comment), turn them off without deleting, delete them. A phrase can be up to four words. These phrases only guide recognition and never replace text. Changes to this list are saved at once.
+- **The terms now sync between your computers, on macOS and Windows.** Additions, turning off and deletions travel with the vocabulary account. The sync server has been upgraded.
+
 ## 0.9.4 — 2026-11-05
 
 macOS (`mac-v0.9.4`) and Windows (`win-v0.9.4`).
