@@ -28,8 +28,24 @@ struct HotwordPhraseRecord: Equatable, Identifiable, Sendable {
     let id: Int64
     let phrase: String
     let enabled: Bool
-    let createdAt: TimeInterval
-    let updatedAt: TimeInterval
+    /// ISO-8601 UTC (`VocabularyStore.timestamp()`), like corrections.
+    let createdAt: String
+    let updatedAt: String
+}
+
+/// Local deletion marker for a custom hotword (table `deleted_hotwords`).
+struct HotwordTombstone: Equatable, Sendable {
+    let key: String
+    let phrase: String
+    let deletedAt: String
+}
+
+/// A custom hotword as the account sync server states it.
+struct HotwordRemoteEntry: Equatable, Sendable {
+    let phrase: String
+    let enabled: Bool
+    let deleted: Bool
+    let updatedAt: String
 }
 
 enum VocabularyStoreError: Error, LocalizedError {
@@ -207,11 +223,16 @@ final class VocabularyStore: @unchecked Sendable {
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 phrase     TEXT NOT NULL,
                 enabled    INTEGER NOT NULL DEFAULT 1,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS hotword_phrases_phrase_unique
                 ON hotword_phrases(phrase);
+            CREATE TABLE IF NOT EXISTS deleted_hotwords (
+                key        TEXT PRIMARY KEY,
+                phrase     TEXT NOT NULL,
+                deleted_at TEXT NOT NULL
+            );
             """)
             hasHotwordTable = true
         } catch {
@@ -909,8 +930,8 @@ final class VocabularyStore: @unchecked Sendable {
         return HotwordPhraseRecord(id: sqlite3_column_int64(statement, 0),
                                    phrase: String(cString: phrase),
                                    enabled: sqlite3_column_int64(statement, 2) != 0,
-                                   createdAt: sqlite3_column_double(statement, 3),
-                                   updatedAt: sqlite3_column_double(statement, 4))
+                                   createdAt: sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? "",
+                                   updatedAt: sqlite3_column_text(statement, 4).map { String(cString: $0) } ?? "")
     }
 
     private func requireHotwordDatabase() throws -> OpaquePointer {
@@ -941,7 +962,7 @@ final class VocabularyStore: @unchecked Sendable {
         let record: HotwordPhraseRecord = try queue.sync {
             let db = try requireHotwordDatabase()
             let clean = try validatedHotwordPhrase(phrase, excludingId: nil, db: db)
-            let now = Date().timeIntervalSince1970
+            let now = Self.timestamp()
             var statement: OpaquePointer?
             let sql = "INSERT INTO hotword_phrases (phrase, enabled, created_at, updated_at) VALUES (?, 1, ?, ?) RETURNING \(Self.hotwordColumns);"
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -949,11 +970,13 @@ final class VocabularyStore: @unchecked Sendable {
             }
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, clean)
-            sqlite3_bind_double(statement, 2, now)
-            sqlite3_bind_double(statement, 3, now)
+            bindText(statement, 2, now)
+            bindText(statement, 3, now)
             guard sqlite3_step(statement) == SQLITE_ROW, let row = hotwordRecord(from: statement) else {
                 throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
             }
+            // Re-adding a phrase clears its tombstone (as for corrections).
+            removeHotwordTombstoneLocked(db: db, key: AsrHotwordSelection.customPhraseKey(row.phrase))
             return row
         }
         notifyLocalChange()
@@ -964,7 +987,7 @@ final class VocabularyStore: @unchecked Sendable {
     func updateHotwordPhrase(id: Int64, phrase: String, enabled: Bool) throws -> HotwordPhraseRecord {
         let record: HotwordPhraseRecord = try queue.sync {
             let db = try requireHotwordDatabase()
-            guard hotwordRow(db: db, id: id) != nil else {
+            guard let previous = hotwordRow(db: db, id: id) else {
                 throw VocabularyStoreError.sqlError("hotword phrase \(id) not found")
             }
             let clean = try validatedHotwordPhrase(phrase, excludingId: id, db: db)
@@ -976,10 +999,18 @@ final class VocabularyStore: @unchecked Sendable {
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, clean)
             sqlite3_bind_int64(statement, 2, enabled ? 1 : 0)
-            sqlite3_bind_double(statement, 3, Date().timeIntervalSince1970)
+            bindText(statement, 3, Self.timestamp())
             sqlite3_bind_int64(statement, 4, id)
             guard sqlite3_step(statement) == SQLITE_ROW, let row = hotwordRecord(from: statement) else {
                 throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            // A rename changes the sync key: tombstone the old one so other
+            // devices drop it, and clear any tombstone of the new one.
+            let oldKey = AsrHotwordSelection.customPhraseKey(previous.phrase)
+            let newKey = AsrHotwordSelection.customPhraseKey(row.phrase)
+            if oldKey != newKey {
+                writeHotwordTombstoneLocked(db: db, phrase: previous.phrase, deletedAt: row.updatedAt)
+                removeHotwordTombstoneLocked(db: db, key: newKey)
             }
             return row
         }
@@ -999,7 +1030,7 @@ final class VocabularyStore: @unchecked Sendable {
             }
             defer { sqlite3_finalize(statement) }
             sqlite3_bind_int64(statement, 1, enabled ? 1 : 0)
-            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+            bindText(statement, 2, Self.timestamp())
             sqlite3_bind_int64(statement, 3, id)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
@@ -1015,19 +1046,194 @@ final class VocabularyStore: @unchecked Sendable {
     func deleteHotwordPhrase(id: Int64) throws -> Bool {
         let deleted: Bool = try queue.sync {
             let db = try requireHotwordDatabase()
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "DELETE FROM hotword_phrases WHERE id = ?;", -1, &statement, nil) == SQLITE_OK else {
-                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            guard let existing = hotwordRow(db: db, id: id) else { return false }
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                throw VocabularyStoreError.sqlError("could not start a transaction (store busy)")
             }
-            defer { sqlite3_finalize(statement) }
-            sqlite3_bind_int64(statement, 1, id)
-            guard sqlite3_step(statement) == SQLITE_DONE else {
-                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            do {
+                var statement: OpaquePointer?
+                guard sqlite3_prepare_v2(db, "DELETE FROM hotword_phrases WHERE id = ?;", -1, &statement, nil) == SQLITE_OK else {
+                    throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+                }
+                defer { sqlite3_finalize(statement) }
+                sqlite3_bind_int64(statement, 1, id)
+                guard sqlite3_step(statement) == SQLITE_DONE else {
+                    throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+                }
+                let removed = sqlite3_changes(db) > 0
+                if removed {
+                    guard writeHotwordTombstoneLocked(db: db, phrase: existing.phrase, deletedAt: Self.timestamp()) else {
+                        throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+                    }
+                }
+                try execute("COMMIT;")
+                return removed
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
             }
-            return sqlite3_changes(db) > 0
         }
         if deleted { notifyLocalChange() }
         return deleted
+    }
+
+    // MARK: Hotword tombstones and sync (user-hotword-vocabulary spec §8)
+
+    /// Records (or advances) the tombstone for `phrase`'s key. An older stamp
+    /// never overwrites a newer one.
+    @discardableResult
+    private func writeHotwordTombstoneLocked(db: OpaquePointer, phrase: String, deletedAt: String) -> Bool {
+        let sql = """
+        INSERT INTO deleted_hotwords (key, phrase, deleted_at) VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET phrase = excluded.phrase, deleted_at = excluded.deleted_at
+        WHERE excluded.deleted_at > deleted_hotwords.deleted_at;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, AsrHotwordSelection.customPhraseKey(phrase))
+        bindText(statement, 2, phrase)
+        bindText(statement, 3, deletedAt)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func removeHotwordTombstoneLocked(db: OpaquePointer, key: String) {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM deleted_hotwords WHERE key = ?;", -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, key)
+        _ = sqlite3_step(statement)
+    }
+
+    func hotwordTombstones() -> [HotwordTombstone] {
+        queue.sync {
+            guard let db, hasHotwordTable else { return [] }
+            return hotwordTombstonesLocked(db: db)
+        }
+    }
+
+    private func hotwordTombstonesLocked(db: OpaquePointer) -> [HotwordTombstone] {
+        let sql = "SELECT key, phrase, deleted_at FROM deleted_hotwords ORDER BY deleted_at;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var result: [HotwordTombstone] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let key = sqlite3_column_text(statement, 0),
+                  let phrase = sqlite3_column_text(statement, 1),
+                  let deletedAt = sqlite3_column_text(statement, 2) else { continue }
+            result.append(HotwordTombstone(key: String(cString: key), phrase: String(cString: phrase),
+                                           deletedAt: String(cString: deletedAt)))
+        }
+        return result
+    }
+
+    /// Local hotword rows changed at or after `stamp` and tombstones written
+    /// at or after it (an empty stamp selects everything); `>=` for the same
+    /// reason as `syncChanges(since:)`.
+    func hotwordSyncChanges(since stamp: String) -> (entries: [HotwordPhraseRecord], tombstones: [HotwordTombstone]) {
+        queue.sync {
+            guard let db, hasHotwordTable else { return ([], []) }
+            let entries = hotwordPhrasesLocked(db: db).filter { $0.updatedAt >= stamp }
+            let tombstones = hotwordTombstonesLocked(db: db).filter { $0.deletedAt >= stamp }
+            return (entries, tombstones)
+        }
+    }
+
+    /// Applies server hotwords by last-writer-wins on `updated_at` (a tie
+    /// keeps the local copy). Rows keep the remote `updated_at`, so an applied
+    /// entry does not look locally changed; `onLocalChange` is not called.
+    /// There is no local row cap: the 1000-phrase limit only shapes the ASR
+    /// list (`AsrHotwordSelection`). Returns how many rows changed.
+    @discardableResult
+    func applyRemoteHotwords(_ entries: [HotwordRemoteEntry]) throws -> Int {
+        guard !entries.isEmpty else { return 0 }
+        return try queue.sync {
+            guard let db else { throw VocabularyStoreError.sqlError("database closed") }
+            guard hasHotwordTable else { return 0 }
+            guard (try? execute("BEGIN IMMEDIATE;")) != nil else {
+                throw VocabularyStoreError.sqlError("could not start a transaction (store busy)")
+            }
+            do {
+                var rows: [String: HotwordPhraseRecord] = [:]
+                for row in hotwordPhrasesLocked(db: db) { rows[AsrHotwordSelection.customPhraseKey(row.phrase)] = row }
+                var tombstones: [String: HotwordTombstone] = [:]
+                for tombstone in hotwordTombstonesLocked(db: db) { tombstones[tombstone.key] = tombstone }
+                var changed = 0
+                for entry in entries {
+                    guard let phrase = AsrHotwordSelection.normalizedCustomPhrase(entry.phrase) else { continue }
+                    let key = AsrHotwordSelection.customPhraseKey(phrase)
+                    guard !key.isEmpty else { continue }
+                    if entry.deleted {
+                        if let local = rows[key] {
+                            guard entry.updatedAt > local.updatedAt else { continue }
+                            try deleteHotwordRowLocked(db: db, id: local.id)
+                            rows[key] = nil
+                            changed += 1
+                        }
+                        // An older stamp never overwrites a newer tombstone.
+                        writeHotwordTombstoneLocked(db: db, phrase: phrase, deletedAt: entry.updatedAt)
+                        if (tombstones[key]?.deletedAt ?? "") < entry.updatedAt {
+                            tombstones[key] = HotwordTombstone(key: key, phrase: phrase, deletedAt: entry.updatedAt)
+                        }
+                        continue
+                    }
+                    if let local = rows[key] {
+                        guard entry.updatedAt > local.updatedAt else { continue }
+                        rows[key] = try writeRemoteHotwordLocked(db: db, phrase: phrase, enabled: entry.enabled,
+                                                                 updatedAt: entry.updatedAt, existingId: local.id)
+                    } else {
+                        if let tombstone = tombstones[key], tombstone.deletedAt >= entry.updatedAt { continue }
+                        rows[key] = try writeRemoteHotwordLocked(db: db, phrase: phrase, enabled: entry.enabled,
+                                                                 updatedAt: entry.updatedAt, existingId: nil)
+                    }
+                    removeHotwordTombstoneLocked(db: db, key: key)
+                    tombstones[key] = nil
+                    changed += 1
+                }
+                try execute("COMMIT;")
+                return changed
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
+    private func deleteHotwordRowLocked(db: OpaquePointer, id: Int64) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM hotword_phrases WHERE id = ?;", -1, &statement, nil) == SQLITE_OK else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, id)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    private func writeRemoteHotwordLocked(db: OpaquePointer, phrase: String, enabled: Bool, updatedAt: String,
+                                          existingId: Int64?) throws -> HotwordPhraseRecord {
+        let sql = existingId != nil
+            ? "UPDATE hotword_phrases SET phrase = ?, enabled = ?, updated_at = ? WHERE id = ? RETURNING \(Self.hotwordColumns);"
+            : "INSERT INTO hotword_phrases (phrase, enabled, updated_at, created_at) VALUES (?, ?, ?, ?) RETURNING \(Self.hotwordColumns);"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, phrase)
+        sqlite3_bind_int64(statement, 2, enabled ? 1 : 0)
+        bindText(statement, 3, updatedAt)
+        if let existingId {
+            sqlite3_bind_int64(statement, 4, existingId)
+        } else {
+            bindText(statement, 4, updatedAt)
+        }
+        guard sqlite3_step(statement) == SQLITE_ROW, let row = hotwordRecord(from: statement) else {
+            throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+        }
+        return row
     }
 
     private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {

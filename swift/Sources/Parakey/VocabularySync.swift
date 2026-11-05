@@ -119,9 +119,40 @@ struct VocabularySyncWireEntry: Codable, Equatable, Sendable {
     }
 }
 
+/// A custom ASR hotword on the wire (`hotwords` collection of the same
+/// push/pull payload; user-hotword-vocabulary spec §8).
+struct VocabularySyncHotwordEntry: Codable, Equatable, Sendable {
+    let phrase: String
+    let enabled: Bool
+    let deleted: Bool
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case phrase, enabled, deleted
+        case updatedAt = "updated_at"
+    }
+}
+
 struct VocabularySyncResponse: Codable, Sendable {
     let revision: Int
     let entries: [VocabularySyncWireEntry]
+    /// Absent in answers from a server that predates custom hotwords.
+    let hotwords: [VocabularySyncHotwordEntry]
+
+    init(revision: Int, entries: [VocabularySyncWireEntry], hotwords: [VocabularySyncHotwordEntry] = []) {
+        self.revision = revision
+        self.entries = entries
+        self.hotwords = hotwords
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        revision = try container.decode(Int.self, forKey: .revision)
+        entries = try container.decode([VocabularySyncWireEntry].self, forKey: .entries)
+        hotwords = try container.decodeIfPresent([VocabularySyncHotwordEntry].self, forKey: .hotwords) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case revision, entries, hotwords }
 }
 
 struct VocabularySyncAuthResult: Codable, Sendable {
@@ -136,7 +167,12 @@ struct VocabularySyncClient: Sendable {
 
     private struct ClientInfo: Codable { let platform: String; let version: String }
     private struct AuthRequest: Codable { let email: String; let password: String; let client: ClientInfo }
-    private struct PushRequest: Codable { let since: Int; let changes: [VocabularySyncWireEntry]; let client: ClientInfo }
+    private struct PushRequest: Codable {
+        let since: Int
+        let changes: [VocabularySyncWireEntry]
+        let hotwords: [VocabularySyncHotwordEntry]
+        let client: ClientInfo
+    }
 
     private static var clientInfo: ClientInfo { ClientInfo(platform: "macos", version: currentBundleVersion()) }
 
@@ -217,8 +253,10 @@ struct VocabularySyncClient: Sendable {
         return try decodeSync(try await send(request))
     }
 
-    func push(token: String, since: Int, changes: [VocabularySyncWireEntry]) async throws -> VocabularySyncResponse {
-        let body = try JSONEncoder().encode(PushRequest(since: since, changes: changes, client: Self.clientInfo))
+    func push(token: String, since: Int, changes: [VocabularySyncWireEntry],
+              hotwords: [VocabularySyncHotwordEntry] = []) async throws -> VocabularySyncResponse {
+        let body = try JSONEncoder().encode(PushRequest(since: since, changes: changes, hotwords: hotwords,
+                                                        client: Self.clientInfo))
         return try decodeSync(try await send(jsonRequest("v1/vocabulary", method: "POST", token: token, body: body)))
     }
 
@@ -410,23 +448,48 @@ actor VocabularySyncEngine {
             newestPushed = max(newestPushed, tombstone.deletedAt)
         }
 
+        // Custom ASR hotwords share the cursor stamp, the server revision and
+        // the push/pull flow with the corrections above.
+        let localHotwords = store.hotwordSyncChanges(since: cursorStamp)
+        var hotwordChanges: [VocabularySyncHotwordEntry] = []
+        for record in localHotwords.entries {
+            guard let phrase = Self.wireField(record.phrase), !record.updatedAt.isEmpty else {
+                log("vocabulary sync: hotword id=\(record.id) not pushed (empty, too long or control characters)")
+                continue
+            }
+            hotwordChanges.append(VocabularySyncHotwordEntry(phrase: phrase, enabled: record.enabled,
+                                                             deleted: false, updatedAt: record.updatedAt))
+            newestPushed = max(newestPushed, record.updatedAt)
+        }
+        for tombstone in localHotwords.tombstones {
+            guard let phrase = Self.wireField(tombstone.phrase), !tombstone.deletedAt.isEmpty else { continue }
+            hotwordChanges.append(VocabularySyncHotwordEntry(phrase: phrase, enabled: true,
+                                                             deleted: true, updatedAt: tombstone.deletedAt))
+            newestPushed = max(newestPushed, tombstone.deletedAt)
+        }
+
         var summary = VocabularySyncPassSummary()
         var since = settings.vocabularySyncLastServerRevision
-        if changes.isEmpty {
+        if changes.isEmpty && hotwordChanges.isEmpty {
             let response = try await client.pull(token: token, since: since)
             summary.applied += try apply(response)
             since = response.revision
             settings.vocabularySyncLastServerRevision = since
         } else {
             var start = 0
-            while start < changes.count {
+            var hotwordStart = 0
+            while start < changes.count || hotwordStart < hotwordChanges.count {
                 let batch = Array(changes[start..<min(start + Self.maxChangesPerPush, changes.count)])
-                let response = try await client.push(token: token, since: since, changes: batch)
+                let hotwordBatch = Array(hotwordChanges[hotwordStart..<min(hotwordStart + Self.maxChangesPerPush,
+                                                                           hotwordChanges.count)])
+                let response = try await client.push(token: token, since: since, changes: batch,
+                                                     hotwords: hotwordBatch)
                 summary.applied += try apply(response)
-                summary.pushed += batch.count
+                summary.pushed += batch.count + hotwordBatch.count
                 since = response.revision
                 settings.vocabularySyncLastServerRevision = since
                 start += batch.count
+                hotwordStart += hotwordBatch.count
             }
             // Never ahead of this device's own clock: a remote stamp from a
             // device whose clock runs fast must not hide later local edits.
@@ -442,8 +505,12 @@ actor VocabularySyncEngine {
                                         origin: VocabularyOrigin(rawValue: entry.origin) ?? .manual,
                                         asrHint: entry.asrHint, deleted: entry.deleted, updatedAt: entry.updatedAt)
         }
+        let hotwords = response.hotwords.map { entry in
+            HotwordRemoteEntry(phrase: entry.phrase, enabled: entry.enabled, deleted: entry.deleted,
+                               updatedAt: entry.updatedAt)
+        }
         do {
-            return try store.applyRemote(entries)
+            return try store.applyRemote(entries) + store.applyRemoteHotwords(hotwords)
         } catch {
             log("vocabulary sync: applying server entries failed: \(error)")
             throw VocabularySyncFailure.busy

@@ -77,6 +77,8 @@ enum ParakeySelfTest {
             return runSuite("vocabulary-store", testVocabularyStore)
         case "asr-hotwords":
             return runSuite("asr-hotwords", testAsrHotwords)
+        case "hotword-sync":
+            return runSuite("hotword-sync", testHotwordSync)
         case "vocabulary-hygiene":
             return runSuite("vocabulary-hygiene", testVocabularyHygiene)
         case "vocabulary-cleanup-dry-run":
@@ -261,6 +263,7 @@ enum ParakeySelfTest {
         try testTranscriptCorrections()
         try testVocabularyStore()
         try testAsrHotwords()
+        try testHotwordSync()
         try testVocabularyHygiene()
         try testLearnCandidateDetector()
         try testFillerWordRemoval()
@@ -4329,6 +4332,97 @@ enum ParakeySelfTest {
         try expect(a.settings.vocabularySyncLastServerRevision, equals: 0, "sign-out resets the cursor")
     }
 
+    /// Custom ASR hotword sync, store level (user-hotword-vocabulary spec §8):
+    /// tombstones, the change filter and applyRemoteHotwords. No server needed.
+    private static func testHotwordSync() throws {
+        final class ChangeCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            func bump() { lock.withLock { value += 1 } }
+            var count: Int { lock.withLock { value } }
+        }
+        let store = VocabularyStore.inMemoryFallback()
+        let counter = ChangeCounter()
+        store.onLocalChange = { counter.bump() }
+
+        // Timestamps are ISO-8601 text.
+        let phrase = try store.addHotwordPhrase("Дунималова Анаида")
+        try expect(phrase.updatedAt.hasSuffix("Z") && phrase.updatedAt.contains("T"), equals: true,
+                   "hotword timestamps are ISO-8601 text")
+        try expect(store.hotwordTombstones().isEmpty, equals: true, "no tombstone before a delete")
+
+        // Local delete leaves a tombstone keyed by the canonical key; re-adding clears it.
+        try expect(try store.deleteHotwordPhrase(id: phrase.id), equals: true, "delete reports a change")
+        let tombstones = store.hotwordTombstones()
+        try expect(tombstones.map(\.key), equals: [AsrHotwordSelection.customPhraseKey("Дунималова Анаида")],
+                   "delete writes a tombstone with the canonical key")
+        try expect(tombstones.first?.phrase, equals: "Дунималова Анаида", "tombstone keeps the phrase")
+        try expect(try store.deleteHotwordPhrase(id: phrase.id), equals: false, "deleting a missing row adds no tombstone")
+        try expect(store.hotwordTombstones().count, equals: 1, "still one tombstone")
+        let readded = try store.addHotwordPhrase("дунималова   анаида")
+        try expect(store.hotwordTombstones().isEmpty, equals: true, "re-adding a phrase clears its tombstone")
+
+        // A rename tombstones the old key.
+        let renamed = try store.updateHotwordPhrase(id: readded.id, phrase: "Арбитражный суд", enabled: true)
+        try expect(store.hotwordTombstones().map(\.key), equals: [AsrHotwordSelection.customPhraseKey("дунималова анаида")],
+                   "a rename tombstones the old key")
+        try expect(renamed.phrase, equals: "Арбитражный суд", "renamed")
+
+        // hotwordSyncChanges: stamp filter (>=), empty stamp selects everything.
+        let all = store.hotwordSyncChanges(since: "")
+        try expect(all.entries.count, equals: 1, "all live rows with an empty stamp")
+        try expect(all.tombstones.count, equals: 1, "all tombstones with an empty stamp")
+        let future = store.hotwordSyncChanges(since: "2999-01-01T00:00:00Z")
+        try expect(future.entries.isEmpty && future.tombstones.isEmpty, equals: true, "nothing is newer than a future stamp")
+        let atStamp = store.hotwordSyncChanges(since: renamed.updatedAt)
+        try expect(atStamp.entries.map(\.phrase), equals: ["Арбитражный суд"], "a row at the cursor stamp is included")
+
+        // applyRemoteHotwords: last-writer-wins, tombstones, no onLocalChange.
+        let before = counter.count
+        let remote = VocabularyStore.inMemoryFallback()
+        remote.onLocalChange = { counter.bump() }
+        func entry(_ phrase: String, _ stamp: String, enabled: Bool = true, deleted: Bool = false) -> HotwordRemoteEntry {
+            HotwordRemoteEntry(phrase: phrase, enabled: enabled, deleted: deleted, updatedAt: stamp)
+        }
+        try expect(try remote.applyRemoteHotwords([entry("ЕСИА", "2026-11-05T10:00:00Z", enabled: false)]), equals: 1,
+                   "a new remote hotword is inserted")
+        var row = remote.hotwordPhrases().first
+        try expect(row?.phrase, equals: "ЕСИА", "remote phrase stored")
+        try expect(row?.enabled, equals: false, "remote enabled flag stored")
+        try expect(row?.updatedAt, equals: "2026-11-05T10:00:00Z", "remote updated_at is kept")
+        try expect(remote.hotwordSyncChanges(since: "2026-11-05T10:00:01Z").entries.isEmpty, equals: true,
+                   "an applied row does not look locally changed")
+        // Older / equal stamps lose; newer wins (case variant = same key).
+        try expect(try remote.applyRemoteHotwords([entry("есиа", "2026-11-05T09:00:00Z")]), equals: 0, "older remote loses")
+        try expect(try remote.applyRemoteHotwords([entry("есиа", "2026-11-05T10:00:00Z")]), equals: 0, "a tie keeps local")
+        try expect(try remote.applyRemoteHotwords([entry("есиа", "2026-11-05T11:00:00Z")]), equals: 1, "newer remote wins")
+        row = remote.hotwordPhrases().first
+        try expect(row?.enabled, equals: true, "newer remote re-enabled the phrase")
+        try expect(remote.hotwordPhrases().count, equals: 1, "still one row")
+        // Remote delete: older loses, newer deletes and leaves a tombstone.
+        try expect(try remote.applyRemoteHotwords([entry("ЕСИА", "2026-11-05T10:30:00Z", deleted: true)]), equals: 0,
+                   "an older remote delete loses")
+        try expect(try remote.applyRemoteHotwords([entry("ЕСИА", "2026-11-05T12:00:00Z", deleted: true)]), equals: 1,
+                   "a newer remote delete removes the row")
+        try expect(remote.hotwordPhrases().isEmpty, equals: true, "row deleted")
+        try expect(remote.hotwordTombstones().map(\.deletedAt), equals: ["2026-11-05T12:00:00Z"],
+                   "the remote stamp becomes the tombstone stamp")
+        // Tombstone blocks an older resurrection, yields to a newer one.
+        try expect(try remote.applyRemoteHotwords([entry("ЕСИА", "2026-11-05T11:30:00Z")]), equals: 0,
+                   "an older live entry cannot resurrect a deleted phrase")
+        try expect(remote.hotwordPhrases().isEmpty, equals: true, "still deleted")
+        try expect(try remote.applyRemoteHotwords([entry("ЕСИА", "2026-11-05T13:00:00Z")]), equals: 1,
+                   "a newer live entry resurrects")
+        try expect(remote.hotwordTombstones().isEmpty, equals: true, "resurrection clears the tombstone")
+        // A tombstone for an unknown phrase is remembered and invalid phrases are skipped.
+        try expect(try remote.applyRemoteHotwords([entry("Неизвестное", "2026-11-05T14:00:00Z", deleted: true),
+                                                   entry("?!…", "2026-11-05T14:00:00Z")]), equals: 0,
+                   "unknown tombstone and invalid phrase change no rows")
+        try expect(remote.hotwordTombstones().map(\.phrase), equals: ["Неизвестное"], "unknown tombstone recorded")
+        try expect(try remote.applyRemoteHotwords([]), equals: 0, "empty batch is a no-op")
+        try expect(counter.count, equals: before, "applyRemoteHotwords never fires onLocalChange")
+    }
+
     private static func testAsrHotwords() throws {
         // --- Selection rule (§6) -------------------------------------
         // (source, replacement, origin, hint, expected effective phrase or nil)
@@ -4549,7 +4643,7 @@ enum ParakeySelfTest {
 
         // Pure selector: dedup keeps the custom spelling, disabled skipped, custom wins the cap.
         func custom(_ id: Int64, _ phrase: String, _ enabled: Bool = true) -> HotwordPhraseRecord {
-            HotwordPhraseRecord(id: id, phrase: phrase, enabled: enabled, createdAt: 0, updatedAt: 0)
+            HotwordPhraseRecord(id: id, phrase: phrase, enabled: enabled, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z")
         }
         let learnedDocker = VocabularyRecord(id: 1, source: "докер", replacement: "docker", origin: .manual, createdAt: "", updatedAt: "")
         try expect(AsrHotwordSelection.combinedPhrases(corrections: [learnedDocker],

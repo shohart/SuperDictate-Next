@@ -1,6 +1,6 @@
 # User hotword vocabulary - specification
 
-**Status:** Wave 0 done; Wave 1 implemented and verified on the remote Mac (2026-11-05; see §9.1)  
+**Status:** Wave 0 done; Waves 1–3 implemented and verified (2026-11-05; §9.1, §9.2, §9.3)
 **Working branch:** `feat/user-hotword-vocabulary`  
 **Base:** `origin/feat/asr-hotwords` at `4b69556` (v0.9.3)  
 **Scope:** SuperDictate Next first. The later ASR-server transfer is explicitly out of scope for this branch.
@@ -47,12 +47,21 @@ CREATE TABLE IF NOT EXISTS hotword_phrases (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     phrase     TEXT NOT NULL,
     enabled    INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    created_at TEXT NOT NULL,   -- ISO-8601 UTC, VocabularyStore.timestamp()
+    updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS hotword_phrases_phrase_unique
     ON hotword_phrases(phrase);
+
+-- Local deletion markers for the account sync (mirrors deleted_corrections).
+CREATE TABLE IF NOT EXISTS deleted_hotwords (
+    key        TEXT PRIMARY KEY,   -- AsrHotwordSelection.customPhraseKey(phrase)
+    phrase     TEXT NOT NULL,
+    deleted_at TEXT NOT NULL       -- ISO-8601 UTC; an older stamp never overwrites a newer one
+);
 ```
+
+Timestamps are ISO-8601 text (not REAL) so they compare as strings in the last-writer-wins merge exactly like `corrections.updated_at`. Wave 1 created the table with REAL columns on development builds only; `CREATE TABLE IF NOT EXISTS` does not rewrite such a database (delete the hotword rows or the dev database; no released build had the REAL schema).
 
 ### 4.1 Phrase input rules
 
@@ -96,8 +105,8 @@ struct HotwordPhraseRecord: Equatable, Identifiable, Sendable {
     let id: Int64
     let phrase: String
     let enabled: Bool
-    let createdAt: TimeInterval
-    let updatedAt: TimeInterval
+    let createdAt: String   // ISO-8601 UTC
+    let updatedAt: String
 }
 
 func hotwordPhrases() -> [HotwordPhraseRecord]
@@ -135,7 +144,16 @@ The custom list must synchronize through the same account, trigger cadence, lock
 - every 15 minutes;
 - manual action.
 
-The sync protocol receives a second collection of row changes. Per-row `updated_at` provides last-write-wins conflict behavior; remote apply must preserve remote timestamps and must not fabricate a local user origin.
+The sync protocol receives a second collection of row changes inside the same payload (decided: a named second collection, no endpoint version bump):
+
+- Request `POST /v1/vocabulary`: `{since, changes: [...], hotwords: [{phrase, enabled, deleted, updated_at}], client}`.
+- Response (push and pull): `{revision, entries: [...], hotwords: [{phrase, enabled, deleted, updated_at, revision}]}`.
+- **Same revision counter.** Hotword changes consume numbers from the account's single `revision`; one cursor (`vocabularySyncLastServerRevision`) covers both collections. Server table `hotword_entries(account_id, key, phrase, enabled, deleted, updated_at, revision)`, key = `normalized_key(phrase)` (NFC, casefold, collapsed whitespace; the client key is `customPhraseKey`).
+- **Last writer wins** per key on the client-supplied `updated_at` (string compare); a tie keeps the existing copy (idempotent re-push). Remote apply preserves the remote `updated_at` and never calls `onLocalChange`.
+- **Tombstones.** A local delete writes `deleted_hotwords` and travels as `deleted: true`; a rename tombstones the old key; re-adding clears the tombstone. A tombstone blocks an older-or-equal live entry and yields to a newer one. The server keeps deleted rows as `deleted = 1`.
+- **Compatibility.** `hotwords` is optional in requests and defaults to `[]` in responses, so old clients (which ignore the field) and a new client against an old server (field absent, decoded as `[]`; an old server ignores the unknown request field) keep working. Hotwords are not appended to the server `events` log.
+- **Caps.** The server limits live hotword rows per account to `VOCAB_SYNC_MAX_HOTWORD_ENTRIES` (default 5000, `MAX_HOTWORD_ENTRIES`). This is a storage cap, independent of the 1000-phrase ASR exposure cap, which still applies only to the list built for the decoder. The client has no local sync row cap.
+- Pushes carry at most 1000 hotword changes per request, like corrections.
 
 Server and Windows changes are separate follow-up waves, but their payload/schema must be designed before the macOS store API is frozen.
 
@@ -152,7 +170,7 @@ Server and Windows changes are separate follow-up waves, but their payload/schem
 
 Implemented in `swift/Sources/Parakey/`: `VocabularyStore.swift` (`HotwordPhraseRecord`, `hotword_phrases` table created idempotently in `createSchema`, non-fatal on failure, CRUD API, `asrHotwordPhrases()` now combined; new `invalidPhrase`/`duplicatePhrase` errors), `AsrHotwordSelection.swift` (`customPhraseKey`, `normalizedCustomPhrase`, `combinedPhrases`, custom-first cap; correction-only `phrases(from:)` unchanged in behavior), `SelfTest.swift` (new block in `asr-hotwords`: migration, CRUD, dedup, disabled, cap, `.disabled`). `Settings.swift` needed no change: `asrHotwordsConfiguration` already calls `asrHotwordPhrases()`.
 
-Known gaps: the decoder token-limit check (§4.1) is left to the ASR boundary and not implemented here; hotword edits call `onLocalChange` but are not synced (Wave 3).
+Known gaps: the decoder token-limit check (§4.1) is left to the ASR boundary and not implemented here; hotword edits call `onLocalChange` but were not synced until Wave 3 (§9.3).
 
 Verification: passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) from an isolated scratch copy of this worktree: `cd swift && swift run Parakey --self-test asr-hotwords` -> `PASS asr-hotwords`; `cd swift && swift run Parakey --self-test vocabulary-store` -> `PASS vocabulary-store`. The build completed successfully; only pre-existing Swift 6 concurrency and existing duplicate-case warnings were emitted. Local `git diff --check` is also clean.
 
@@ -173,6 +191,17 @@ Verification (2026-11-05): passed on the remote Intel Mac Pro (macOS 26.7.1, Swi
 - extend `VocabularySync` and `server/vocab-sync` with custom-hotword changes;
 - server round-trip/conflict tests;
 - document request/response compatibility.
+
+#### 9.3 Wave 3 status (2026-11-05)
+
+Implemented, committed in this wave (§10 below):
+
+- `swift/Sources/Parakey/VocabularyStore.swift`: hotword timestamps are ISO-8601 TEXT (`HotwordPhraseRecord.createdAt/updatedAt: String`); `deleted_hotwords` table, `HotwordTombstone`, `HotwordRemoteEntry`; `deleteHotwordPhrase` writes the tombstone and deletes the row in one transaction inside `queue.sync`; rename tombstones the old key, add clears the tombstone; `hotwordTombstones()`, `hotwordSyncChanges(since:)`, `applyRemoteHotwords(_:)` (last-writer-wins, tombstones respected, remote `updated_at` kept, no `onLocalChange`; remote phrases failing the §4.1 rules are skipped).
+- `swift/Sources/Parakey/VocabularySync.swift`: `VocabularySyncHotwordEntry`; `VocabularySyncResponse.hotwords` (decoded as `[]` when absent); `push(..., hotwords:)`; `pass()` builds hotword changes (entries + tombstones) beside corrections, shares `since`, the cursor stamp and `newestPushed`; `apply()` applies both collections and sums the count. `pull()` is unchanged and still returns hotwords through the response.
+- `server/vocab-sync/app.py`: `hotword_entries` table + revision index, `HotwordEntry`/`RemoteHotwordEntry`, `PushRequest.hotwords`, `SyncResponse.hotwords`, `MAX_HOTWORD_ENTRIES`, push/pull handling with the shared revision.
+- Tests: `server/vocab-sync/test_app.py` (hotword push/update/disable/delete, pull, last-writer-wins, shared revision, no events, validation and cap, old client); `SelfTest.swift` suite `hotword-sync` (also in `all`).
+
+Verification (2026-11-05): server tests passed on Linux from a throwaway venv (`python -m pytest test_app.py` -> 13 passed). Swift verified on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) from an isolated scratch copy: `cd swift && swift build` -> success; `swift run Parakey --self-test hotword-sync` -> PASS; `... vocabulary-store` -> PASS; `... asr-hotwords` -> PASS. Known gap: the networked `vocabulary-sync` self-test has no hotword round-trip step yet (a local server integration test), so the end-to-end client-server hotword flow is covered by the store-level and server-level tests separately, not yet by one networked test.
 
 ### Wave 4 - Windows parity
 

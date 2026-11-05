@@ -14,7 +14,12 @@ apps use for dedup. Last writer wins on the client-supplied `updated_at`;
 deletions travel as tombstones. Every account has a monotonically growing
 revision; a client pulls everything above the revision it last saw.
 
-Every accepted change is also appended to `events`, an append-only log kept
+Custom ASR hotwords travel in a second collection (`hotwords`) of the same
+push/pull payload: table `hotword_entries`, same key rule, same last-writer-
+wins and tombstones, the same account revision. Old clients that send and
+read only `changes`/`entries` are unaffected.
+
+Every accepted correction change is also appended to `events`, an append-only log kept
 to improve the speech model later (the apps say so before the user signs
 in).
 
@@ -40,6 +45,10 @@ from pydantic import BaseModel, Field
 
 DB_PATH = os.environ.get("VOCAB_SYNC_DB", "/data/vocab-sync.sqlite")
 MAX_ENTRIES = int(os.environ.get("VOCAB_SYNC_MAX_ENTRIES", "5000"))
+# Custom ASR hotwords sync cap (live rows). Separate from the 1000-phrase
+# ASR exposure cap on the clients: storage never drops user data just because
+# it is not currently sent to ASR.
+MAX_HOTWORD_ENTRIES = int(os.environ.get("VOCAB_SYNC_MAX_HOTWORD_ENTRIES", "5000"))
 MAX_CHANGES_PER_PUSH = 1000
 MAX_FIELD = 200
 MIN_PASSWORD = 8
@@ -93,6 +102,17 @@ CREATE TABLE IF NOT EXISTS entries (
     PRIMARY KEY (account_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_entries_revision ON entries (account_id, revision);
+CREATE TABLE IF NOT EXISTS hotword_entries (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    phrase TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    PRIMARY KEY (account_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_hotword_entries_revision ON hotword_entries (account_id, revision);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL,
@@ -217,15 +237,28 @@ class RemoteEntry(Entry):
     revision: int
 
 
+class HotwordEntry(BaseModel):
+    phrase: str = Field(..., max_length=MAX_FIELD * 2)
+    enabled: bool = True
+    deleted: bool = False
+    updated_at: str = Field(..., max_length=40)
+
+
+class RemoteHotwordEntry(HotwordEntry):
+    revision: int
+
+
 class PushRequest(BaseModel):
     since: int = 0
     changes: List[Entry] = Field(default_factory=list, max_length=MAX_CHANGES_PER_PUSH)
+    hotwords: List[HotwordEntry] = Field(default_factory=list, max_length=MAX_CHANGES_PER_PUSH)
     client: ClientInfo = ClientInfo()
 
 
 class SyncResponse(BaseModel):
     revision: int
     entries: List[RemoteEntry]
+    hotwords: List[RemoteHotwordEntry] = Field(default_factory=list)
 
 
 # --- auth --------------------------------------------------------------------
@@ -311,7 +344,13 @@ def _changes_since(conn: sqlite3.Connection, account_id: int, since: int) -> Syn
                            asr_hint=None if r["asr_hint"] is None else bool(r["asr_hint"]),
                            deleted=bool(r["deleted"]), updated_at=r["updated_at"], revision=r["revision"])
                for r in rows]
-    return SyncResponse(revision=revision, entries=entries)
+    hotword_rows = conn.execute(
+        "SELECT phrase, enabled, deleted, updated_at, revision FROM hotword_entries"
+        " WHERE account_id = ? AND revision > ? ORDER BY revision", (account_id, since)).fetchall()
+    hotwords = [RemoteHotwordEntry(phrase=r["phrase"], enabled=bool(r["enabled"]), deleted=bool(r["deleted"]),
+                                   updated_at=r["updated_at"], revision=r["revision"])
+                for r in hotword_rows]
+    return SyncResponse(revision=revision, entries=entries, hotwords=hotwords)
 
 
 @app.get("/v1/vocabulary", response_model=SyncResponse)
@@ -358,6 +397,31 @@ def push(body: PushRequest, account_id: int = Depends(current_account)) -> SyncR
                 " asr_hint, deleted, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (account_id, now, body.client.platform, body.client.version, source, replacement, origin, hint,
                  int(change.deleted), change.updated_at))
+        # Custom ASR hotwords: same last-writer-wins and the same shared
+        # revision counter; deliberately not appended to `events`.
+        live_hotwords = conn.execute("SELECT COUNT(*) FROM hotword_entries WHERE account_id = ? AND deleted = 0",
+                                     (account_id,)).fetchone()[0]
+        for change in body.hotwords:
+            phrase = _clean(change.phrase, "phrase")
+            key = normalized_key(phrase)
+            existing = conn.execute("SELECT updated_at, deleted FROM hotword_entries"
+                                    " WHERE account_id = ? AND key = ?", (account_id, key)).fetchone()
+            if existing is not None and existing["updated_at"] >= change.updated_at:
+                continue
+            if not change.deleted and (existing is None or existing["deleted"]):
+                if live_hotwords >= MAX_HOTWORD_ENTRIES:
+                    continue
+                live_hotwords += 1
+            elif change.deleted and existing is not None and not existing["deleted"]:
+                live_hotwords -= 1
+            revision += 1
+            conn.execute(
+                "INSERT INTO hotword_entries (account_id, key, phrase, enabled, deleted, updated_at, revision)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (account_id, key) DO UPDATE SET phrase = excluded.phrase,"
+                " enabled = excluded.enabled, deleted = excluded.deleted, updated_at = excluded.updated_at,"
+                " revision = excluded.revision",
+                (account_id, key, phrase, int(change.enabled), int(change.deleted), change.updated_at, revision))
         conn.execute("UPDATE accounts SET revision = ? WHERE id = ?", (revision, account_id))
         return _changes_since(conn, account_id, max(0, body.since))
 
