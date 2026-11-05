@@ -115,10 +115,14 @@ The migration must be idempotent for a fresh database, a database created before
 In `VocabularyManagerWindow`, add a distinct **ASR Hotwords** section/tab:
 
 - add one phrase;
+- import many phrases from a file;
 - show phrase and enabled state;
 - enable/disable without deleting;
 - delete;
-- explain that entries guide recognition but do not automatically replace text.
+- explain that entries guide recognition but do not automatically replace text;
+- explain the import file format.
+
+Import format: a UTF-8 plain-text file, one phrase per line. Blank lines and lines starting with `#` are skipped; duplicates (already present or repeated in the file) are ignored. Each phrase is subject to the §4.1 input rules (a letter or digit, at most four words).
 
 The existing corrections table/editor and its ASR-hint column are not repurposed.
 
@@ -160,9 +164,9 @@ Verification: passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) fro
 
 #### 9.2 Wave 2 status (2026-11-05)
 
-Implemented in `swift/Sources/Parakey/VocabularyManagerWindow.swift` only: the window content is now an `NSTabView` with the unchanged corrections editor (including its ASR-hint column) on the **Corrections** tab and a new **ASR Hotwords** tab. The tab has an explanation that hotwords only guide recognition and never replace text, a table (enabled checkbox + phrase), an add field (Return or Add button) and Delete. Operations call `VocabularyStore.addHotwordPhrase` / `setHotwordPhraseEnabled` / `deleteHotwordPhrase`, which fire the existing `onLocalChange` themselves (nothing extra is wired in the UI); the lists are reloaded after every operation and on `VOCABULARY_CHANGED_NOTIFICATION`. Store errors (invalid/duplicate phrase, unavailable table) are shown via the existing alert. Controls carry accessibility labels. No edit-in-place (`updateHotwordPhrase` unused: delete + add). No new self-test: the window is AppKit-only and the repo has no UI self-test harness; store behavior is covered by Wave 1 tests. Configuration refresh needs no UI code: `Settings.asrHotwordsConfiguration` reads `asrHotwordPhrases()` on demand.
+Implemented in `swift/Sources/Parakey/VocabularyManagerWindow.swift` only: the window content is now an `NSTabView` with the unchanged corrections editor (including its ASR-hint column) on the **Corrections** tab and a new **ASR Hotwords** tab. The tab has an explanation that hotwords only guide recognition and never replace text, a format note for file import, a table (enabled checkbox + phrase), an add field (Return or Add button), Delete, and an Import button that reads a UTF-8 text file (one phrase per line, `#` comments and blank lines skipped, duplicates ignored) and adds the phrases via `addHotwordPhrase`. Operations call `VocabularyStore.addHotwordPhrase` / `setHotwordPhraseEnabled` / `deleteHotwordPhrase`, which fire the existing `onLocalChange` themselves (nothing extra is wired in the UI); the lists are reloaded after every operation and on `VOCABULARY_CHANGED_NOTIFICATION`. Store errors (invalid/duplicate phrase, unavailable table) are shown via the existing alert; import reports an added/skipped summary. Controls carry accessibility labels. No edit-in-place (`updateHotwordPhrase` unused: delete + add). No new self-test: the window is AppKit-only and the repo has no UI self-test harness; store behavior is covered by Wave 1 tests. Configuration refresh needs no UI code: `Settings.asrHotwordsConfiguration` reads `asrHotwordPhrases()` on demand.
 
-Verification (2026-11-05): passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) from an isolated scratch copy: `cd swift && swift build` -> success; `swift run Parakey --self-test vocabulary-store` -> PASS; `swift run Parakey --self-test asr-hotwords` -> PASS. Existing project warnings about Swift concurrency and an existing duplicate self-test switch case remain, but no new build diagnostics were introduced. Manual interaction remains the release-gate check: via `scripts/install-local.sh` only (never a copied/test bundle), open the vocabulary window; add `Дунималова Анаида Георгиевна`; toggle it off/on; add a duplicate (expect alert); delete; confirm the Corrections tab and ASR-hint checkboxes behave as before.
+Verification (2026-11-05): passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) from an isolated scratch copy: `cd swift && swift build` -> success; `swift run Parakey --self-test vocabulary-store` -> PASS; `swift run Parakey --self-test asr-hotwords` -> PASS. Existing project warnings about Swift concurrency and an existing duplicate self-test switch case remain, but no new build diagnostics were introduced. Manual interaction remains the release-gate check: via `scripts/install-local.sh` only (never a copied/test bundle), open the vocabulary window; add `Дунималова Анаида Георгиевна`; toggle it off/on; add a duplicate (expect alert); import a small UTF-8 file (expect an added-count summary and that `#` comments and duplicates are skipped); delete; confirm the Corrections tab and ASR-hint checkboxes behave as before.
 
 ### Wave 3 - synchronization contract
 

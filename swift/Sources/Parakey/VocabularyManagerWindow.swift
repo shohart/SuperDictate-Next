@@ -5,6 +5,7 @@
 // exactly as VocabularyStore tracks them).
 
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
@@ -111,6 +112,14 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         ))
         explanation.setAccessibilityLabel(t("Пояснение к ASR-терминам", "ASR hotwords explanation"))
 
+        let formatNote = NSTextField(wrappingLabelWithString: t(
+            "Импорт: текстовый файл UTF-8, одна фраза на строку. Пустые строки и строки, начинающиеся с «#», пропускаются; дубликаты игнорируются. Одна фраза — не более четырёх слов.",
+            "Import: a UTF-8 text file, one phrase per line. Blank lines and lines starting with # are skipped; duplicates are ignored. A phrase is at most four words."
+        ))
+        formatNote.font = .systemFont(ofSize: 11)
+        formatNote.textColor = .secondaryLabelColor
+        formatNote.setAccessibilityLabel(t("Формат файла импорта ASR-терминов", "ASR hotword import file format"))
+
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -142,15 +151,19 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         addButton.setAccessibilityLabel(t("Добавить ASR-фразу", "Add ASR hotword"))
         let deleteButton = makeButton(title: t("Удалить", "Delete"), action: #selector(deleteHotwordTapped))
         deleteButton.setAccessibilityLabel(t("Удалить выбранную ASR-фразу", "Delete selected ASR hotword"))
-        let buttonRow = NSStackView(views: [field, addButton, deleteButton])
+        let importButton = makeButton(title: t("Импорт…", "Import…"), action: #selector(importHotwordsTapped))
+        importButton.setAccessibilityLabel(t("Импортировать ASR-фразы из файла", "Import ASR hotwords from a file"))
+        let buttonRow = NSStackView(views: [field, addButton, deleteButton, importButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 8
 
         root.addArrangedSubview(explanation)
+        root.addArrangedSubview(formatNote)
         root.addArrangedSubview(scrollView)
         root.addArrangedSubview(buttonRow)
         NSLayoutConstraint.activate([
             explanation.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            formatNote.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
             scrollView.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
         ])
@@ -351,6 +364,48 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
                            "Could not delete the ASR hotword: \(error.localizedDescription)"))
         }
         reload()
+    }
+
+    @objc private func importHotwordsTapped() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .utf8PlainText, .commaSeparatedText]
+        panel.allowsMultipleSelection = false
+        panel.message = t("Выберите текстовый файл со списком фраз — по одной на строку.",
+                          "Choose a text file with one phrase per line.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            presentError(t("Не удалось прочитать файл. Используйте кодировку UTF-8.",
+                           "Could not read the file. Use UTF-8 encoding."))
+            return
+        }
+        var added = 0
+        var failed = 0
+        var firstFailure = ""
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            do {
+                _ = try store.addHotwordPhrase(line)
+                added += 1
+            } catch VocabularyStoreError.duplicatePhrase {
+                // Expected on import: an existing or repeated phrase is skipped.
+            } catch {
+                failed += 1
+                if firstFailure.isEmpty { firstFailure = error.localizedDescription }
+            }
+        }
+        reload()
+        if failed > 0 {
+            presentError(t("Импортировано фраз: \(added), пропущено с ошибкой: \(failed) (первая ошибка: \(firstFailure)).",
+                           "Imported phrases: \(added), skipped with error: \(failed) (first error: \(firstFailure))."))
+        } else {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = t("Импорт завершён", "Import complete")
+            alert.informativeText = t("Добавлено фраз: \(added). Дубликаты, пустые строки и комментарии пропущены.",
+                                      "Added phrases: \(added). Duplicates, blank lines and comments were skipped.")
+            alert.runModal()
+        }
     }
 
     // MARK: - Actions
