@@ -23,14 +23,27 @@ struct VocabularyRecord: Equatable {
     var asrHint: Bool? = nil
 }
 
+/// A user-managed ASR hotword phrase (docs/specs/user-hotword-vocabulary-spec.md §4).
+struct HotwordPhraseRecord: Equatable, Identifiable, Sendable {
+    let id: Int64
+    let phrase: String
+    let enabled: Bool
+    let createdAt: TimeInterval
+    let updatedAt: TimeInterval
+}
+
 enum VocabularyStoreError: Error, LocalizedError {
     case openFailed(String)
     case sqlError(String)
+    case invalidPhrase
+    case duplicatePhrase
 
     var errorDescription: String? {
         switch self {
         case .openFailed(let message): return "Could not open the vocabulary database: \(message)"
         case .sqlError(let message): return "Vocabulary database error: \(message)"
+        case .invalidPhrase: return "A hotword must contain a letter or digit and at most \(AsrHotwordSelection.maxWords) words."
+        case .duplicatePhrase: return "This hotword is already in the list."
         }
     }
 }
@@ -55,6 +68,10 @@ final class VocabularyStore: @unchecked Sendable {
     /// then select NULL in its place, so the store keeps working with
     /// automatic hints, and `setAsrHint` reports the failure.
     private var hasAsrHintColumn = false
+
+    /// False only when the `hotword_phrases` table could not be created;
+    /// the corrections side keeps working and the custom list stays empty.
+    private var hasHotwordTable = false
 
     /// Called (on the writing thread, after the write committed) whenever
     /// a local edit changed the store: manual edits, learning, cleanup,
@@ -178,6 +195,28 @@ final class VocabularyStore: @unchecked Sendable {
         """
         try execute(sql)
         migrateAsrHintColumnIfNeeded()
+        createHotwordTableIfNeeded()
+    }
+
+    /// Idempotent; independent of `corrections`, so it needs no migration
+    /// for older databases. Failure is non-fatal (see `hasHotwordTable`).
+    private func createHotwordTableIfNeeded() {
+        do {
+            try execute("""
+            CREATE TABLE IF NOT EXISTS hotword_phrases (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                phrase     TEXT NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS hotword_phrases_phrase_unique
+                ON hotword_phrases(phrase);
+            """)
+            hasHotwordTable = true
+        } catch {
+            log("VocabularyStore: hotword_phrases creation failed (custom hotwords unavailable this session): \(error)")
+        }
     }
 
     /// Idempotent: adds `asr_hint INTEGER` (NULL auto / 1 on / 0 off) once.
@@ -827,10 +866,168 @@ final class VocabularyStore: @unchecked Sendable {
         return record
     }
 
-    /// The ASR hotword list (spec asr-hotwords §6) for the current
-    /// contents of the store.
+    /// The ASR hotword list: enabled user phrases first, then the
+    /// correction-derived ones (user-hotword-vocabulary spec §5).
     func asrHotwordPhrases() -> [String] {
-        AsrHotwordSelection.phrases(from: all())
+        // Read both sources in one serialized snapshot. The menu app and
+        // control panel may write the same SQLite file concurrently; mixing
+        // an old corrections read with a new custom-phrase read would make
+        // one dictation observe a state that never existed atomically.
+        queue.sync {
+            guard let db else { return [] }
+            let corrections = allLocked(db: db)
+            let custom = hasHotwordTable ? hotwordPhrasesLocked(db: db) : []
+            return AsrHotwordSelection.combinedPhrases(corrections: corrections, custom: custom)
+        }
+    }
+
+    // MARK: - User hotword phrases (user-hotword-vocabulary spec §4, §6)
+
+    private static let hotwordColumns = "id, phrase, enabled, created_at, updated_at"
+
+    func hotwordPhrases() -> [HotwordPhraseRecord] {
+        queue.sync {
+            guard let db, hasHotwordTable else { return [] }
+            return hotwordPhrasesLocked(db: db)
+        }
+    }
+
+    private func hotwordPhrasesLocked(db: OpaquePointer) -> [HotwordPhraseRecord] {
+        var statement: OpaquePointer?
+        let sql = "SELECT \(Self.hotwordColumns) FROM hotword_phrases ORDER BY id;"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var rows: [HotwordPhraseRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let row = hotwordRecord(from: statement) { rows.append(row) }
+        }
+        return rows
+    }
+
+    private func hotwordRecord(from statement: OpaquePointer?) -> HotwordPhraseRecord? {
+        guard let phrase = sqlite3_column_text(statement, 1) else { return nil }
+        return HotwordPhraseRecord(id: sqlite3_column_int64(statement, 0),
+                                   phrase: String(cString: phrase),
+                                   enabled: sqlite3_column_int64(statement, 2) != 0,
+                                   createdAt: sqlite3_column_double(statement, 3),
+                                   updatedAt: sqlite3_column_double(statement, 4))
+    }
+
+    private func requireHotwordDatabase() throws -> OpaquePointer {
+        guard let db else { throw VocabularyStoreError.sqlError("database closed") }
+        guard hasHotwordTable else { throw VocabularyStoreError.sqlError("the hotword_phrases table is unavailable") }
+        return db
+    }
+
+    private func validatedHotwordPhrase(_ input: String, excludingId: Int64?, db: OpaquePointer) throws -> String {
+        guard let phrase = AsrHotwordSelection.normalizedCustomPhrase(input) else {
+            throw VocabularyStoreError.invalidPhrase
+        }
+        let key = AsrHotwordSelection.customPhraseKey(phrase)
+        if hotwordPhrasesLocked(db: db).contains(where: {
+            $0.id != excludingId && AsrHotwordSelection.customPhraseKey($0.phrase) == key
+        }) {
+            throw VocabularyStoreError.duplicatePhrase
+        }
+        return phrase
+    }
+
+    private func hotwordRow(db: OpaquePointer, id: Int64) -> HotwordPhraseRecord? {
+        hotwordPhrasesLocked(db: db).first { $0.id == id }
+    }
+
+    @discardableResult
+    func addHotwordPhrase(_ phrase: String) throws -> HotwordPhraseRecord {
+        let record: HotwordPhraseRecord = try queue.sync {
+            let db = try requireHotwordDatabase()
+            let clean = try validatedHotwordPhrase(phrase, excludingId: nil, db: db)
+            let now = Date().timeIntervalSince1970
+            var statement: OpaquePointer?
+            let sql = "INSERT INTO hotword_phrases (phrase, enabled, created_at, updated_at) VALUES (?, 1, ?, ?) RETURNING \(Self.hotwordColumns);"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            bindText(statement, 1, clean)
+            sqlite3_bind_double(statement, 2, now)
+            sqlite3_bind_double(statement, 3, now)
+            guard sqlite3_step(statement) == SQLITE_ROW, let row = hotwordRecord(from: statement) else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            return row
+        }
+        notifyLocalChange()
+        return record
+    }
+
+    @discardableResult
+    func updateHotwordPhrase(id: Int64, phrase: String, enabled: Bool) throws -> HotwordPhraseRecord {
+        let record: HotwordPhraseRecord = try queue.sync {
+            let db = try requireHotwordDatabase()
+            guard hotwordRow(db: db, id: id) != nil else {
+                throw VocabularyStoreError.sqlError("hotword phrase \(id) not found")
+            }
+            let clean = try validatedHotwordPhrase(phrase, excludingId: id, db: db)
+            var statement: OpaquePointer?
+            let sql = "UPDATE hotword_phrases SET phrase = ?, enabled = ?, updated_at = ? WHERE id = ? RETURNING \(Self.hotwordColumns);"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            bindText(statement, 1, clean)
+            sqlite3_bind_int64(statement, 2, enabled ? 1 : 0)
+            sqlite3_bind_double(statement, 3, Date().timeIntervalSince1970)
+            sqlite3_bind_int64(statement, 4, id)
+            guard sqlite3_step(statement) == SQLITE_ROW, let row = hotwordRecord(from: statement) else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            return row
+        }
+        notifyLocalChange()
+        return record
+    }
+
+    /// False when no such row exists.
+    @discardableResult
+    func setHotwordPhraseEnabled(id: Int64, enabled: Bool) throws -> Bool {
+        let changed: Bool = try queue.sync {
+            let db = try requireHotwordDatabase()
+            var statement: OpaquePointer?
+            let sql = "UPDATE hotword_phrases SET enabled = ?, updated_at = ? WHERE id = ?;"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int64(statement, 1, enabled ? 1 : 0)
+            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+            sqlite3_bind_int64(statement, 3, id)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            return sqlite3_changes(db) > 0
+        }
+        if changed { notifyLocalChange() }
+        return changed
+    }
+
+    /// False when no such row exists.
+    @discardableResult
+    func deleteHotwordPhrase(id: Int64) throws -> Bool {
+        let deleted: Bool = try queue.sync {
+            let db = try requireHotwordDatabase()
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "DELETE FROM hotword_phrases WHERE id = ?;", -1, &statement, nil) == SQLITE_OK else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int64(statement, 1, id)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw VocabularyStoreError.sqlError(String(cString: sqlite3_errmsg(db)))
+            }
+            return sqlite3_changes(db) > 0
+        }
+        if deleted { notifyLocalChange() }
+        return deleted
     }
 
     private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {

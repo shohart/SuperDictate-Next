@@ -4508,6 +4508,70 @@ enum ParakeySelfTest {
         try expect(settings.asrHotwordsConfiguration, equals: .disabled, "disabled → empty list")
         try expect(AsrHotwordsConfiguration.disabled.phrases.isEmpty, equals: true, "disabled carries no phrases")
 
+        let suite0 = "com.local.superdictate.selftest.user-hotwords-\(UUID().uuidString)"
+        guard let defaults0 = UserDefaults(suiteName: suite0) else {
+            throw SelfTestFailure.failed("could not create a test defaults suite")
+        }
+        defer { defaults0.removePersistentDomain(forName: suite0) }
+        // --- User hotword vocabulary, Wave 1 (user-hotword-vocabulary spec §4–§6) ---
+        // Migration: the pre-hotwords database above gained the table.
+        try expect(store.hotwordPhrases().isEmpty, equals: true, "legacy database gets an empty hotword table")
+        try expect(reopened.hotwordPhrases().isEmpty, equals: true, "second connection re-runs the migration idempotently")
+        let anaida = try store.addHotwordPhrase("  Дунималова   Анаида Георгиевна ")
+        try expect(anaida.phrase, equals: "Дунималова   Анаида Георгиевна", "trimmed, casing and inner spacing kept")
+        try expect(anaida.enabled, equals: true, "new phrase is enabled")
+        try expect(reopened.hotwordPhrases().map(\.phrase), equals: [anaida.phrase], "phrase visible to another connection")
+        for bad in ["", "   ", "?!…", "один два три четыре пять"] {
+            do { _ = try store.addHotwordPhrase(bad); throw SelfTestFailure.failed("accepted invalid phrase '\(bad)'") }
+            catch VocabularyStoreError.invalidPhrase {}
+        }
+        do { _ = try store.addHotwordPhrase("дунималова анаида   георгиевна"); throw SelfTestFailure.failed("accepted a canonical duplicate") }
+        catch VocabularyStoreError.duplicatePhrase {}
+        let arbitr = try store.addHotwordPhrase("АС Москвы")
+        let renamed = try store.updateHotwordPhrase(id: arbitr.id, phrase: "Арбитражный суд", enabled: true)
+        try expect(renamed.phrase, equals: "Арбитражный суд", "update rewrites the phrase")
+        do { _ = try store.updateHotwordPhrase(id: arbitr.id, phrase: "ДУНИМАЛОВА Анаида Георгиевна", enabled: true)
+             throw SelfTestFailure.failed("update accepted a duplicate") }
+        catch VocabularyStoreError.duplicatePhrase {}
+        _ = try store.updateHotwordPhrase(id: arbitr.id, phrase: "арбитражный СУД", enabled: true) // own key is not a duplicate
+        // Selection/priority: custom first, no text replacement implied.
+        let combinedFromStore = store.asrHotwordPhrases()
+        try expect(combinedFromStore,
+                   equals: [anaida.phrase, "арбитражный СУД", "ЕСИА", "Claude"],
+                   "custom phrases precede the explicit correction-derived tail")
+        try expect(try store.setHotwordPhraseEnabled(id: arbitr.id, enabled: false), equals: true, "disable reports a change")
+        try expect(store.hotwordPhrases().contains { $0.id == arbitr.id && !$0.enabled }, equals: true, "disabled phrase is kept")
+        try expect(store.asrHotwordPhrases().contains("арбитражный СУД"), equals: false, "disabled phrase absent from ASR input")
+        try expect(try store.setHotwordPhraseEnabled(id: 99_999, enabled: true), equals: false, "unknown id reports no change")
+        try expect(try store.deleteHotwordPhrase(id: arbitr.id), equals: true, "delete reports a change")
+        try expect(try store.deleteHotwordPhrase(id: arbitr.id), equals: false, "second delete reports none")
+        try expect(store.all().count, equals: afterReplace.count + 1, "corrections untouched by hotword CRUD (+ the learned Клод row)")
+
+        // Pure selector: dedup keeps the custom spelling, disabled skipped, custom wins the cap.
+        func custom(_ id: Int64, _ phrase: String, _ enabled: Bool = true) -> HotwordPhraseRecord {
+            HotwordPhraseRecord(id: id, phrase: phrase, enabled: enabled, createdAt: 0, updatedAt: 0)
+        }
+        let learnedDocker = VocabularyRecord(id: 1, source: "докер", replacement: "docker", origin: .manual, createdAt: "", updatedAt: "")
+        try expect(AsrHotwordSelection.combinedPhrases(corrections: [learnedDocker],
+                                                       custom: [custom(1, "Docker"), custom(2, "Off", false)]),
+                   equals: ["Docker"], "duplicate appears once with the custom spelling; disabled skipped")
+        try expect(AsrHotwordSelection.combinedPhrases(corrections: [], custom: []).isEmpty, equals: true, "both sources empty → empty list")
+        let manyCustom = (0..<900).map { custom(Int64($0), "Custom\($0)") }
+        let combined = AsrHotwordSelection.combinedPhrases(corrections: many, custom: manyCustom)
+        try expect(combined.count, equals: AsrHotwordSelection.maxPhrases, "combined list is capped at 1000")
+        try expect(Array(combined.prefix(900)), equals: manyCustom.map(\.phrase), "all custom phrases survive the cap")
+        try expect(combined.last, equals: "Term99", "remaining slots go to correction phrases in order")
+        let onlyDisabled = Settings(defaults: defaults0, vocabularyStore: VocabularyStore.inMemoryFallback())
+        try expect(onlyDisabled.asrHotwordsConfiguration, equals: .disabled, "no custom and no correction phrases → .disabled")
+        let memHot = VocabularyStore.inMemoryFallback()
+        let memPhrase = try memHot.addHotwordPhrase("Дунималова Анаида Георгиевна")
+        try expect(memHot.all().isEmpty, equals: true, "a hotword creates no correction row")
+        try expect(Settings(defaults: defaults0, vocabularyStore: memHot).asrHotwordsConfiguration.phrases,
+                   equals: [memPhrase.phrase], "custom phrase reaches AsrHotwordsConfiguration")
+        try memHot.setHotwordPhraseEnabled(id: memPhrase.id, enabled: false)
+        try expect(Settings(defaults: defaults0, vocabularyStore: memHot).asrHotwordsConfiguration, equals: .disabled,
+                   "only a disabled custom phrase → .disabled")
+
         // --- TRANSCRIBE options (§7) ----------------------------------
         // An empty list must produce exactly the pre-hotwords request.
         let legacyOptions: [String: Any] = ["timestamps": true, "sample_rate": Int(SAMPLE_RATE)]
