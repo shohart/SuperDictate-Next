@@ -3,11 +3,11 @@
 set -euo pipefail
 
 REPOSITORY="${SUPERDICTATE_REPOSITORY:-shohart/SuperDictate-Next}"
-RELEASE_VERSION="0.9.3"
+RELEASE_VERSION="0.9.4"
 # macOS releases are tagged mac-vX.Y.Z (Windows ones win-vX.Y.Z, same repo);
 # 0.7.0 and earlier carry the legacy vX.Y.Z tag.
-RELEASE_TAG="mac-v0.9.3"
-RELEASE_SHA256="343d20bca2ec5cba8b149ea74e3a076f46d5e2b96f756afc148a23889fe0d011"
+RELEASE_TAG="mac-v0.9.4"
+RELEASE_SHA256="4c6267ac4f58f83421589b74f2a70822478727e4c91c5666c8c529b58aeb7c3b"
 SOURCE_COMMIT="cdc53429f22ec99f6976ff56e1107522380fa1f5"
 RELEASE_URL="${SUPERDICTATE_RELEASE_URL:-https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG/SuperDictate.zip}"
 EXPECTED_SHA256="${SUPERDICTATE_RELEASE_SHA256:-$RELEASE_SHA256}"
