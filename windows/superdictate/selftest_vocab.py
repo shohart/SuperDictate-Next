@@ -915,6 +915,77 @@ def test_custom_hotwords_store() -> None:
         store.close()
 
 
+def test_custom_hotwords_window() -> None:
+    """The «ASR-термины» section of the real settings window, by its widgets."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from .settings import Settings
+    from .ui.settings_window import SettingsWindow
+    from .vocabulary import VocabularyStore
+
+    app = QApplication.instance() or QApplication([])
+    work = Path(tempfile.mkdtemp(prefix="sd-hotwords-ui-"))
+    store = VocabularyStore(str(work / "d.sqlite"))
+    saved: list[bool] = []
+
+    class Controller:
+        def apply_settings(self) -> None:
+            saved.append(True)
+
+        def reload_model(self) -> None:
+            saved.append(True)
+
+    window = SettingsWindow(Settings(path=work / "s.json"), store, Controller())
+    messages: list[str] = []
+    window._warn = messages.append
+    field, listing = window._custom_hotword_field, window._custom_hotwords_list
+    try:
+        window.show()
+        window._tabs.setCurrentIndex(3)
+        app.processEvents()
+        field.setFocus()
+        field.setText("Дунималова Анаида Георгиевна")
+        QTest.keyClick(field, Qt.Key.Key_Return)
+        app.processEvents()
+        _check("terms UI: Return adds the phrase", [r.phrase for r in store.hotword_phrases()],
+               ["Дунималова Анаида Георгиевна"])
+        _check("terms UI: Return does not save or close the settings",
+               (saved, window.isVisible()), ([], True))
+        _check("terms UI: the field is cleared", field.text(), "")
+        field.setText("ДУНИМАЛОВА анаида георгиевна")
+        window._add_custom_hotword()
+        _check("terms UI: a duplicate is explained and kept in the field",
+               (len(messages), field.text()), (1, "ДУНИМАЛОВА анаида георгиевна"))
+        field.clear()
+        source = work / "terms.txt"
+        source.write_bytes("\ufeff# суд\r\nАрбитражный суд города Москвы\r\nЕФРСБ\r\n".encode("utf-8"))
+        window._import_custom_hotwords_file(str(source))
+        _check("terms UI: import fills the list", listing.count(), 3)
+        broken = work / "utf16.txt"
+        broken.write_bytes("Тест".encode("utf-16"))
+        window._import_custom_hotwords_file(str(broken))
+        _check("terms UI: a non-UTF-8 file is refused", listing.count(), 3)
+        listing.item(1).setCheckState(Qt.CheckState.Unchecked)
+        _check("terms UI: the checkbox reaches the ASR list",
+               "Арбитражный суд города Москвы" in store.asr_hotword_phrases(), False)
+        listing.setCurrentRow(2)
+        window._remove_custom_hotword()
+        _check("terms UI: delete", [listing.item(i).text() for i in range(listing.count())],
+               ["Дунималова Анаида Георгиевна", "Арбитражный суд города Москвы"])
+        store.apply_remote_hotwords([{"phrase": "С сервера", "enabled": True, "deleted": False,
+                                      "updated_at": "2099-01-01T00:00:00Z"}])
+        window._on_vocabulary_changed("sync")
+        _check("terms UI: a synced term appears", listing.item(2).text(), "С сервера")
+        _check("terms UI: a reload keeps the unchecked state",
+               listing.item(1).checkState(), Qt.CheckState.Unchecked)
+    finally:
+        window.hide()
+        window.deleteLater()
+        store.close()
+
+
 def _sync_error(call) -> str:
     from .vocabulary_sync import SyncError
 
@@ -956,6 +1027,7 @@ def test_sync_settings_and_token() -> None:
 
 TESTS = [
     test_custom_hotwords_store,
+    test_custom_hotwords_window,
     test_asr_hotword_selection,
     test_asr_hint_store,
     test_asr_hotwords_settings_and_ipc,

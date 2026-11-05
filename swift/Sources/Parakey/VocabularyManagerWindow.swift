@@ -366,18 +366,8 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         reload()
     }
 
-    @objc private func importHotwordsTapped() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.plainText, .utf8PlainText, .commaSeparatedText]
-        panel.allowsMultipleSelection = false
-        panel.message = t("Выберите текстовый файл со списком фраз — по одной на строку.",
-                          "Choose a text file with one phrase per line.")
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            presentError(t("Не удалось прочитать файл. Используйте кодировку UTF-8.",
-                           "Could not read the file. Use UTF-8 encoding."))
-            return
-        }
+    /// One phrase per line; blank lines, `#` comments and duplicates are skipped.
+    private func importHotwords(text: String) -> (added: Int, failed: Int, firstFailure: String) {
         var added = 0
         var failed = 0
         var firstFailure = ""
@@ -394,6 +384,22 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
                 if firstFailure.isEmpty { firstFailure = error.localizedDescription }
             }
         }
+        return (added, failed, firstFailure)
+    }
+
+    @objc private func importHotwordsTapped() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .utf8PlainText, .commaSeparatedText]
+        panel.allowsMultipleSelection = false
+        panel.message = t("Выберите текстовый файл со списком фраз — по одной на строку.",
+                          "Choose a text file with one phrase per line.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            presentError(t("Не удалось прочитать файл. Используйте кодировку UTF-8.",
+                           "Could not read the file. Use UTF-8 encoding."))
+            return
+        }
+        let (added, failed, firstFailure) = importHotwords(text: text)
         reload()
         if failed > 0 {
             presentError(t("Импортировано фраз: \(added), пропущено с ошибкой: \(failed) (первая ошибка: \(firstFailure)).",
@@ -678,3 +684,61 @@ final class VocabularyManagerWindowController: NSObject, NSWindowDelegate, NSTab
         alert.runModal()
     }
 }
+
+#if DEBUG
+extension VocabularyManagerWindowController {
+    /// Self-test `hotword-window`: drives the real tab's controls without
+    /// putting a window on screen and writes what it draws to `imageURL`.
+    func exerciseHotwordsTabForSelfTest(imageURL: URL?) throws {
+        func expect(_ condition: Bool, _ message: String) throws {
+            if !condition { throw VocabularyLearningTestFailure("hotword window: \(message)") }
+        }
+        let view = buildHotwordsView()
+        // In a window that is never ordered in: controls draw as in the app.
+        let offscreen = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+                                 styleMask: [.titled], backing: .buffered, defer: false)
+        offscreen.isReleasedWhenClosed = false
+        offscreen.contentView = view
+        reload()
+        guard let field = hotwordPhraseField, let table = hotwordTableView else {
+            throw VocabularyLearningTestFailure("hotword window: the controls were not built")
+        }
+        field.stringValue = "Дунималова Анаида Георгиевна"
+        addHotwordTapped()
+        try expect(store.hotwordPhrases().map(\.phrase) == ["Дунималова Анаида Георгиевна"], "Add stores the phrase")
+        try expect(field.stringValue.isEmpty && numberOfRows(in: table) == 1, "Add clears the field and fills the table")
+
+        let imported = importHotwords(text: "# суд\r\nАрбитражный суд города Москвы\r\n\r\nарбитражный СУД ГОРОДА москвы\r\nЕФРСБ\r\nфинансовый управляющий\r\n")
+        reload()
+        try expect(imported.added == 3 && imported.failed == 0, "import counts: \(imported)")
+        try expect(numberOfRows(in: table) == 4, "import fills the table")
+
+        view.layoutSubtreeIfNeeded()
+        table.layoutSubtreeIfNeeded()
+        guard let columnIndex = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "hotwordEnabled" }),
+              let checkbox = table.view(atColumn: columnIndex, row: 1, makeIfNecessary: true) as? NSButton else {
+            throw VocabularyLearningTestFailure("hotword window: no checkbox in the row")
+        }
+        checkbox.state = .off
+        _ = checkbox.sendAction(checkbox.action, to: checkbox.target)
+        try expect(store.hotwordPhrases()[1].enabled == false, "the checkbox turns the phrase off")
+        try expect(!store.asrHotwordPhrases().contains("Арбитражный суд города Москвы"), "an unchecked phrase leaves the ASR list")
+
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        deleteHotwordTapped()
+        try expect(store.hotwordPhrases().map(\.phrase) == ["Дунималова Анаида Георгиевна", "Арбитражный суд города Москвы", "финансовый управляющий"], "Delete removes the selected row")
+        try expect(store.hotwordTombstones().map(\.key) == ["ефрсб"], "Delete leaves a tombstone")
+        try expect(store.all().isEmpty, "terms create no replacement rules")
+
+        if let imageURL {
+            view.layoutSubtreeIfNeeded()
+            table.layoutSubtreeIfNeeded()
+            offscreen.displayIfNeeded()
+            if let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to: imageURL)
+            }
+        }
+    }
+}
+#endif

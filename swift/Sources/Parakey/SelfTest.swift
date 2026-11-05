@@ -89,6 +89,8 @@ enum ParakeySelfTest {
             // Needs a local server-side instance (server/vocab-sync) at
             // SD_VOCAB_SYNC_TEST_URL; not part of `all`.
             return runSuite("vocabulary-sync", testVocabularySync)
+        case "hotword-window":
+            return runSuite("hotword-window", testHotwordWindow)
         case "hotword-sync-cross":
             // Against a real server and account from the environment, for a
             // check with the Windows client; not part of `all`.
@@ -268,6 +270,7 @@ enum ParakeySelfTest {
         try testVocabularyStore()
         try testAsrHotwords()
         try testHotwordSync()
+        try testHotwordWindow()
         try testVocabularyHygiene()
         try testLearnCandidateDetector()
         try testFillerWordRemoval()
@@ -4404,6 +4407,19 @@ enum ParakeySelfTest {
 
     /// Custom ASR hotword sync, store level (user-hotword-vocabulary spec §8):
     /// tombstones, the change filter and applyRemoteHotwords. No server needed.
+    /// The vocabulary window's «ASR-термины» tab; SD_HOTWORD_WINDOW_PNG saves
+    /// what it draws.
+    private static func testHotwordWindow() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hotword-window-\(UUID().uuidString).sqlite")
+        defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) } }
+        let store = try VocabularyStore(fileURL: url)
+        let image = ProcessInfo.processInfo.environment["SD_HOTWORD_WINDOW_PNG"].map { URL(fileURLWithPath: $0) }
+        _ = NSApplication.shared
+        try MainActor.assumeIsolated {
+            try VocabularyManagerWindowController(store: store).exerciseHotwordsTabForSelfTest(imageURL: image)
+        }
+    }
+
     /// SD_CROSS_URL, SD_CROSS_EMAIL, SD_CROSS_PASSWORD; adds SD_CROSS_ADD if
     /// set, runs a pass from an empty store and prints every term it holds.
     private static func testHotwordSyncCross() throws {

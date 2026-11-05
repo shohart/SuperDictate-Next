@@ -297,6 +297,18 @@ def _page(*sections: QWidget) -> QWidget:
     return scroll
 
 
+class _SubmitLineEdit(QLineEdit):
+    """Return submits this field only. A plain QLineEdit also lets the key
+    reach the dialog, whose default button saves the settings and restarts."""
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.returnPressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class SettingsWindow(QDialog):
     # A sign-in / sync / sign-out finished on its worker thread:
     # (kind, detail), kind "ok" | "created" | "error".
@@ -625,7 +637,7 @@ class SettingsWindow(QDialog):
         row = QHBoxLayout(editor)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self._custom_hotword_field = QLineEdit()
+        self._custom_hotword_field = _SubmitLineEdit()
         self._custom_hotword_field.setPlaceholderText(i18n.tr("custom_hotwords_new"))
         self._custom_hotword_field.returnPressed.connect(self._add_custom_hotword)
         add = QPushButton(i18n.tr("corrections_add"))
