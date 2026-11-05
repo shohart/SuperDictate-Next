@@ -158,6 +158,12 @@ Verification: passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) fro
 - configuration refresh after add/edit/delete/enable;
 - accessibility labels and UI smoke/self-tests where available.
 
+#### 9.2 Wave 2 status (2026-11-05)
+
+Implemented in `swift/Sources/Parakey/VocabularyManagerWindow.swift` only: the window content is now an `NSTabView` with the unchanged corrections editor (including its ASR-hint column) on the **Corrections** tab and a new **ASR Hotwords** tab. The tab has an explanation that hotwords only guide recognition and never replace text, a table (enabled checkbox + phrase), an add field (Return or Add button) and Delete. Operations call `VocabularyStore.addHotwordPhrase` / `setHotwordPhraseEnabled` / `deleteHotwordPhrase`, which fire the existing `onLocalChange` themselves (nothing extra is wired in the UI); the lists are reloaded after every operation and on `VOCABULARY_CHANGED_NOTIFICATION`. Store errors (invalid/duplicate phrase, unavailable table) are shown via the existing alert. Controls carry accessibility labels. No edit-in-place (`updateHotwordPhrase` unused: delete + add). No new self-test: the window is AppKit-only and the repo has no UI self-test harness; store behavior is covered by Wave 1 tests. Configuration refresh needs no UI code: `Settings.asrHotwordsConfiguration` reads `asrHotwordPhrases()` on demand.
+
+Verification (2026-11-05): passed on the remote Intel Mac Pro (macOS 26.7.1, Swift 6.3.2) from an isolated scratch copy: `cd swift && swift build` -> success; `swift run Parakey --self-test vocabulary-store` -> PASS; `swift run Parakey --self-test asr-hotwords` -> PASS. Existing project warnings about Swift concurrency and an existing duplicate self-test switch case remain, but no new build diagnostics were introduced. Manual interaction remains the release-gate check: via `scripts/install-local.sh` only (never a copied/test bundle), open the vocabulary window; add `Дунималова Анаида Георгиевна`; toggle it off/on; add a duplicate (expect alert); delete; confirm the Corrections tab and ASR-hint checkboxes behave as before.
+
 ### Wave 3 - synchronization contract
 
 - extend `VocabularySync` and `server/vocab-sync` with custom-hotword changes;
