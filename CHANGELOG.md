@@ -6,6 +6,17 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.7 — 2026-11-06
+
+macOS (`mac-v0.9.7`) and Windows (`win-v0.9.7`).
+
+### Fixed
+- **The text correction no longer swaps words it does not know for something unrelated.** It used to turn «хотвордов» into «Hotjar» and «хотворды» into «HuggingFace». Each word it changes is now compared with the original, and an unrelated replacement goes back to what recognition wrote. Real fixes stay: «гитхаб» still becomes «GitHub».
+- **The correction no longer changes names and terms from your vocabulary.** Capitalized and Latin words in your terms and rules stay as they are. Their case can still change.
+
+### Added
+- **A local log of each dictation's stages** (`DictationTrace.jsonl`): what recognition wrote, after the rules, and the final text. It stays on your computer, keeps the latest 2000–4000 dictations, and shows where text went wrong.
+
 ## 0.9.6 — 2026-11-06
 
 macOS only (`mac-v0.9.6`).

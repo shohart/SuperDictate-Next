@@ -7,7 +7,7 @@ swift/Info.plist by hand when bumping — there is no build step here that
 could read it automatically.
 """
 
-VERSION = "0.9.5"
+VERSION = "0.9.7"
 UPSTREAM_BASE = (
     "SuperDictate Next (macOS), itself a fork of SuperDictate by shlgd "
     "and Parakey by Richard Courtman"
