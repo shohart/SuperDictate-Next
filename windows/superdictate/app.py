@@ -31,7 +31,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import (asr, audio, edit_watch, focus_target, i18n, incremental, inject, system,
+from . import (asr, audio, dictation_trace, edit_watch, focus_target, i18n, incremental, inject, system,
                textproc, transcription, vocabulary_hygiene)
 from .history import History, HistoryEntry, UsageStats
 from .hotkeys import Action, HotkeyListener
@@ -165,6 +165,7 @@ class DictationController(QObject):
         # that actually needs one — a multi-GB model must not be loaded at
         # launch for a feature the user may never turn on.
         self.postprocessor = LLMPostprocessor()
+        self.postprocessor.vocabulary_phrases = self.corrections.asr_hotword_phrases
         self.punctuation = PunctuationRestorer()
         self.postprocessor.gpu_layers = settings.llm_gpu_layers
         # Cold-start feedback. The callbacks fire on the transcription
@@ -852,7 +853,9 @@ class DictationController(QObject):
             self.dictation_failed.emit("mic", i18n.tr("error_no_speech"))
             return
 
+        rules_text = text
         text = self._postprocessed(text)
+        dictation_trace.record(result.text, rules_text, text)
 
         # The preview stopped a beat before the recording did, so its last
         # words are missing. This is the same sentence, complete.

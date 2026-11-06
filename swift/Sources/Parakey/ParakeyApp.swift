@@ -2417,6 +2417,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     showCorrectingHUD()
                     let cleaned = await llmPostprocessing.finalizedText(processed.text, settings: settings)
+                    DictationTrace.record(asr: transcription.text, rules: processed.text, final: cleaned)
                     if completed.transcription.hadSegmentFailure {
                         dictationFailed = true
                     }

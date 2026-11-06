@@ -89,6 +89,12 @@ enum ParakeySelfTest {
             // Needs a local server-side instance (server/vocab-sync) at
             // SD_VOCAB_SYNC_TEST_URL; not part of `all`.
             return runSuite("vocabulary-sync", testVocabularySync)
+        case "llm-prompt-dump":
+            // Writes the correction prompt as JSON to SD_LLM_PROMPT_DUMP, for
+            // replaying texts against a running host; not part of `all`.
+            return runSuite("llm-prompt-dump", dumpCorrectionPrompt)
+        case "dictation-trace":
+            return runSuite("dictation-trace", testDictationTrace)
         case "hotword-window":
             return runSuite("hotword-window", testHotwordWindow)
         case "hotword-sync-cross":
@@ -271,6 +277,7 @@ enum ParakeySelfTest {
         try testAsrHotwords()
         try testHotwordSync()
         try testHotwordWindow()
+        try testDictationTrace()
         try testVocabularyHygiene()
         try testLearnCandidateDetector()
         try testFillerWordRemoval()
@@ -3104,8 +3111,11 @@ enum ParakeySelfTest {
         struct WordCount: Decodable {
             let input_words: Int; let output_words: Int; let expect: String; let why: String
         }
+        struct WordGuard: Decodable {
+            let input: String; let output: String; let protected: [String]; let expect: String; let why: String
+        }
         struct Fixture: Decodable {
-            let model_removed_fillers: [String]; let cases: [Case]; let word_count: [WordCount]
+            let model_removed_fillers: [String]; let cases: [Case]; let word_count: [WordCount]; let word_guard: [WordGuard]
         }
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -3121,6 +3131,13 @@ enum ParakeySelfTest {
             try expect(LLMCorrectionGuardrail.sanitizedCorrection(input: item.input, output: item.output),
                        equals: expected, "guardrail must \(item.expect) «\(item.input)» (\(item.why))")
         }
+        for item in fixture.word_guard {
+            try expect(LLMCorrectionGuardrail.faithfulWords(input: item.input, output: item.output,
+                                                            protected: LLMCorrectionGuardrail.protectedWords(from: item.protected)),
+                       equals: item.expect, "word guard «\(item.input)» (\(item.why))")
+        }
+        try expect(LLMCorrectionGuardrail.protectedWords(from: ["финансовый управляющий", "Дунималова Анаида", "GitHub", "ЕГРН"]),
+                   equals: ["github", "анаида", "дунималова", "егрн"], "only proper words of the vocabulary are protected")
         for item in fixture.word_count {
             let input = (0..<item.input_words).map { "слово\($0)" }.joined(separator: " ")
             let output = (0..<item.output_words).map { "слово\($0)" }.joined(separator: " ")
@@ -4407,6 +4424,31 @@ enum ParakeySelfTest {
 
     /// Custom ASR hotword sync, store level (user-hotword-vocabulary spec §8):
     /// tombstones, the change filter and applyRemoteHotwords. No server needed.
+    private static func dumpCorrectionPrompt() throws {
+        guard let path = ProcessInfo.processInfo.environment["SD_LLM_PROMPT_DUMP"] else {
+            print("SKIP llm-prompt-dump: SD_LLM_PROMPT_DUMP is not set")
+            return
+        }
+        let model = Settings.shared.correctionBundledModel
+        let system = LLMCorrectionPrompt.systemPrompt(vocabulary: [], model: model)
+        let turns = LLMCorrectionPrompt.exampleTurns(vocabulary: [], model: model)
+        let data = try JSONEncoder().encode(["system": [OpenAICompatibleMessage(role: .system, content: system)], "turns": turns])
+        try data.write(to: URL(fileURLWithPath: path))
+    }
+
+    private static func testDictationTrace() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("trace-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        for number in 0..<5 {
+            DictationTrace.record(asr: "сырой \(number)", rules: "правила \(number)", final: "итог \(number)", to: url, maxLines: 3)
+        }
+        let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n")
+        try expect(lines.count <= 6, equals: true, "the trace keeps only the newest lines")
+        let entry = try JSONSerialization.jsonObject(with: Data(lines.last!.utf8)) as? [String: Any]
+        try expect(entry?["asr"] as? String, equals: "сырой 4", "the trace holds the recognized text")
+        try expect(entry?["final"] as? String, equals: "итог 4", "the trace holds the final text")
+    }
+
     /// The vocabulary window's «ASR-термины» tab; SD_HOTWORD_WINDOW_PNG saves
     /// what it draws.
     private static func testHotwordWindow() throws {

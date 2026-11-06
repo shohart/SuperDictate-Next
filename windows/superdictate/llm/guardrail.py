@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 
+from .. import vocabulary_hygiene as hygiene
 from ..logging_setup import get as get_logger
 from ..textproc import remove_filler_words
 
@@ -240,6 +241,163 @@ def correction_chunks(text: str, max_characters: int = 500) -> list[str]:
     if current:
         chunks.append(current)
     return [chunk for chunk in chunks if chunk]
+
+
+# -- word-level faithfulness ---------------------------------------------------
+#
+# The corrector sometimes swaps a word it does not know for a real term that
+# merely sounds similar: «хотвордов» -> «Hotjar», «хотворды» -> «HuggingFace».
+# The output still has the right length and first word, so the whole-text
+# checks above let it pass. Each changed word is therefore compared with the
+# word it replaced, and an unfaithful one goes back to what recognition wrote;
+# the rest of the correction stays. The verdicts are shared with macOS through
+# the "word_guard" section of fixtures/llm-correction-guardrail.json.
+
+MIN_CLOSENESS_TO_LATIN = 0.5
+MIN_CLOSENESS_SAME_SCRIPT = 0.4
+_ALL_CAPS_TERM_MIN_LETTERS = 6
+_NUMERAL_STEMS = (
+    "ноль", "нул", "один", "одн", "перв", "два", "две", "двух", "двум", "втор", "три", "трех", "трём",
+    "трем", "трет", "четыр", "четвер", "пят", "шест", "сем", "седьм", "восем", "восьм", "девя", "десят",
+    "двадцат", "тридцат", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяност",
+    "сто", "ста", "двест", "двести", "триста", "четырест", "пятьсот", "шестьсот", "семьсот", "восемьсот",
+    "девятьсот", "тысяч", "миллион", "миллиард", "полтор", "точка", "запятая",
+)
+
+
+def _word_core(token: str) -> tuple[str, str, str]:
+    """``(leading punctuation, the word, trailing punctuation)``."""
+    start, end = 0, len(token)
+    while start < end and not token[start].isalnum():
+        start += 1
+    while end > start and not token[end - 1].isalnum():
+        end -= 1
+    return token[:start], token[start:end], token[end:]
+
+
+def _fold(word: str) -> str:
+    return word.lower().replace("ё", "е")
+
+
+def _sound_key(text: str) -> str:
+    """Transliterated, with spellings of one sound brought together."""
+    key = hygiene.transliterate(text)
+    for old, new in (("kh", "h"), ("ck", "k"), ("ph", "f"), ("c", "k"), ("q", "k"), ("w", "v"),
+                     ("x", "ks"), ("y", "i"), ("j", "zh")):
+        key = key.replace(old, new)
+    collapsed = []
+    for ch in key:
+        if not collapsed or collapsed[-1] != ch:
+            collapsed.append(ch)
+    return "".join(collapsed)
+
+
+def _closeness(old: str, new: str) -> float:
+    a, b = _sound_key(old), _sound_key(new)
+    longest = max(len(a), len(b))
+    return 1.0 if longest == 0 else 1.0 - edit_distance(a, b) / longest
+
+
+def _is_latin(text: str) -> bool:
+    return any("a" <= ch.lower() <= "z" for ch in text)
+
+
+def _faithful(old: str, new: str) -> bool:
+    """``old`` and ``new`` are word cores, possibly several joined by spaces."""
+    if not any(ch.isalnum() for ch in new):
+        return True
+    if any(ch.isdigit() for ch in new) and not any(ch.isdigit() for ch in old):
+        return all(_fold(word).startswith(_NUMERAL_STEMS) for word in old.split())
+    old_latin, new_latin = _is_latin(old), _is_latin(new)
+    if new_latin and not old_latin:
+        letters = [ch for ch in new if ch.isalpha()]
+        if len(letters) >= _ALL_CAPS_TERM_MIN_LETTERS and all(ch.isupper() for ch in letters):
+            return False  # «ARBITRAJNSKII»: a Russian word spelled in Latin capitals
+        return _closeness(old, new) >= MIN_CLOSENESS_TO_LATIN
+    return _closeness(old, new) >= MIN_CLOSENESS_SAME_SCRIPT
+
+
+def protected_words(phrases) -> frozenset[str]:
+    """The proper words of the user's vocabulary, which the corrector must
+    not change: anything capitalized or Latin, of at least three letters."""
+    words = set()
+    for phrase in phrases:
+        for token in phrase.split():
+            core = _word_core(token)[1]
+            if len(core) >= 3 and (core[0].isupper() or _is_latin(core)):
+                words.add(_fold(core))
+    return frozenset(words)
+
+
+def _aligned_gaps(left: list[str], right: list[str]) -> list[tuple[int, int, int, int]]:
+    """Longest common subsequence; what lies between its matches, as
+    ``(left start, left end, right start, right end)``."""
+    rows, cols = len(left), len(right)
+    table = [[0] * (cols + 1) for _ in range(rows + 1)]
+    for i in range(rows - 1, -1, -1):
+        for j in range(cols - 1, -1, -1):
+            table[i][j] = table[i + 1][j + 1] + 1 if left[i] == right[j] else max(table[i + 1][j], table[i][j + 1])
+    gaps = []
+    i = j = gap_i = gap_j = 0
+    while i < rows and j < cols:
+        if left[i] == right[j]:
+            if gap_i < i or gap_j < j:
+                gaps.append((gap_i, i, gap_j, j))
+            i += 1
+            j += 1
+            gap_i, gap_j = i, j
+        elif table[i + 1][j] >= table[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    if gap_i < rows or gap_j < cols:
+        gaps.append((gap_i, rows, gap_j, cols))
+    return gaps
+
+
+def _restored(old_token: str, new_token: str, capitalize: bool) -> str:
+    """The word recognition wrote, with the punctuation the corrector gave it."""
+    core = _word_core(old_token)[1]
+    lead, _, trail = _word_core(new_token)
+    if capitalize and core and core[0].islower():
+        core = core[0].upper() + core[1:]
+    return lead + core + trail
+
+
+def faithful_words(text_in: str, text_out: str, protected: frozenset[str] = frozenset()) -> str:
+    """``text_out`` with every unfaithful word put back as in ``text_in``."""
+    old_tokens, new_tokens = text_in.split(), text_out.split()
+    old_cores = [_fold(_word_core(t)[1]) for t in old_tokens]
+    new_cores = [_fold(_word_core(t)[1]) for t in new_tokens]
+    result = list(new_tokens)
+    edits = []
+    for old_start, old_end, new_start, new_end in _aligned_gaps(old_cores, new_cores):
+        olds = old_tokens[old_start:old_end]
+        news = new_tokens[new_start:new_end]
+        guarded = any(old_cores[k] in protected for k in range(old_start, old_end))
+        if not olds:
+            continue
+        if not news:
+            if guarded:
+                edits.append((new_start, new_end, olds))
+            continue
+        if len(olds) == len(news):
+            for offset, (old, new) in enumerate(zip(olds, news)):
+                old_core, new_core = _word_core(old)[1], _word_core(new)[1]
+                if _fold(old_core) in protected or not _faithful(old_core, new_core):
+                    at = new_start + offset
+                    edits.append((at, at + 1, [_restored(old, new, at == 0 and new_core[:1].isupper())]))
+            continue
+        joined_old = " ".join(_word_core(t)[1] for t in olds)
+        joined_new = " ".join(_word_core(t)[1] for t in news)
+        if guarded or not _faithful(joined_old, joined_new):
+            edits.append((new_start, new_end, olds))
+    if not edits:
+        return text_out
+    for start, end, tokens in sorted(edits, reverse=True):
+        log.info("Guardrail restored %d word(s) the corrector replaced", end - start)
+        result[start:end] = tokens
+    return " ".join(result)
 
 
 def strip_reasoning(raw: str) -> str:

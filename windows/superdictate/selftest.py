@@ -620,11 +620,34 @@ def test_correction_guardrail() -> None:
         expected = case["output"].strip() if case["expect"] == "accept" else case["input"]
         _check(f"guardrail {case['expect']}s {case['input']!r} ({case['why']})",
                sanitized_correction(case["input"], case["output"]), expected)
+    from .llm.guardrail import faithful_words, protected_words
+    for case in fixture["word_guard"]:
+        _check(f"word guard {case['input']!r} ({case['why']})",
+               faithful_words(case["input"], case["output"], protected_words(case["protected"])), case["expect"])
+    _check("only proper words of the vocabulary are protected",
+           sorted(protected_words(["финансовый управляющий", "Дунималова Анаида", "GitHub", "ЕГРН"])),
+           ["github", "анаида", "дунималова", "егрн"])
     for case in fixture["word_count"]:
         text_in = " ".join(f"слово{n}" for n in range(case["input_words"]))
         text_out = " ".join(f"слово{n}" for n in range(case["output_words"]))
         _check(f"word count {case['input_words']} → {case['output_words']} ({case['why']})",
                preserves_word_count(text_in, text_out), case["expect"] == "accept")
+
+
+def test_dictation_trace() -> None:
+    import json
+    import tempfile
+
+    from . import dictation_trace
+
+    path = Path(tempfile.mkdtemp()) / "trace.jsonl"
+    for number in range(5):
+        dictation_trace.record(f"сырой {number}", f"правила {number}", f"итог {number}", path=path, max_lines=3)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    _check("the trace keeps only the newest lines", len(lines) <= 6, True)
+    entry = json.loads(lines[-1])
+    _check("the trace holds every stage",
+           (entry["asr"], entry["rules"], entry["final"]), ("сырой 4", "правила 4", "итог 4"))
 
 
 def test_correction_chunks() -> None:
@@ -2301,6 +2324,7 @@ _TESTS = [
     test_autostart_target_parsing,
     test_correction_guardrail,
     test_correction_chunks,
+    test_dictation_trace,
     test_learn_candidate,
     test_vocabulary_store,
     test_hud_elapsed_format,

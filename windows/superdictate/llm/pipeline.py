@@ -142,6 +142,9 @@ class LLMPostprocessor:
     """
 
     def __init__(self) -> None:
+        #: The user's vocabulary phrases: the corrector must not change their
+        #: proper words (guardrail.faithful_words).
+        self.vocabulary_phrases: Callable[[], list] = list
         self._pool = LLMHostPool()
         self._lock = threading.RLock()
         self._unload_timer: Optional[threading.Timer] = None
@@ -295,6 +298,7 @@ class LLMPostprocessor:
         # dictation in one request is where the model loses or replaces
         # text, and the guardrail then reverts each chunk on its own.
         chunks = guardrail.correction_chunks(text)
+        protected = guardrail.protected_words(self.vocabulary_phrases())
         corrected: list[str] = []
         for index, chunk in enumerate(chunks):
             messages = [Message(Role.SYSTEM, system), *examples, Message(Role.USER, chunk)]
@@ -310,7 +314,8 @@ class LLMPostprocessor:
             # The guardrail is the whole reason the correction stage is safe
             # to run by default: it reverts to the input whenever the
             # model's known failure modes show up.
-            corrected.append(guardrail.sanitized_correction(chunk, raw))
+            corrected.append(guardrail.faithful_words(
+                chunk, guardrail.sanitized_correction(chunk, raw), protected))
         return " ".join(corrected) if corrected else text
 
     def _rewrite_prompt(self, config: RewriteConfig) -> tuple[str, str]:

@@ -212,6 +212,168 @@ enum LLMCorrectionGuardrail {
         return chunks.filter { !$0.isEmpty }
     }
 
+    // MARK: - Word-level faithfulness
+    //
+    // The corrector sometimes swaps a word it does not know for a real term
+    // that merely sounds similar: «хотвордов» -> «Hotjar», «хотворды» ->
+    // «HuggingFace». The output still has the right length and first word, so
+    // the whole-text checks let it pass. Each changed word is therefore
+    // compared with the word it replaced, and an unfaithful one goes back to
+    // what recognition wrote; the rest of the correction stays. Same rules as
+    // the Windows port; the "word_guard" section of
+    // fixtures/llm-correction-guardrail.json holds the shared verdicts.
+
+    static let minClosenessToLatin = 0.5
+    static let minClosenessSameScript = 0.4
+    private static let allCapsTermMinLetters = 6
+    private static let numeralStems = [
+        "ноль", "нул", "один", "одн", "перв", "два", "две", "двух", "двум", "втор", "три", "трех", "трём",
+        "трем", "трет", "четыр", "четвер", "пят", "шест", "сем", "седьм", "восем", "восьм", "девя", "десят",
+        "двадцат", "тридцат", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяност",
+        "сто", "ста", "двест", "двести", "триста", "четырест", "пятьсот", "шестьсот", "семьсот", "восемьсот",
+        "девятьсот", "тысяч", "миллион", "миллиард", "полтор", "точка", "запятая",
+    ]
+
+    private static func wordCore(_ token: String) -> (lead: String, core: String, trail: String) {
+        let characters = Array(token)
+        var start = 0, end = characters.count
+        while start < end, !(characters[start].isLetter || characters[start].isNumber) { start += 1 }
+        while end > start, !(characters[end - 1].isLetter || characters[end - 1].isNumber) { end -= 1 }
+        return (String(characters[..<start]), String(characters[start..<end]), String(characters[end...]))
+    }
+
+    private static func fold(_ word: String) -> String {
+        word.lowercased().replacingOccurrences(of: "ё", with: "е")
+    }
+
+    private static func soundKey(_ text: String) -> String {
+        var key = VocabularyHygiene.transliterated(text)
+        for (old, new) in [("kh", "h"), ("ck", "k"), ("ph", "f"), ("c", "k"), ("q", "k"), ("w", "v"),
+                           ("x", "ks"), ("y", "i"), ("j", "zh")] {
+            key = key.replacingOccurrences(of: old, with: new)
+        }
+        var collapsed = ""
+        for character in key where collapsed.last != character { collapsed.append(character) }
+        return collapsed
+    }
+
+    private static func closeness(_ old: String, _ new: String) -> Double {
+        let a = soundKey(old), b = soundKey(new)
+        let longest = max(a.count, b.count)
+        return longest == 0 ? 1 : 1 - Double(editDistance(a, b)) / Double(longest)
+    }
+
+    private static func isLatin(_ text: String) -> Bool {
+        text.unicodeScalars.contains { (0x41...0x5A).contains($0.value) || (0x61...0x7A).contains($0.value) }
+    }
+
+    /// `old` and `new` are word cores, possibly several joined by spaces.
+    private static func isFaithful(old: String, new: String) -> Bool {
+        guard new.contains(where: { $0.isLetter || $0.isNumber }) else { return true }
+        if new.contains(where: \.isNumber), !old.contains(where: \.isNumber) {
+            return old.split(separator: " ").allSatisfy { word in
+                numeralStems.contains { fold(String(word)).hasPrefix($0) }
+            }
+        }
+        if isLatin(new), !isLatin(old) {
+            let letters = new.filter(\.isLetter)
+            if letters.count >= allCapsTermMinLetters, letters.allSatisfy(\.isUppercase) {
+                return false  // «ARBITRAJNSKII»: a Russian word spelled in Latin capitals
+            }
+            return closeness(old, new) >= minClosenessToLatin
+        }
+        return closeness(old, new) >= minClosenessSameScript
+    }
+
+    /// The proper words of the user's vocabulary, which the corrector must
+    /// not change: anything capitalized or Latin, of at least three letters.
+    static func protectedWords(from phrases: [String]) -> Set<String> {
+        var words = Set<String>()
+        for phrase in phrases {
+            for token in phrase.split(whereSeparator: { $0.isWhitespace }) {
+                let core = wordCore(String(token)).core
+                if core.count >= 3, core.first?.isUppercase == true || isLatin(core) {
+                    words.insert(fold(core))
+                }
+            }
+        }
+        return words
+    }
+
+    /// Longest common subsequence; what lies between its matches.
+    private static func alignedGaps(_ left: [String], _ right: [String]) -> [(oldRange: Range<Int>, newRange: Range<Int>)] {
+        let rows = left.count, cols = right.count
+        var table = [[Int]](repeating: [Int](repeating: 0, count: cols + 1), count: rows + 1)
+        for i in stride(from: rows - 1, through: 0, by: -1) {
+            for j in stride(from: cols - 1, through: 0, by: -1) {
+                table[i][j] = left[i] == right[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+            }
+        }
+        var gaps: [(oldRange: Range<Int>, newRange: Range<Int>)] = []
+        var i = 0, j = 0, gapI = 0, gapJ = 0
+        while i < rows, j < cols {
+            if left[i] == right[j] {
+                if gapI < i || gapJ < j { gaps.append((gapI..<i, gapJ..<j)) }
+                i += 1
+                j += 1
+                gapI = i
+                gapJ = j
+            } else if table[i + 1][j] >= table[i][j + 1] {
+                i += 1
+            } else {
+                j += 1
+            }
+        }
+        if gapI < rows || gapJ < cols { gaps.append((gapI..<rows, gapJ..<cols)) }
+        return gaps
+    }
+
+    /// `output` with every unfaithful word put back as in `input`.
+    static func faithfulWords(input: String, output: String, protected: Set<String> = []) -> String {
+        let oldTokens = input.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let newTokens = output.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let oldCores = oldTokens.map { fold(wordCore($0).core) }
+        let newCores = newTokens.map { fold(wordCore($0).core) }
+        var edits: [(range: Range<Int>, tokens: [String])] = []
+        for gap in alignedGaps(oldCores, newCores) {
+            let olds = Array(oldTokens[gap.oldRange])
+            let news = Array(newTokens[gap.newRange])
+            let guarded = gap.oldRange.contains { protected.contains(oldCores[$0]) }
+            if olds.isEmpty { continue }
+            if news.isEmpty {
+                if guarded { edits.append((gap.newRange, olds)) }
+                continue
+            }
+            if olds.count == news.count {
+                for offset in olds.indices {
+                    let oldCore = wordCore(olds[offset]).core
+                    let new = wordCore(news[offset])
+                    if protected.contains(fold(oldCore)) || !isFaithful(old: oldCore, new: new.core) {
+                        let at = gap.newRange.lowerBound + offset
+                        var restored = oldCore
+                        if at == 0, new.core.first?.isUppercase == true, restored.first?.isLowercase == true {
+                            restored = restored.prefix(1).uppercased() + restored.dropFirst()
+                        }
+                        edits.append((at..<(at + 1), [new.lead + restored + new.trail]))
+                    }
+                }
+                continue
+            }
+            let joinedOld = olds.map { wordCore($0).core }.joined(separator: " ")
+            let joinedNew = news.map { wordCore($0).core }.joined(separator: " ")
+            if guarded || !isFaithful(old: joinedOld, new: joinedNew) {
+                edits.append((gap.newRange, olds))
+            }
+        }
+        guard !edits.isEmpty else { return output }
+        var result = newTokens
+        for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            log("LLM postprocessing: guardrail restored \(edit.range.count) word(s) the corrector replaced")
+            result.replaceSubrange(edit.range, with: edit.tokens)
+        }
+        return result.joined(separator: " ")
+    }
+
     // MARK: - Internals
 
     /// Lowercased, ё→е, punctuation-stripped words (letters+digits runs).

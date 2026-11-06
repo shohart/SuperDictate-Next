@@ -576,6 +576,7 @@ actor LLMPostprocessingCoordinator {
         // request is where the model loses or replaces text, and the
         // guardrail then reverts each chunk on its own.
         let chunks = LLMCorrectionGuardrail.correctionChunks(text)
+        let protectedWords = LLMCorrectionGuardrail.protectedWords(from: settings.vocabularyStore.asrHotwordPhrases())
         var correctedChunks: [String] = []
         var keptOriginal = 0
         for (index, chunk) in chunks.enumerated() {
@@ -598,7 +599,8 @@ actor LLMPostprocessingCoordinator {
             )
             switch result {
             case .success(let corrected):
-                let sanitized = LLMCorrectionGuardrail.sanitizedCorrection(input: chunk, output: corrected)
+                let whole = LLMCorrectionGuardrail.sanitizedCorrection(input: chunk, output: corrected)
+                let sanitized = LLMCorrectionGuardrail.faithfulWords(input: chunk, output: whole, protected: protectedWords)
                 if sanitized == chunk { keptOriginal += 1 }
                 correctedChunks.append(sanitized)
             case .failure(let error):

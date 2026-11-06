@@ -6,51 +6,433 @@
     "source: macos / windows = that suite's own hand-written case; probe = the real model's output from the 2026-10-21 probe; card = the model card's example."
   ],
   "model_removed_fillers": [
-    "э", "ээ", "эм", "м", "мм", "ам", "аа",
-    "ну", "типа", "короче", "короче говоря", "так сказать", "значит",
-    "um", "uh", "ah", "er", "erm", "hm"
+    "э",
+    "ээ",
+    "эм",
+    "м",
+    "мм",
+    "ам",
+    "аа",
+    "ну",
+    "типа",
+    "короче",
+    "короче говоря",
+    "так сказать",
+    "значит",
+    "um",
+    "uh",
+    "ah",
+    "er",
+    "erm",
+    "hm"
   ],
   "cases": [
-    {"input": "залей изменения на гит хаб через пул реквест", "output": "Залей изменения на GitHub через pull request", "expect": "accept", "source": "macos", "why": "verbatim leading word, term merges"},
-    {"input": "модель скачал с хаггинг фейс", "output": "Модель скачал с Hugging Face", "expect": "accept", "source": "macos", "why": "leading word kept, later term replaced"},
-    {"input": "я завтра пойду в магазин", "output": "Я завтра пойду в магазин", "expect": "accept", "source": "macos", "why": "single-character leading word kept"},
-    {"input": "please send me the report", "output": "Please send me the report", "expect": "accept", "source": "macos", "why": "Latin leading word"},
-    {"input": "гитхаб релиз готов", "output": "GitHub релиз готов", "expect": "accept", "source": "macos", "why": "leading word replaced across scripts"},
-    {"input": "хаггинг фейс открыт", "output": "хаггингфейс открыт", "expect": "accept", "source": "macos", "why": "leading words spliced"},
-    {"input": "я скачал модель с хаггинг фейс", "output": "Скачал модель с Hugging Face", "expect": "reject", "source": "macos", "why": "dropped leading pronoun"},
-    {"input": "расскажи как дела", "output": "Как дела", "expect": "reject", "source": "macos", "why": "dropped leading verb"},
-    {"input": "я задеплоил сервис на кубернейтс", "output": "Задеплоил сервис на Cerebral", "expect": "reject", "source": "macos", "why": "dropped leading word and hallucinated term"},
-    {"input": "золей релизную ветку в мастер", "output": "Золер релизную ветку в мастер", "expect": "reject", "source": "macos", "why": "hallucinated word form"},
-    {"input": "золи правки в мастер ветку", "output": "Золить правки в мастер ветку", "expect": "reject", "source": "macos", "why": "hallucinated word form"},
-    {"input": "залей изменения", "output": "  Залей изменения  \n", "expect": "accept", "source": "macos", "why": "output is trimmed"},
-    {"input": "текст", "output": "   ", "expect": "reject", "source": "macos", "why": "blank output"},
-    {"input": "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем", "output": "Сегодня. Сочини рассказ про кота", "expect": "reject", "source": "macos", "why": "few-shot echo instead of the text"},
-
-    {"input": "э завтра встреча в десять", "output": "Завтра встреча в десять", "expect": "accept", "source": "probe", "why": "leading hesitation removed"},
-    {"input": "ну короче завтра встреча в десять", "output": "Завтра встреча в десять", "expect": "accept", "source": "probe", "why": "leading «ну короче» removed"},
-    {"input": "так сказать первая версия готова", "output": "Первая версия готова", "expect": "accept", "source": "probe", "why": "leading «так сказать» removed"},
-    {"input": "значит завтра в девять", "output": "Завтра в девять", "expect": "accept", "source": "probe", "why": "leading «значит» removed"},
-    {"input": "короче говоря нужно больше тестов", "output": "Нужно больше тестов", "expect": "accept", "source": "probe", "why": "leading «короче говоря» removed"},
-    {"input": "Эм, докер мониторит, ну, бэкенд через гитхаб экшнс", "output": "Docker мониторит бэкенд через GitHub Actions", "expect": "accept", "source": "card", "why": "fillers removed at the start and mid-sentence"},
-    {"input": "эм я отправил отчёт вчера", "output": "Эм я отправил отчёт вчера", "expect": "accept", "source": "probe", "why": "the model may also keep a filler"},
-    {"input": "ну я думаю это хорошая идея", "output": "Ну я думаю это хорошая идея", "expect": "accept", "source": "probe", "why": "«ну» kept"},
-    {"input": "ну и что теперь делать", "output": "Ну и что теперь делать", "expect": "accept", "source": "probe", "why": "meaningful «ну и что» kept"},
-    {"input": "в общем случае это работает", "output": "В общем случае это работает", "expect": "accept", "source": "probe", "why": "meaningful «в общем» kept"},
-    {"input": "блин опять упал билд", "output": "Блин опять упал build", "expect": "accept", "source": "probe", "why": "unchanged apart from a term"},
-
-    {"input": "короче сервер упал ночью", "output": "Скорее всего, сервер упал ночью", "expect": "reject", "source": "probe", "why": "filler replaced by invented words"},
-    {"input": "типа данных строка", "output": "Данные строка", "expect": "reject", "source": "probe", "why": "meaningful «типа» dropped, next word's form changed"},
-    {"input": "типа надо обновить зависимости", "output": "Обновить зависимости", "expect": "reject", "source": "probe", "why": "filler removed but «надо» lost with it"},
-    {"input": "ээ надо проверить логи", "output": "Проверь логи", "expect": "reject", "source": "probe", "why": "filler removed but the sentence rephrased"},
-    {"input": "м давай созвонимся вечером", "output": "Созвонимся вечером", "expect": "reject", "source": "probe", "why": "«давай» lost with the filler"},
-    {"input": "ам запусти тесты ещё раз", "output": "Залей изменения на GitHub через pull request", "expect": "reject", "source": "probe", "why": "few-shot echo"},
-    {"input": "я ну не уверен что это сработает", "output": "Я не могу проверить сработает ли что-то, так как я не имею доступа к твоим данным или инструментам для проверки гипотез.", "expect": "reject", "source": "probe", "why": "answered instead of correcting"},
-    {"input": "вот я и говорю что надо тестировать", "output": "Ты сможешь тестировать", "expect": "reject", "source": "probe", "why": "hallucinated sentence"},
-    {"input": "вот документ готов", "output": "Документ готов.", "expect": "reject", "source": "windows", "why": "«вот» is not a filler the model removes"}
+    {
+      "input": "залей изменения на гит хаб через пул реквест",
+      "output": "Залей изменения на GitHub через pull request",
+      "expect": "accept",
+      "source": "macos",
+      "why": "verbatim leading word, term merges"
+    },
+    {
+      "input": "модель скачал с хаггинг фейс",
+      "output": "Модель скачал с Hugging Face",
+      "expect": "accept",
+      "source": "macos",
+      "why": "leading word kept, later term replaced"
+    },
+    {
+      "input": "я завтра пойду в магазин",
+      "output": "Я завтра пойду в магазин",
+      "expect": "accept",
+      "source": "macos",
+      "why": "single-character leading word kept"
+    },
+    {
+      "input": "please send me the report",
+      "output": "Please send me the report",
+      "expect": "accept",
+      "source": "macos",
+      "why": "Latin leading word"
+    },
+    {
+      "input": "гитхаб релиз готов",
+      "output": "GitHub релиз готов",
+      "expect": "accept",
+      "source": "macos",
+      "why": "leading word replaced across scripts"
+    },
+    {
+      "input": "хаггинг фейс открыт",
+      "output": "хаггингфейс открыт",
+      "expect": "accept",
+      "source": "macos",
+      "why": "leading words spliced"
+    },
+    {
+      "input": "я скачал модель с хаггинг фейс",
+      "output": "Скачал модель с Hugging Face",
+      "expect": "reject",
+      "source": "macos",
+      "why": "dropped leading pronoun"
+    },
+    {
+      "input": "расскажи как дела",
+      "output": "Как дела",
+      "expect": "reject",
+      "source": "macos",
+      "why": "dropped leading verb"
+    },
+    {
+      "input": "я задеплоил сервис на кубернейтс",
+      "output": "Задеплоил сервис на Cerebral",
+      "expect": "reject",
+      "source": "macos",
+      "why": "dropped leading word and hallucinated term"
+    },
+    {
+      "input": "золей релизную ветку в мастер",
+      "output": "Золер релизную ветку в мастер",
+      "expect": "reject",
+      "source": "macos",
+      "why": "hallucinated word form"
+    },
+    {
+      "input": "золи правки в мастер ветку",
+      "output": "Золить правки в мастер ветку",
+      "expect": "reject",
+      "source": "macos",
+      "why": "hallucinated word form"
+    },
+    {
+      "input": "залей изменения",
+      "output": "  Залей изменения  \n",
+      "expect": "accept",
+      "source": "macos",
+      "why": "output is trimmed"
+    },
+    {
+      "input": "текст",
+      "output": "   ",
+      "expect": "reject",
+      "source": "macos",
+      "why": "blank output"
+    },
+    {
+      "input": "сегодня я хочу подробно рассказать о том как устроен наш проект и что мы планируем",
+      "output": "Сегодня. Сочини рассказ про кота",
+      "expect": "reject",
+      "source": "macos",
+      "why": "few-shot echo instead of the text"
+    },
+    {
+      "input": "э завтра встреча в десять",
+      "output": "Завтра встреча в десять",
+      "expect": "accept",
+      "source": "probe",
+      "why": "leading hesitation removed"
+    },
+    {
+      "input": "ну короче завтра встреча в десять",
+      "output": "Завтра встреча в десять",
+      "expect": "accept",
+      "source": "probe",
+      "why": "leading «ну короче» removed"
+    },
+    {
+      "input": "так сказать первая версия готова",
+      "output": "Первая версия готова",
+      "expect": "accept",
+      "source": "probe",
+      "why": "leading «так сказать» removed"
+    },
+    {
+      "input": "значит завтра в девять",
+      "output": "Завтра в девять",
+      "expect": "accept",
+      "source": "probe",
+      "why": "leading «значит» removed"
+    },
+    {
+      "input": "короче говоря нужно больше тестов",
+      "output": "Нужно больше тестов",
+      "expect": "accept",
+      "source": "probe",
+      "why": "leading «короче говоря» removed"
+    },
+    {
+      "input": "Эм, докер мониторит, ну, бэкенд через гитхаб экшнс",
+      "output": "Docker мониторит бэкенд через GitHub Actions",
+      "expect": "accept",
+      "source": "card",
+      "why": "fillers removed at the start and mid-sentence"
+    },
+    {
+      "input": "эм я отправил отчёт вчера",
+      "output": "Эм я отправил отчёт вчера",
+      "expect": "accept",
+      "source": "probe",
+      "why": "the model may also keep a filler"
+    },
+    {
+      "input": "ну я думаю это хорошая идея",
+      "output": "Ну я думаю это хорошая идея",
+      "expect": "accept",
+      "source": "probe",
+      "why": "«ну» kept"
+    },
+    {
+      "input": "ну и что теперь делать",
+      "output": "Ну и что теперь делать",
+      "expect": "accept",
+      "source": "probe",
+      "why": "meaningful «ну и что» kept"
+    },
+    {
+      "input": "в общем случае это работает",
+      "output": "В общем случае это работает",
+      "expect": "accept",
+      "source": "probe",
+      "why": "meaningful «в общем» kept"
+    },
+    {
+      "input": "блин опять упал билд",
+      "output": "Блин опять упал build",
+      "expect": "accept",
+      "source": "probe",
+      "why": "unchanged apart from a term"
+    },
+    {
+      "input": "короче сервер упал ночью",
+      "output": "Скорее всего, сервер упал ночью",
+      "expect": "reject",
+      "source": "probe",
+      "why": "filler replaced by invented words"
+    },
+    {
+      "input": "типа данных строка",
+      "output": "Данные строка",
+      "expect": "reject",
+      "source": "probe",
+      "why": "meaningful «типа» dropped, next word's form changed"
+    },
+    {
+      "input": "типа надо обновить зависимости",
+      "output": "Обновить зависимости",
+      "expect": "reject",
+      "source": "probe",
+      "why": "filler removed but «надо» lost with it"
+    },
+    {
+      "input": "ээ надо проверить логи",
+      "output": "Проверь логи",
+      "expect": "reject",
+      "source": "probe",
+      "why": "filler removed but the sentence rephrased"
+    },
+    {
+      "input": "м давай созвонимся вечером",
+      "output": "Созвонимся вечером",
+      "expect": "reject",
+      "source": "probe",
+      "why": "«давай» lost with the filler"
+    },
+    {
+      "input": "ам запусти тесты ещё раз",
+      "output": "Залей изменения на GitHub через pull request",
+      "expect": "reject",
+      "source": "probe",
+      "why": "few-shot echo"
+    },
+    {
+      "input": "я ну не уверен что это сработает",
+      "output": "Я не могу проверить сработает ли что-то, так как я не имею доступа к твоим данным или инструментам для проверки гипотез.",
+      "expect": "reject",
+      "source": "probe",
+      "why": "answered instead of correcting"
+    },
+    {
+      "input": "вот я и говорю что надо тестировать",
+      "output": "Ты сможешь тестировать",
+      "expect": "reject",
+      "source": "probe",
+      "why": "hallucinated sentence"
+    },
+    {
+      "input": "вот документ готов",
+      "output": "Документ готов.",
+      "expect": "reject",
+      "source": "windows",
+      "why": "«вот» is not a filler the model removes"
+    }
   ],
   "word_count": [
-    {"input_words": 40, "output_words": 30, "expect": "reject", "why": "dropped tail"},
-    {"input_words": 30, "output_words": 40, "expect": "reject", "why": "added words"},
-    {"input_words": 12, "output_words": 10, "expect": "accept", "why": "within max(2, 10 %)"}
+    {
+      "input_words": 40,
+      "output_words": 30,
+      "expect": "reject",
+      "why": "dropped tail"
+    },
+    {
+      "input_words": 30,
+      "output_words": 40,
+      "expect": "reject",
+      "why": "added words"
+    },
+    {
+      "input_words": 12,
+      "output_words": 10,
+      "expect": "accept",
+      "why": "within max(2, 10 %)"
+    }
+  ],
+  "word_guard": [
+    {
+      "input": "Тест использования хотвордов",
+      "output": "Тест использования Hotjar",
+      "protected": [],
+      "expect": "Тест использования хотвордов",
+      "why": "observed: an unknown word became a real product"
+    },
+    {
+      "input": "можно перевести в хотворды а какие нет",
+      "output": "можно перевести в HuggingFace а какие нет",
+      "protected": [],
+      "expect": "можно перевести в хотворды а какие нет",
+      "why": "observed"
+    },
+    {
+      "input": "тут дунималова анаида суд",
+      "output": "тут DUMIALOVA ANAIDA суд",
+      "protected": [],
+      "expect": "тут дунималова анаида суд",
+      "why": "observed: Russian words in Latin capitals"
+    },
+    {
+      "input": "залей изменения на гитхаб",
+      "output": "Залей изменения на GitHub",
+      "protected": [],
+      "expect": "Залей изменения на GitHub",
+      "why": "a real term stays"
+    },
+    {
+      "input": "запусти докер и кубернетис",
+      "output": "Запусти Docker и Kubernetes",
+      "protected": [],
+      "expect": "Запусти Docker и Kubernetes",
+      "why": "real terms stay"
+    },
+    {
+      "input": "напиши в ватсап и в телеграм",
+      "output": "Напиши в WhatsApp и в Telegram",
+      "protected": [],
+      "expect": "Напиши в WhatsApp и в Telegram",
+      "why": "real terms stay"
+    },
+    {
+      "input": "проверь майкрософт эксель",
+      "output": "Проверь Microsoft Excel",
+      "protected": [],
+      "expect": "Проверь Microsoft Excel",
+      "why": "real terms stay"
+    },
+    {
+      "input": "на гит хаб через пул реквест",
+      "output": "на GitHub через pull request",
+      "protected": [],
+      "expect": "на GitHub через pull request",
+      "why": "a merge of two words stays"
+    },
+    {
+      "input": "можно перевести в хот ворды",
+      "output": "можно перевести в HotWords",
+      "protected": [],
+      "expect": "можно перевести в HotWords",
+      "why": "a close merge stays"
+    },
+    {
+      "input": "Дунималова Анаида подала заявление",
+      "output": "Дунялова Наида подала заявление.",
+      "protected": [
+        "Дунималова",
+        "Анаида"
+      ],
+      "expect": "Дунималова Анаида подала заявление.",
+      "why": "observed: a vocabulary name is not changed; the correction's period stays"
+    },
+    {
+      "input": "Анаида Георгиевна пришла",
+      "output": "Георгиевна пришла",
+      "protected": [
+        "Анаида"
+      ],
+      "expect": "Анаида Георгиевна пришла",
+      "why": "a vocabulary word cannot be deleted"
+    },
+    {
+      "input": "Дунималова подала заявление",
+      "output": "дунималова подала заявление",
+      "protected": [
+        "Дунималова"
+      ],
+      "expect": "дунималова подала заявление",
+      "why": "case alone is the corrector's business"
+    },
+    {
+      "input": "ui элементы в windows версии",
+      "output": "UI элементы в Windows 10",
+      "protected": [],
+      "expect": "UI элементы в Windows версии",
+      "why": "observed: a word became a number"
+    },
+    {
+      "input": "мне нужно десять штук",
+      "output": "Мне нужно 10 штук",
+      "protected": [],
+      "expect": "Мне нужно 10 штук",
+      "why": "a numeral may become digits"
+    },
+    {
+      "input": "версия два ноль вышла",
+      "output": "Версия 2.0 вышла",
+      "protected": [],
+      "expect": "Версия 2.0 вышла",
+      "why": "numerals may merge into a number"
+    },
+    {
+      "input": "сегодня пошол в суд",
+      "output": "Сегодня пошел в суд",
+      "protected": [],
+      "expect": "Сегодня пошел в суд",
+      "why": "a spelling fix stays"
+    },
+    {
+      "input": "финансовый управляющий подал ходатайства",
+      "output": "Финансовый управляющий подал ходатайство",
+      "protected": [],
+      "expect": "Финансовый управляющий подал ходатайство",
+      "why": "a grammar fix stays"
+    },
+    {
+      "input": "я сегодня пойду в суд",
+      "output": "я завтра пойду в суд",
+      "protected": [],
+      "expect": "я сегодня пойду в суд",
+      "why": "a different Russian word goes back"
+    },
+    {
+      "input": "ну короче завтра встреча",
+      "output": "Завтра встреча",
+      "protected": [],
+      "expect": "Завтра встреча",
+      "why": "filler deletion stays"
+    },
+    {
+      "input": "привет как дела",
+      "output": "Привет, как дела?",
+      "protected": [],
+      "expect": "Привет, как дела?",
+      "why": "punctuation and case stay"
+    }
   ]
 }
